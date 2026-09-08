@@ -1,0 +1,61 @@
+name = "zarlino-executive-os"
+main = "src/index.ts"
+compatibility_date = "2025-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+# ---------------------------------------------------------------------------
+# Durable Object: the Executive's brain. SQLite-backed (use_sqlite = true) so
+# the whole business store lives in the DO's embedded database and survives
+# restarts. `migrations` block migrates the class on deploy.
+# ---------------------------------------------------------------------------
+[durable_objects]
+bindings = [{ name = "EXECUTIVE_AGENT", class_name = "ExecutiveAgent" }]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ExecutiveAgent"]
+
+# ---------------------------------------------------------------------------
+# KV: shared page/license/revenue counters + affiliate program (same namespace
+# the website worker uses, so the Executive can see live site counters).
+# ---------------------------------------------------------------------------
+[[kv_namespaces]]
+binding = "ZARLINO_KV"
+id = "66bc47e33fe145f697cf1f80912f269e"
+
+# ---------------------------------------------------------------------------
+# Static assets: the Founder web console (React+Vite, built to web/dist).
+# run_worker_first = true so /api/* reaches the Worker; the Worker then serves
+# the console via env.ASSETS.fetch(request) for every non-API path.
+# ---------------------------------------------------------------------------
+[assets]
+directory = "./web/dist"
+binding = "ASSETS"
+not_found_handling = "none"
+run_worker_first = true
+
+# ---------------------------------------------------------------------------
+# Static vars. Secrets (DEEPSEEK_API_KEY, FOUNDER_AUTH_TOKEN, PAYSTACK_SECRET_KEY,
+# GITHUB_TOKEN, CF_API_TOKEN, ZARLINO_LICENSE_PRIVATE_KEY) are set via
+# `wrangler secret put <NAME>` in production and live in .dev.vars locally.
+# NOTE: FOUNDER_AUTH_TOKEN must NOT also appear here as a var — Cloudflare
+# rejects a binding that is both a secret and a var (error 10053), and an
+# empty var would shadow the real secret at runtime (auth would always 401).
+# ---------------------------------------------------------------------------
+[vars]
+WEBSITE_URL = "https://zarlinoaudio.com"
+AI_DAILY_BUDGET = "5"
+AI_MONTHLY_BUDGET = "80"
+AI_PER_TASK_BUDGET = "2"
+AI_PER_RUN_BUDGET = "8"
+
+# ---------------------------------------------------------------------------
+# Constant maintenance: the System Doctor auto-runs on this schedule (and on
+# every DO wake/alarm). It reaps stale agent runs, re-queues expired local-task
+# leases, clears expired sessions, verifies migrations, and logs every run.
+# ---------------------------------------------------------------------------
+[triggers]
+crons = ["0 */6 * * *"]
+
+[observability]
+enabled = true

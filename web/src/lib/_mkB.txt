@@ -1,0 +1,81 @@
+/* ---- lightweight per-fence syntax highlighting --------------------------- */
+const KW2: Record<string, string[]> = {
+  js: ["const","let","var","function","return","if","else","for","while","do","new","class","extends","implements","import","export","from","default","async","await","try","catch","finally","throw","typeof","instanceof","of","in","this","super","null","undefined","true","false"],
+  jsx: ["const","let","var","function","return","if","else","for","while","do","new","class","extends","import","export","from","default","async","await","try","catch","throw","typeof","of","in","this","null","undefined","true","false"],
+  ts: ["const","let","var","function","return","if","else","for","while","do","new","class","extends","implements","interface","type","enum","namespace","public","private","protected","readonly","static","abstract","import","export","from","default","async","await","try","catch","finally","throw","typeof","instanceof","as","of","in","this","super","null","undefined","true","false"],
+  tsx: ["const","let","var","function","return","if","else","for","while","do","new","class","extends","interface","type","enum","public","private","readonly","import","export","from","default","async","await","try","catch","throw","typeof","as","of","in","this","null","undefined","true","false"],
+  bash: ["if","then","else","elif","fi","for","do","done","case","esac","function","local","return","exit","export","cd","echo","source","set","shift","in"],
+  sh: ["if","then","else","elif","fi","for","do","done","case","esac","function","return","exit","export","echo","in"],
+  python: ["def","class","return","if","elif","else","for","while","in","not","and","or","import","from","as","try","except","finally","raise","with","lambda","yield","pass","break","continue","None","True","False","global","is"],
+  json: [], css: [], html: [], text: [],
+};
+const DEFAULT_KW = KW2.ts;
+
+function highlightCode(code: string, lang: string): ReactNode[] {
+  const kws = new Set<string>(KW2[lang] ?? DEFAULT_KW);
+  const lines = code.split("\n");
+  const total: ReactNode[] = [];
+  let inBlock = false;
+  const isWord = (c: string) => /[A-Za-z0-9_$]/.test(c);
+  lines.forEach((ln, li) => {
+    const spans: { text: string; cls?: string }[] = [];
+    let i = 0;
+    const n = ln.length;
+    const push = (tk: string, cls?: string) => {
+      if (!tk) return;
+      const last = spans[spans.length - 1];
+      if (cls && last && last.cls === cls) { last.text += tk; return; }
+      if (!cls && last && !last.cls) { last.text += tk; return; }
+      spans.push({ text: tk, cls });
+    };
+    while (i < n) {
+      const ch = ln[i];
+      const nx = ln[i + 1];
+      if (inBlock) {
+        const close = ln.indexOf("*/", i);
+        if (close === -1) { push(ln.slice(i), "tok-c"); i = n; break; }
+        push(ln.slice(i, close + 2), "tok-c");
+        inBlock = false; i = close + 2; continue;
+      }
+      if (ch === "/" && nx === "/") { push(ln.slice(i), "tok-c"); i = n; break; }
+      if (ch === "#" && !(i > 0 && /[\w]/.test(ln[i - 1]))) { push(ln.slice(i), "tok-c"); i = n; break; }
+      if (ch === "/" && nx === "*") {
+        const close = ln.indexOf("*/", i + 2);
+        if (close === -1) { push(ln.slice(i), "tok-c"); inBlock = true; i = n; break; }
+        push(ln.slice(i, close + 2), "tok-c"); i = close + 2; continue;
+      }
+      if (ch === '"' || ch === "'" || ch === "`") {
+        const q = ch; let j = i + 1;
+        while (j < n) {
+          if (ln[j] === "\\") { j += 2; continue; }
+          if (ln[j] === q) break;
+          j++;
+        }
+        if (j < n) { push(ln.slice(i, j + 1), "tok-str"); i = j + 1; continue; }
+        push(ln.slice(i), "tok-str"); i = n; break;
+      }
+      if (/[0-9]/.test(ch) || (ch === "." && nx && /[0-9]/.test(nx))) {
+        let j = i; while (j < n && /[0-9a-fA-FxX_]/.test(ln[j])) j++;
+        push(ln.slice(i, j), "tok-num"); i = j; continue;
+      }
+      if (isWord(ch)) {
+        let j = i; while (j < n && isWord(ln[j])) j++;
+        const w = ln.slice(i, j);
+        if (kws.has(w)) push(w, w === "true" || w === "false" || w === "null" || w === "undefined" ? "tok-bool" : "tok-kw");
+        else if (j < n && ln[j] === "(") push(w, "tok-fn");
+        else push(w);
+        i = j; continue;
+      }
+      if (/[{}()[\]<>=+\-*/%!&|^~?:;,.]/.test(ch)) push(ch, "tok-op");
+      else push(ch);
+      i++;
+    }
+    total.push(
+      <span key={li} className="md-code-line">
+        {spans.map((s, si) => (s.cls ? <span key={si} className={s.cls}>{s.text}</span> : <span key={si}>{s.text}</span>))}
+        {li < lines.length - 1 ? "\n" : ""}
+      </span>,
+    );
+  });
+  return total;
+}

@@ -1,0 +1,44 @@
+// ---- Markdown (safe + lightweight, P0/P1/P2-ready upgrade) -----------------
+
+function decodeEntities(s: string): string {
+  return s
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&mdash;/g, "—")
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)));
+}
+
+/* A stateless code fence block. Shows the fence language (so ```ts -> "ts")
+   and a Copy button that copies ONLY this block's code. */
+function MdCodeBlock({ lang, code }: { lang: string; code: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <div className="md-codeblock" data-lang={lang || "text"}>
+      <div className="md-codeblock-head">
+        <span className="md-lang">{lang || "text"}</span>
+        <button
+          type="button"
+          aria-label="Copy code block"
+          onClick={() => {
+            void copyText(code).then((ok) => {
+              if (ok) {
+                setCopied(true);
+                setTimeout(() => setCopied(false), 1400);
+              }
+            });
+          }}
+        >
+          {copied ? "\u2713 copied" : "copy"}
+        </button>
+      </div>
+      <pre>
+        <code>{highlightCode(code, lang)}</code>
+      </pre>
+    </div>
+  );
+}

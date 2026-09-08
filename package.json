@@ -1,0 +1,39 @@
+{
+  "name": "zarlino-executive-os",
+  "private": true,
+  "version": "1.1.0",
+  "type": "module",
+  "description": "Zarlino Executive OS — autonomous business/engineering agent on Cloudflare Workers (Durable Object + SQLite) with a self-healing System Doctor.",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "doctor": "tsx scripts/doctor.ts",
+    "doctor:fix": "tsx scripts/doctor.ts --fix",
+    "maintenance": "tsx scripts/doctor.ts --maintenance",
+    "agent:local": "tsx scripts/local-agent.ts",
+    "agent:local:yes": "tsx scripts/local-agent.ts --yes",
+    "agent:daemon": "tsx scripts/local-daemon.ts --yes",
+    "agent:daemon:loop": "tsx scripts/local-daemon.ts --loop --yes",
+    "agent:daemon:start": "wscript scripts\\start-daemon.vbs",
+    "agent:daemon:stop": "powershell -ExecutionPolicy Bypass -File scripts/stop-daemon.ps1",
+    "agent:daemon:install": "powershell -ExecutionPolicy Bypass -File scripts/install-daemon-startup.ps1",
+    "agent:daemon:uninstall": "powershell -ExecutionPolicy Bypass -File scripts/uninstall-daemon-startup.ps1",
+    "build:console": "npm --prefix web run build",
+    "console:dev": "npm --prefix web run dev",
+    "upload:audio": "tsx scripts/upload-audio.ts"
+  },
+  "dependencies": {
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260823.1",
+    "@types/node": "^26.2.0",
+    "tsx": "^4.23.12",
+    "typescript": "~5.9.3",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.125.0"
+  }
+}

@@ -1,0 +1,102 @@
+/* ---- block builder / Markdown component ---------------------------------- */
+type ListItem = { depth: number; ordered: boolean; text: string; closed: boolean };
+
+function listsToNodes(items: ListItem[] | null): ReactNode | null {
+  if (!items || items.length === 0) return null;
+  // nest by depth using a stack of open containers {ordered, children: (ReactNode|tag)[]}
+  const root: { ordered: boolean; items: { depth: number; ordered: boolean; text: string }[] }[] = [];
+  // Simpler: if all items share depth 0, emit one flat list.
+  const listed = items.map((it) => ({ depth: it.depth, ordered: it.ordered, text: it.text }));
+  const renderLevel = (level: number, start: number): ReactNode => {
+    const out: ReactNode[] = [];
+    let k = start;
+    for (; k < items.length; k++) {
+      const it = items[k]!;
+      if (it.depth < level) break;
+      if (it.depth === level) {
+        const children = [{ open: it.ordered, nodes: [] as ReactNode[] }];
+        const siblings: ReactNode[] = [inlineNodes(it.text.trim(), k)];
+        out.push(
+          <li key={k} className={`md-li d${level}`}>
+            <div>{inlineNodes(it.text.trim(), k * 1000 + level)}</div>
+            {it.closed}
+          </li>,
+        );
+      } else {
+        break;
+      }
+    }
+    return null; // replaced below
+  };
+  void renderLevel; void listed; void root;
+  return null;
+}
+
+function groupByDepth(baseItems: { depth: number; ordered: boolean; text: string }[]): ReactNode[] {
+  if (baseItems.length === 0) return [];
+  const sorted = baseItems.slice();
+  for (let d = 0; d <= 3; d++) { void sorted; }
+  // build nested using recurrence on raw list
+  function build(start: number, level: number): { node: ReactNode; next: number } {
+    const listKind = baseItems[start];
+    const children: ReactNode[] = [];
+    let i = start;
+    while (i < baseItems.length && baseItems[i] && baseItems[i].depth >= level) {
+      if (baseItems[i].depth > level) {
+        // a deeper item: attach as child of previous li
+        const r = build(i, (baseItems[i]?.depth ?? 0) + 0); // handled below; simpler: nest immediately
+      }
+    }
+    return { node: null, next: start };
+  }
+  void build;
+  // Flat render fallback when every item is depth 0:
+  const byOrder = baseItems[0]!.ordered;
+  if (baseItems.every((b) => b.depth === 0)) {
+    return [baseItems[0]!.ordered ? <ol data-kind="ordered"></ol> : <ul data-kind="ul"></ul>];
+  }
+  return [];
+}
+
+/* Ordered/unordered/nested list renderer — deterministic tree build. */
+function renderList(itemsRaw: { depth: number; ordered: boolean; text: string }[]): ReactNode[] {
+  const items = itemsRaw.slice();
+  const out: ReactNode[] = [];
+  // Convert flat stream into nested li elements preserving order.
+  const rec = (lo: number, hi: number, depth: number): ReactNode[] => {
+    const res: ReactNode[] = [];
+    while (lo < hi) {
+      const it = items[lo]!;
+      if (it.depth < depth) break; // pop
+      if (it.depth === depth) {
+        // gather children deeper than depth
+        let sub = lo + 1;
+        const childStart = sub;
+        while (sub < hi && items[sub]!.depth >= depth) sub++;
+        const deeper = items.slice(childStart, sub).filter((x) => x.depth > depth);
+        const li = (
+          <li key={lo}>
+            <div className="md-li-text">{inlineNodes(it.text.trim(), lo)}</div>
+            {deeper.length > 0 && renderList(deeper.length === 1 ? deeper : collapseFirst(deeper))}
+          </li>
+        );
+        res.push(li);
+        lo = sub < hi ? sub : hi;
+        if (lo >= hi || items[lo]!.depth < depth) return res;
+      } else {
+        lo++;
+      }
+    }
+    return res;
+  };
+  // helper: take deeper slice and subtract depth offset
+  function collapseFirst(d: { depth: number; ordered: boolean; text: string }[]): { depth: number; ordered: boolean; text: string }[] {
+    const minD = Math.min(...d.map((x) => x.depth));
+    return d.map((x) => ({ ...x, depth: x.depth - minD }));
+  }
+  const minRoot = Math.min(...itemsRaw.map((x) => x.depth));
+  const norm = itemsRaw.map((x) => ({ ordered: x.ordered, depth: x.depth - minRoot, text: x.text }));
+  const firstKind = norm[0]!.ordered;
+  const lis = rec(0, norm.length, 0);
+  return [firstKind ? <ol key="ol">{lis}</ol> : <ul key="ul">{lis}</ul>];
+}

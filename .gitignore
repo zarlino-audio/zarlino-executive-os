@@ -1,0 +1,23 @@
+# --- Secrets & local state (never commit) ---
+.dev.vars
+.wrangler/
+.local/
+*.local.db
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# --- Build output ---
+dist/
+node_modules/
+web/dist/
+web/node_modules/
+*.tsbuildinfo
+
+# --- OS noise ---
+.DS_Store
+Thumbs.db
+
+# --- runtime logs ---
+local-daemon.log
+

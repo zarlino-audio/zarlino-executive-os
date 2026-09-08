@@ -1,0 +1,85 @@
+/* Single-pass inline scanner: recognises ``code``/`code`, ![alt](url),
+   [text](url), **bold**, *italic*/_italic_, and bare http(s) URLs. Text is
+   escaped by React so it is injection-safe. */
+function inlineNodes(text: string, keyBase: number): ReactNode[] {
+  const nodes: ReactNode[] = [];
+  let buf = "";
+  const flush = (k: number) => {
+    if (!buf) return;
+    const bits = buf.split(/(https?:\/\/[^\s)]+)/g);
+    bits.forEach((b, i) => {
+      if (!b) return;
+      if (/^https?:\/\//.test(b))
+        nodes.push(<a key={`auto-${k}-${i}`} href={b} target="_blank" rel="noreferrer noopener">{b}</a>);
+      else nodes.push(<span key={`${keyBase}-${k}-t${i}`}>{b}</span>);
+    });
+    buf = "";
+  };
+  let i = 0;
+  let key = 0;
+  const n = text.length;
+  while (i < n) {
+    const ch = text[i];
+    if (ch === "`") {
+      const j = text.indexOf("`", i + 1);
+      if (j > i) {
+        flush(key);
+        nodes.push(<code key={`${keyBase}-${key}-c`}>{text.slice(i + 1, j)}</code>);
+        i = j + 1; key++; continue;
+      }
+    }
+    if ((ch === "!" && text[i + 1] === "[") || ch === "[") {
+      const ls = ch === "[" ? i : i + 1;
+      const cbr = text.indexOf("]", ls + 1);
+      if (cbr > ls) {
+        const op = text.indexOf("(", cbr + 1);
+        const cp = text.indexOf(")", op + 1);
+        if (op === cbr + 1 && cp > op) {
+          const label = text.slice(ls + 1, cbr);
+          const url = text.slice(op + 1, cp);
+          flush(key);
+          if (ch === "!") nodes.push(<img key={`${keyBase}-${key}-img`} src={url} alt={label} loading="lazy" />);
+          else nodes.push(<a key={`${keyBase}-${key}-a`} href={url} target="_blank" rel="noreferrer noopener">{label}</a>);
+          i = cp + 1; key++; continue;
+        }
+      }
+    }
+    if (ch === "*" && text[i + 1] === "*") {
+      const j = text.indexOf("**", i + 2);
+      if (j > i) {
+        flush(key);
+        nodes.push(<strong key={`${keyBase}-${key}-b`}>{text.slice(i + 2, j)}</strong>);
+        i = j + 2; key++; continue;
+      }
+    }
+    if ((ch === "*" || ch === "_") && text[i + 1] !== ch && text[i - 1] !== ch) {
+      const end = text.indexOf(ch, i + 1);
+      if (end > i) {
+        const be = i === 0 ? " " : text[i - 1];
+        const af = end + 1 < n ? text[end + 1] : " ";
+        const wordy = /[A-Za-z0-9]/.test(be) && /[A-Za-z0-9]/.test(af);
+        if (!wordy) {
+          flush(key);
+          nodes.push(<em key={`${keyBase}-${key}-e`}>{text.slice(i + 1, end)}</em>);
+          i = end + 1; key++; continue;
+        }
+      }
+    }
+    // skip an unclosed emphasis marker so it stays literal text
+    buf += ch;
+    i++;
+  }
+  flush(key);
+  return nodes;
+}
+
+/* Named emphasis helper width marker used for block list text. */
+const MO_BULLET = /^[-*+]\s+/;
+const MO_ORDER = /^\d+[.)]\s*/;
+function stripListMarker(line: string): { text: string; rest?: string } {
+  const s = line.trim();
+  if (MO_BULLET.test(s)) return { text: s.replace(MO_BULLET, "") };
+  const o = s.match(MO_ORDER);
+  if (o) return { text: s.slice(o[0].length) };
+  return { text: s };
+}
