@@ -15,7 +15,7 @@ Set fso = CreateObject("Scripting.FileSystemObject")
 execOs = fso.GetParentFolderName(fso.GetParentFolderName(WScript.ScriptFullName))
 logPath = execOs & "\local-daemon.log"
 
-cmd = "cmd /c cd /d """ & execOs & """ && npm run agent:daemon:loop > """ & logPath & """ 2>&1"
+cmd = "cmd /c cd /d """ & execOs & """ && set ""ZARLINO_WORKSPACE=%USERPROFILE%\Desktop\plugin"" && npm run agent:daemon:loop > """ & logPath & """ 2>&1"
 
 Set sh = CreateObject("WScript.Shell")
 sh.Run cmd, 0, False
