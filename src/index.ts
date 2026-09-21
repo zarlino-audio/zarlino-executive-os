@@ -20,6 +20,7 @@ import { buildToolRegistry } from "./agent/tools";
 import type { ToolRegistry } from "./core/tools/registry";
 import { runDoctor } from "./core/doctor";
 import { collectiveMetrics, runChaosTest, runOrgAnalyst } from "./core/org/intelligence";
+import { resolveDaemonAgentId } from "./core/org/agents";
 import { createTask } from "./core/tasks/model";
 import { hashPassword, timingSafeEqual, verifyPassword } from "./core/auth/passwords";
 import {
@@ -1231,6 +1232,26 @@ export class ExecutiveAgent {
       });
       return json({ ok: true, agent: this.store.getOrgAgent(body.id) });
     }
+    const agentDeregister = /^\/api\/org\/agents\/([^/]+)$/.exec(path);
+    if (agentDeregister && method === "DELETE") {
+      // Deregister a dead instance (the Doctor's stale-agent action, §31).
+      const id = decodeURIComponent(agentDeregister[1]!);
+      const agent = this.store.getOrgAgent(id);
+      if (!agent) return json({ error: "Agent not found" }, 404);
+      this.store.deleteOrgAgent(id);
+      this.store.insertAudit({
+        id: newId("aud"),
+        actor: "founder",
+        action: "org.agent.deregister",
+        entity_type: "org_agents",
+        entity_id: id,
+        detail_json: JSON.stringify({ role_id: agent.role_id }),
+        source: "api",
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      });
+      return json({ ok: true, id });
+    }
     if (path === "/api/org/task-contracts" && method === "GET") {
       return json({ contracts: this.store.listTaskContracts({ limit: 100 }) });
     }
@@ -2267,21 +2288,24 @@ export class ExecutiveAgent {
 
     // Local agent health beacon (daemon pings every ~30s).
     if (path === "/api/local-agent/heartbeat" && method === "POST") {
-      const body = (await readBody<{ host?: string; version?: string; pid?: string; claimed?: boolean }>(request).catch(() => ({}))) as { host?: string; version?: string; pid?: string; claimed?: boolean };
-      this.store.upsertLocalAgentHeartbeat({ host: body.host, version: body.version, pid: body.pid, claimed: body.claimed });
+      const body = (await readBody<{ host?: string; version?: string; pid?: string; claimed?: boolean; agent_id?: string }>(request).catch(() => ({}))) as { host?: string; version?: string; pid?: string; claimed?: boolean; agent_id?: string };
+      // Each physical runtime registers under its own instance id (validated;
+      // role is pinned — a heartbeat can never grant itself a role).
+      const agentId = resolveDaemonAgentId(body.agent_id);
+      this.store.upsertLocalAgentHeartbeat({ host: body.host, version: body.version, pid: body.pid, claimed: body.claimed, id: agentId });
       // AOrgI registry: the daemon is a real runtime instance — register it
       // (software-engineering role: it executes local build/render/tooling
       // capability) with the same heartbeat so org liveness is honest.
       this.store.upsertOrgAgent({
-        id: "local_daemon_01",
+        id: agentId,
         roleId: "role_software_engineering",
         kind: "local",
         model: "deepseek-v4",
-        host: body.host ?? "local",
+        host: body.host ?? agentId,
         version: body.version,
         capabilitiesJson: JSON.stringify(["local_execution", "build", "render", "automation"]),
       });
-      return json({ ok: true, lastSeen: nowIso() });
+      return json({ ok: true, lastSeen: nowIso(), agentId });
     }
 
     // Local machine daemon bridge

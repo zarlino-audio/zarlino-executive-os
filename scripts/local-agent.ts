@@ -35,7 +35,9 @@ import { loadDotEnv } from "./dotenv.js";
 
 // ---- paths -----------------------------------------------------------------
 const SCRIPT_DIR = resolve(fileURLToPath(import.meta.url), "..");
-export const REPO_ROOT = resolve(SCRIPT_DIR, "..", ".."); // …/plugin
+export const REPO_ROOT = process.env.ZARLINO_WORKSPACE
+  ? resolve(String(process.env.ZARLINO_WORKSPACE))
+  : resolve(SCRIPT_DIR, "..", ".."); // …/plugin on the founder machine
 export const EXEC_OS = join(REPO_ROOT, "executive-os");
 export const WEBSITE = join(REPO_ROOT, "zarlino-website");
 

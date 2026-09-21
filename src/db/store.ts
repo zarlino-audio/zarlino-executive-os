@@ -2178,13 +2178,14 @@ export class ExecutiveStore implements CostStorage {
       started_at: r.started_at ? String(r.started_at) : undefined,
     };
   }
-  /** Record a heartbeat from the local daemon (idempotent single row). */
-  upsertLocalAgentHeartbeat(input: { host?: string; version?: string; pid?: string; claimed?: boolean }): void {
+  /** Record a heartbeat from a local daemon (one row per instance id). */
+  upsertLocalAgentHeartbeat(input: { host?: string; version?: string; pid?: string; claimed?: boolean; id?: string }): void {
+    const rowId = input.id && /^[a-z0-9_]{3,40}$/.test(input.id) ? input.id : "local";
     const now = new Date().toISOString();
-    const existing = this.sql.all<Row>("SELECT id FROM local_agent_status WHERE id = 'local'");
+    const existing = this.sql.all<Row>("SELECT id FROM local_agent_status WHERE id = ?", rowId);
     if (existing.length === 0) {
       this.insert("local_agent_status", {
-        id: "local",
+        id: rowId,
         host: input.host ?? null,
         version: input.version ?? null,
         pid: input.pid ?? null,
@@ -2202,7 +2203,7 @@ export class ExecutiveStore implements CostStorage {
     if (input.version) { sets.push("version = ?"); params.push(input.version); }
     if (input.pid) { sets.push("pid = ?"); params.push(input.pid); }
     if (input.claimed) { sets.push("last_claim_at = ?"); params.push(now); }
-    params.push("local");
+    params.push(rowId);
     this.sql.run(`UPDATE local_agent_status SET ${sets.join(", ")} WHERE id = ?`, ...params);
   }
   /** Age (ms) since the daemon's last heartbeat, or null if never seen. */
