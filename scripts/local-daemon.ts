@@ -31,6 +31,13 @@ const LEASE_HB_MS = 60_000; // heartbeat while working (lease is 10 min)
 const MAX_TOOL_CALLS = Number(process.env.LOCAL_AGENT_MAX_TOOL_CALLS) || 60;
 const MAX_TOTAL_TOOL_CALLS = Number(process.env.LOCAL_AGENT_MAX_TOTAL_TOOL_CALLS) || 2000;
 const LOOP = process.argv.includes("--loop");
+/**
+ * Instance identity (AOrgI §7): each physical machine runs the daemon under
+ * its own id. Default: local_daemon_01 (founder machine). A remote dev
+ * machine sets AGENT_ID=remote_daemon_01 so the org registry tracks two
+ * honest instances instead of one heartbeat clobbering the other.
+ */
+const AGENT_ID = /^[a-z0-9_]{3,40}$/.test(String(process.env.AGENT_ID ?? "")) ? String(process.env.AGENT_ID) : "local_daemon_01";
 
 function log(...args: string[]): void {
   console.log(`[${new Date().toISOString()}] ${args.join(" ")}`);
@@ -57,6 +64,7 @@ async function beacon(claimed: boolean): Promise<void> {
       version: "local-agent-daemon-1.0",
       pid: String(process.pid),
       claimed,
+      agent_id: AGENT_ID,
     });
   } catch (err) {
     log("beacon failed:", err instanceof Error ? err.message : String(err));
@@ -85,11 +93,11 @@ async function runTask(task: { id: string; prompt: string }): Promise<void> {
         if (p.turn > 1) log("task", task.id, `— continuing (turn ${p.turn}, ${p.iterations}/${MAX_TOTAL_TOOL_CALLS} calls, ${p.tools} tools)`);
       },
     });
-    await post("/api/local-tasks/finish", { id: task.id, status: "DONE", result });
+    await post("/api/local-tasks/finish", { id: task.id, status: "DONE", result, agent_id: AGENT_ID });
     log("finished task", task.id, "(DONE,", String(result.length), "chars)");
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    await post("/api/local-tasks/finish", { id: task.id, status: "FAILED", error: msg }).catch(() => {});
+    await post("/api/local-tasks/finish", { id: task.id, status: "FAILED", error: msg, agent_id: AGENT_ID }).catch(() => {});
     log("task", task.id, "FAILED:", msg.slice(0, 200));
   } finally {
     clearInterval(hb);

@@ -19,9 +19,13 @@ import { SCHEMA_VERSION } from "./db/schema";
 import { buildToolRegistry } from "./agent/tools";
 import type { ToolRegistry } from "./core/tools/registry";
 import { runDoctor } from "./core/doctor";
+import { isToolCallSequenceError, repairToolCallSequence, trimTranscript } from "./core/transcript";
 import { collectiveMetrics, runChaosTest, runOrgAnalyst } from "./core/org/intelligence";
+import { resolveDaemonAgentId } from "./core/org/agents";
 import { createTask } from "./core/tasks/model";
 import { hashPassword, timingSafeEqual, verifyPassword } from "./core/auth/passwords";
+import { estimateCost } from "./core/model/pricing";
+import { meterModelCall } from "./core/model/meter";
 import {
   assignTask,
   budgetStatus,
@@ -42,6 +46,7 @@ import {
   scoreProduct,
 } from "./core/perceptual/manager";
 import { newId, nowIso } from "./ids";
+import { isTerminalTaskStatus, GovernanceError } from "./core/tasks/evidence";
 import type { AgentRun, DoctorLog, Task } from "./types";
 import type { ModelCallRecord as _M } from "./core/model/types";
 type ModelCall = _M;
@@ -145,27 +150,102 @@ interface ChatMsg {
   name?: string;
 }
 
+/** One streamed delta from the provider (content and/or reasoning text). */
+interface ChatDelta {
+  text?: string;
+  reasoning?: string;
+}
+
+/**
+ * Build the provider request body. Tool names are sanitized for the wire
+ * (DeepSeek forbids dots in names). Transcript hygiene is enforced here too —
+ * never put an assistant `tool_calls` message without one `tool` response per
+ * id on the wire (instant HTTP 400); single pass, no-op when already valid.
+ */
+function chatRequestBody(
+  model: string,
+  messages: ChatMsg[],
+  registry: ToolRegistry,
+  stream: boolean,
+  noTools = false,
+): string {
+  const repaired = repairToolCallSequence(messages);
+  if (repaired !== messages) messages.splice(0, messages.length, ...repaired);
+  return JSON.stringify({
+    model,
+    messages,
+    ...(noTools ? {} : { tools: registry.functionSchemas(), tool_choice: "auto" }),
+    max_tokens: 2048,
+    stream,
+    ...(stream ? { stream_options: { include_usage: true } } : {}),
+  });
+}
+
+function recordChatCost(
+  store: ExecutiveStore,
+  model: string,
+  usage: { prompt_tokens?: number; completion_tokens?: number } | undefined,
+  latencyMs: number,
+  fallbackChars = 0,
+  attribution: { sessionId?: string; runId?: string } = {},
+): void {
+  // Priced by the shared meter so the dollars booked here are identical to the
+  // dollars every other provider call books (see core/model/meter.ts).
+  //
+  // The meter is handed the REAL store on purpose. This function used to pass a
+  // shim ({ record: recordCost, addTokenUse: () => {} }) that wrote the
+  // model_costs ledger and THREW AWAY the token_budgets increment — every real
+  // provider call was therefore invisible to the budget meter, and the two
+  // halves of the same feature could never agree. meterModelCall is now the
+  // single writer for both tables: there is no path that writes one without
+  // the other.
+  meterModelCall(store, {
+    model,
+    taskType: "chat",
+    usage,
+    latencyMs,
+    fallbackChars,
+    sessionId: attribution.sessionId,
+    runId: attribution.runId,
+  });
+}
+
+/**
+ * Test-only hook: exercise the REAL non-streaming provider call path
+ * (request build -> fetch -> usage parse -> recordChatCost -> meter) against a
+ * stubbed global fetch, so the metering path can be asserted with pinned
+ * provider numbers instead of a mocked meter.
+ *
+ * This is not a re-export of different behaviour: it is the same function the
+ * Durable Object calls, surfaced so the metering test does not have to reach
+ * into module internals.
+ */
+export function callDeepSeekForTest(
+  apiKey: string,
+  messages: ChatMsg[],
+  registry: ToolRegistry,
+  store: ExecutiveStore,
+  model = "deepseek-chat",
+  opts: { signal?: AbortSignal; noTools?: boolean; sessionId?: string; runId?: string } = {},
+): Promise<ChatMsg> {
+  return callDeepSeek(apiKey, messages, registry, store, model, opts);
+}
+
 async function callDeepSeek(
   apiKey: string,
   messages: ChatMsg[],
   registry: ToolRegistry,
-  recordCost: (c: ModelCall) => void,
+  store: ExecutiveStore,
   model = "deepseek-chat",
+  opts: { signal?: AbortSignal; noTools?: boolean; sessionId?: string; runId?: string } = {},
 ): Promise<ChatMsg> {
-  // Tool names are sanitized for the wire (DeepSeek forbids dots in names).
-  const tools = registry.functionSchemas();
+  const attribution = { sessionId: opts.sessionId, runId: opts.runId };
   const started = Date.now();
   const res = await fetch(DEEPSEEK_URL, {
     method: "POST",
     headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model,
-      messages,
-      tools,
-      tool_choice: "auto",
-      max_tokens: 2048,
-      stream: false,
-    }),
+    body: chatRequestBody(model, messages, registry, false, opts.noTools === true),
+    signal: opts.signal,
   });
   const latencyMs = Date.now() - started;
   if (!res.ok) {
@@ -178,19 +258,138 @@ async function callDeepSeek(
   };
   const message = data.choices?.[0]?.message;
   if (!message) throw new Error("Empty model response");
-  const inputTokens = data.usage?.prompt_tokens ?? 0;
-  const outputTokens = data.usage?.completion_tokens ?? 0;
-  recordCost({
-    provider: "deepseek",
-    model,
-    taskType: "chat",
-    inputTokens,
-    outputTokens,
-    cost: (inputTokens / 1_000_000) * 0.27 + (outputTokens / 1_000_000) * 1.1,
-    latencyMs,
-    timestamp: new Date().toISOString(),
-  });
+  recordChatCost(store, model, data.usage, latencyMs, 0, attribution);
   return message;
+}
+
+/**
+ * Streaming completion (audit gap 1): forwards content + reasoning deltas to
+ * `onDelta` as they arrive and assembles the final assistant message —
+ * including `tool_calls`, whose id/name/arguments arrive as fragments spread
+ * across deltas — exactly like the non-streaming path. `signal` makes stop
+ * (audit gap 6) actually cancel the in-flight provider request.
+ */
+async function callDeepSeekStream(
+  apiKey: string,
+  messages: ChatMsg[],
+  registry: ToolRegistry,
+  store: ExecutiveStore,
+  model: string,
+  onDelta: (d: ChatDelta) => void,
+  signal?: AbortSignal,
+  attribution: { sessionId?: string; runId?: string } = {},
+): Promise<ChatMsg> {
+  const started = Date.now();
+  const res = await fetch(DEEPSEEK_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    body: chatRequestBody(model, messages, registry, true),
+    signal,
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`DeepSeek HTTP ${res.status}: ${body.slice(0, 300)}`);
+  }
+  if (!res.body) throw new Error("Empty model response");
+
+  // Minimal structural view of an OpenAI-compatible SSE frame.
+  interface StreamFrame {
+    choices?: Array<{
+      delta?: {
+        content?: string;
+        reasoning_content?: string;
+        tool_calls?: Array<{ index?: number; id?: string; type?: string; function?: { name?: string; arguments?: string } }>;
+      };
+    }>;
+    usage?: { prompt_tokens?: number; completion_tokens?: number };
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let content = "";
+  let reasoning = "";
+  let usage: { prompt_tokens?: number; completion_tokens?: number } | undefined;
+  let sawFrame = false;
+  const calls: Array<{ id: string; type: string; function: { name: string; arguments: string } }> = [];
+
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (payload === "[DONE]") continue;
+      let frame: StreamFrame;
+      try {
+        frame = JSON.parse(payload) as StreamFrame;
+      } catch {
+        continue;
+      }
+      sawFrame = true;
+      if (frame.usage) usage = frame.usage;
+      const delta = frame.choices?.[0]?.delta;
+      if (!delta) continue;
+      if (typeof delta.content === "string" && delta.content.length > 0) {
+        content += delta.content;
+        onDelta({ text: delta.content });
+      }
+      if (typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0) {
+        reasoning += delta.reasoning_content;
+        onDelta({ reasoning: delta.reasoning_content });
+      }
+      if (Array.isArray(delta.tool_calls)) {
+        for (const tc of delta.tool_calls) {
+          const idx = typeof tc.index === "number" ? tc.index : calls.length;
+          const slot = (calls[idx] ??= { id: "", type: "function", function: { name: "", arguments: "" } });
+          if (tc.id) slot.id = tc.id;
+          if (tc.type) slot.type = tc.type;
+          if (tc.function?.name) slot.function.name += tc.function.name;
+          if (tc.function?.arguments) slot.function.arguments += tc.function.arguments;
+        }
+      }
+    }
+  }
+  if (!sawFrame) throw new Error("Empty model response");
+  recordChatCost(store, model, usage, Date.now() - started, content.length + reasoning.length, attribution);
+  const message: ChatMsg = { role: "assistant", content };
+  const usable = calls.filter((c) => c.id && c.function.name);
+  if (usable.length > 0) message.tool_calls = usable;
+  return message;
+}
+
+/** Models the chat may run on (audit gap 10 — no more hardcoded single model). */
+const CHAT_MODELS = ["deepseek-chat", "deepseek-reasoner"] as const;
+const DEFAULT_CHAT_MODEL = "deepseek-chat";
+
+function normalizeChatModel(model: unknown): string {
+  return typeof model === "string" && (CHAT_MODELS as readonly string[]).includes(model) ? model : DEFAULT_CHAT_MODEL;
+}
+
+/**
+ * Human-readable manifest for files attached to a chat message. The bytes live
+ * in uploaded_files; this tells the agent what was attached and how to read it
+ * (`executive.get_file { id }`).
+ */
+function attachmentManifest(list: unknown): string {
+  if (!Array.isArray(list) || list.length === 0) return "";
+  const parts: string[] = [];
+  for (const raw of list.slice(0, 8)) {
+    if (!raw || typeof raw !== "object") continue;
+    const rec = raw as { id?: unknown; name?: unknown; kind?: unknown };
+    const id = typeof rec.id === "string" ? rec.id : "";
+    if (!id) continue;
+    const name = (typeof rec.name === "string" ? rec.name : "file").slice(0, 120);
+    const kind = typeof rec.kind === "string" ? `, ${rec.kind}` : "";
+    parts.push(`${name} (id=${id}${kind})`);
+  }
+  if (parts.length === 0) return "";
+  return `[attachments] ${parts.join(", ")} — read them with executive.get_file { id } when relevant.`;
 }
 
 const SYSTEM_PROMPT = `You are the Zarlino Executive OS — the autonomous operator of Zarlino Audio, a small audio-plugins company (ZTame, ZScorch). You run the business through tools and a durable store.
@@ -210,6 +409,14 @@ function buildSystemContext(env: Env): ChatMsg {
   };
 }
 
+/** Keep an auto-generated title short, single-line and free of quotes/markup. */
+function sanitizeChatTitle(raw: string): string {
+  const firstLine = raw.split("\n").map((l) => l.trim()).find((l) => l.length > 0) ?? "";
+  const cleaned = firstLine.replace(/^["'`*#\s]+/, "").replace(/["'`*\s]+$/, "").replace(/[.:;,]+$/, "").trim();
+  if (cleaned.length <= 64) return cleaned;
+  return `${cleaned.slice(0, 61).trim()}...`;
+}
+
 /**
  * Run one agent turn (chat or task-driven) with the tool loop. Bounded by
  * maxIterations. Records messages + cost. Returns the final assistant text.
@@ -222,26 +429,47 @@ async function agentLoop(opts: {
   runId?: string;
   messages: ChatMsg[];
   onChunk?: (text: string) => void;
+  /** When set, the model is called with `stream: true` and every delta is forwarded. */
+  onDelta?: (d: ChatDelta) => void;
+  /** Progress narration for the UI ("running web.search", …). */
+  onStatus?: (status: { label: string; tool?: string }) => void;
+  /** Cancels the in-flight provider call (founder pressed stop). */
+  signal?: AbortSignal;
+  model?: string;
   maxIterations?: number;
 }): Promise<{ text: string; iterations: number; toolsCalled: number; limitReached: boolean }> {
   const apiKey = opts.env.DEEPSEEK_API_KEY;
   if (!apiKey) throw new Error("DEEPSEEK_API_KEY not configured — set it as a Worker secret.");
+  const model = opts.model ?? "deepseek-chat";
   const store = opts.store;
   const maxIter = opts.maxIterations ?? 8;
   const messages = [...opts.messages];
+  // THE fix for the meter divergence: this sink used to write ONLY the
+  // model_costs ledger. Every real provider call therefore left token_budgets
+  // untouched, so the budget knob (and productivity.budget_status) reported a
+  // tiny hand-entered number while the ledger reported the real spend.
+  // Booking through meterModelCall keeps ledger and budget identical by
+  // construction, priced from the one shared table.
+  // Books BOTH tables through the one meter: model_costs (the ledger every
+  // dollar figure is summed from) and token_budgets (what the budget gate and
+  // productivity.budget_status read). Writing them by hand here is how they
+  // drifted apart in the first place.
   const recordCost = (c: ModelCall) => {
+    const tokens = c.inputTokens + c.outputTokens;
+    if (tokens > 0) store.addTokenUse("global", undefined, tokens, c.cost);
     store.record({ ...c, sessionId: opts.sessionId, runId: opts.runId });
   };
   let iterations = 0;
   let toolsCalled = 0;
   // Keep the in-memory transcript bounded so very long runs don't overflow the
-  // model context window (system + prompt head, recent tail).
+  // model context window (system + prompt head, recent tail). The trim is
+  // tool-call-group aligned: a raw `slice(0, 10)` + `slice(-70)` cut used to
+  // split an assistant `tool_calls` message from its `tool` responses, and
+  // because this array is checkpointed below, that one bad cut made EVERY
+  // later auto-resume replay an invalid request (DeepSeek HTTP 400).
   const prune = () => {
-    if (messages.length > 100) {
-      const head = messages.slice(0, 10);
-      const tail = messages.slice(-70);
-      messages.splice(0, messages.length, ...head, ...tail);
-    }
+    if (messages.length <= 100) return;
+    messages.splice(0, messages.length, ...trimTranscript(messages, { keepHead: 10, keepTail: 70 }));
   };
 
   for (let i = 0; i < maxIter; i++) {
@@ -250,7 +478,34 @@ async function agentLoop(opts: {
     // this, any run executing >15min was reaped as a "restart orphan" by the
     // Doctor's maintenance sweep even though it was actively working.
     if (opts.runId) store.heartbeatAgentRun(opts.runId, iterations, toolsCalled);
-    const reply = await callDeepSeek(apiKey, messages, opts.registry, recordCost);
+    let reply: ChatMsg;
+    try {
+      reply = opts.onDelta
+        ? await callDeepSeekStream(apiKey, messages, opts.registry, store, model, opts.onDelta, opts.signal, {
+            sessionId: opts.sessionId,
+            runId: opts.runId,
+          })
+        : await callDeepSeek(apiKey, messages, opts.registry, store, model, {
+            signal: opts.signal,
+            sessionId: opts.sessionId,
+            runId: opts.runId,
+          });
+    } catch (err) {
+      // Self-heal a broken tool-call sequence (e.g. a checkpoint written by an
+      // older build) and retry once instead of failing the whole run.
+      if (!isToolCallSequenceError(err)) throw err;
+      messages.splice(0, messages.length, ...repairToolCallSequence(messages));
+      reply = opts.onDelta
+        ? await callDeepSeekStream(apiKey, messages, opts.registry, store, model, opts.onDelta, opts.signal, {
+            sessionId: opts.sessionId,
+            runId: opts.runId,
+          })
+        : await callDeepSeek(apiKey, messages, opts.registry, store, model, {
+            signal: opts.signal,
+            sessionId: opts.sessionId,
+            runId: opts.runId,
+          });
+    }
     messages.push(reply);
     const toolCalls = reply.tool_calls;
     if (toolCalls && toolCalls.length > 0) {
@@ -293,6 +548,9 @@ async function agentLoop(opts: {
           messages.push({ role: "tool", tool_call_id: call.id, content: message });
           continue;
         }
+        // Narrate progress: tool phases produce no content deltas, so the UI
+        // would otherwise show an empty bubble while real work happens.
+        opts.onStatus?.({ label: `running ${realName}`, tool: realName });
         const result = await opts.registry.run(realName, safeParseArgs(call.function.arguments), {
           env: opts.env as unknown as Record<string, string | undefined>,
           store,
@@ -321,12 +579,15 @@ async function agentLoop(opts: {
       }
       // Durable transcript so a continued run resumes where it left off
       // (checkpointAgentRun also refreshes last_heartbeat).
+      opts.onStatus?.({ label: "thinking" });
       prune();
       if (opts.runId) store.checkpointAgentRun(opts.runId, JSON.stringify(messages));
       continue;
     }
     const text = String(reply.content ?? "");
-    opts.onChunk?.(text);
+    // With true streaming the text already reached the client delta-by-delta —
+    // re-sending the whole reply through onChunk would duplicate it.
+    if (!opts.onDelta) opts.onChunk?.(text);
     return { text, iterations, toolsCalled, limitReached: false };
   }
   // Ran out of iterations while still requesting tools — the caller decides
@@ -431,7 +692,12 @@ async function executeAgentRun(store: ExecutiveStore, registry: ToolRegistry, en
     if (run.checkpoint_json) {
       try {
         const parsed = JSON.parse(run.checkpoint_json) as ChatMsg[];
-        if (Array.isArray(parsed) && parsed.length > 0 && parsed[0]?.role === "system") initial = parsed;
+        if (Array.isArray(parsed) && parsed.length > 0 && parsed[0]?.role === "system") {
+          // Heal checkpoints written by builds whose trim could split a
+          // tool-call group — otherwise every resume of this run replays the
+          // same invalid request and fails with HTTP 400 forever.
+          initial = repairToolCallSequence(parsed);
+        }
       } catch {
         /* malformed checkpoint — fall back to the prompt */
       }
@@ -452,7 +718,17 @@ async function executeAgentRun(store: ExecutiveStore, registry: ToolRegistry, en
       return;
     }
     store.finishAgentRun(run.id, "DONE", result.text);
-    if (run.task_id) store.updateTask(run.task_id, { status: "DONE", completed_at: nowIso() } as never);
+    if (run.task_id) {
+      // Closed-loop governance: the autonomous sweep obeys the same gate as
+      // every other caller. If the run produced no evidence, the task stays
+      // open (and the run note says so) instead of silently claiming DONE.
+      try {
+        store.setTaskStatus(run.task_id, "DONE");
+      } catch (gateErr) {
+        const msg = gateErr instanceof Error ? gateErr.message : String(gateErr);
+        store.finishAgentRun(run.id, "DONE", result.text, `Task left OPEN by the evidence gate: ${msg}`);
+      }
+    }
   } catch (err) {
     store.finishAgentRun(run.id, "FAILED", undefined, err instanceof Error ? err.message : String(err));
   }
@@ -604,6 +880,8 @@ const ALARM_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
 export class ExecutiveAgent {
   private readonly sql: Sql;
   private readonly store: ExecutiveStore;
+  /** In-flight chat streams, so POST /api/chat/stop can really cancel them. */
+  private readonly chatAborts = new Map<string, AbortController>();
 
   constructor(
     private readonly state: DurableObjectState,
@@ -1050,11 +1328,18 @@ export class ExecutiveAgent {
     // Chat
     if (path === "/api/chat" && method === "POST") return this.handleChat(request);
     if (path === "/api/chat/sessions" && method === "GET") {
-      return json({ sessions: this.store.listChatSessions(50) });
+      const limit = Math.max(1, Math.min(100, Number(url.searchParams.get("limit")) || 40));
+      const offset = Math.max(0, Number(url.searchParams.get("offset")) || 0);
+      const page = this.store.listChatSessions(limit + 1, offset);
+      return json({ sessions: page.slice(0, limit), hasMore: page.length > limit, total: this.store.countChatSessions() });
     }
     if (path === "/api/chat/messages" && method === "GET") {
       const sessionId = url.searchParams.get("sessionId") ?? "default";
-      return json({ messages: this.store.listChatMessages(sessionId, 200) });
+      const limit = Math.max(1, Math.min(300, Number(url.searchParams.get("limit")) || 80));
+      const before = url.searchParams.get("before") ?? undefined;
+      const page = this.store.listChatMessagesPage(sessionId, { limit, before });
+      const title = this.store.getChatSessionTitle(sessionId);
+      return json({ ...page, title: title?.title ?? null });
     }
     if (path === "/api/chat/stream" && method === "GET") {
       const id = url.searchParams.get("streamId") ?? url.searchParams.get("id") ?? "";
@@ -1065,6 +1350,41 @@ export class ExecutiveAgent {
       const body = (await readBody<{ sessionId?: string }>(request).catch(() => ({}))) as { sessionId?: string };
       this.store.clearChat(body.sessionId ?? "default");
       return json({ ok: true });
+    }
+    // Chat enhancements (audit gaps 4, 5, 6, 12, 16, 26)
+    if (path === "/api/chat/stop" && method === "POST") {
+      const body = (await readBody<{ streamId?: string }>(request).catch(() => ({}))) as { streamId?: string };
+      const ctrl = body.streamId ? this.chatAborts.get(body.streamId) : undefined;
+      if (ctrl) ctrl.abort();
+      return json({ ok: true, stopped: Boolean(ctrl) });
+    }
+    if (path === "/api/chat/rate" && method === "POST") {
+      const body = (await readBody<{ messageId?: string; rating?: number }>(request).catch(() => ({}))) as { messageId?: string; rating?: number };
+      if (!body.messageId) return json({ error: "messageId required" }, 400);
+      const rating = body.rating === 1 ? 1 : body.rating === -1 ? -1 : 0;
+      this.store.rateChatMessage(body.messageId, rating);
+      return json({ ok: true, rating });
+    }
+    if (path === "/api/chat/rename" && method === "POST") {
+      const body = (await readBody<{ sessionId?: string; title?: string }>(request).catch(() => ({}))) as { sessionId?: string; title?: string };
+      const sessionId = body.sessionId ?? "default";
+      const title = (body.title ?? "").trim().slice(0, 80);
+      if (!title) return json({ error: "title required" }, 400);
+      this.store.setChatSessionTitle(sessionId, title, "founder");
+      return json({ ok: true, title });
+    }
+    if (path === "/api/chat/truncate" && method === "POST") {
+      const body = (await readBody<{ sessionId?: string; messageId?: string }>(request).catch(() => ({}))) as { sessionId?: string; messageId?: string };
+      if (!body.messageId) return json({ error: "messageId required" }, 400);
+      const removed = this.store.truncateChatFrom(body.sessionId ?? "default", body.messageId);
+      return json({ ok: true, removed });
+    }
+    if (path === "/api/chat/regenerate" && method === "POST") {
+      const body = (await readBody<{ sessionId?: string; model?: string; stream?: boolean }>(request).catch(() => ({}))) as { sessionId?: string; model?: string; stream?: boolean };
+      const sessionId = body.sessionId ?? "default";
+      const last = this.store.lastAssistantMessage(sessionId);
+      if (last) this.store.truncateChatFrom(sessionId, last.id);
+      return this.runChatReply(sessionId, normalizeChatModel(body.model), body.stream === true);
     }
 
     // Files
@@ -1086,7 +1406,19 @@ export class ExecutiveAgent {
 
     // Tasks
     if (path === "/api/tasks" && method === "GET") {
-      return json({ tasks: this.store.listTasks({ limit: 100 }).map((t) => ({ id: t.id, title: t.title, status: t.status, priority: t.priority, project_id: t.project_id, created_at: t.created_at })) });
+      const counts = this.store.countTaskEvidence();
+      return json({
+        tasks: this.store.listTasks({ limit: 100 }).map((t) => ({
+          id: t.id,
+          title: t.title,
+          status: t.status,
+          priority: t.priority,
+          project_id: t.project_id,
+          close_reason: t.close_reason ?? null,
+          evidence: counts[t.id] ?? { total: 0, verified: 0 },
+          created_at: t.created_at,
+        })),
+      });
     }
     if (path === "/api/tasks" && method === "POST") {
       const body = (await readBody<{ title?: string; description?: string; priority?: string }>(request).catch(() => ({}))) as { title?: string; description?: string; priority?: string };
@@ -1096,21 +1428,81 @@ export class ExecutiveAgent {
       return json({ ok: true, id: task.id });
     }
     const taskPatch = /^\/api\/tasks\/([^/]+)$/.exec(path);
+    if (taskPatch && method === "GET") {
+      const id = decodeURIComponent(taskPatch[1]!);
+      const withEvidence = this.store.getTaskWithEvidence(id);
+      if (!withEvidence) return json({ error: "Task not found" }, 404);
+      return json({ task: withEvidence });
+    }
     if (taskPatch && method === "PATCH") {
       const id = decodeURIComponent(taskPatch[1]!);
       const task = this.store.getTask(id);
       if (!task) return json({ error: "Task not found" }, 404);
-      const body = (await readBody<{ status?: string; priority?: string }>(request).catch(() => ({}))) as { status?: string; priority?: string };
+      const body = (await readBody<{ status?: string; priority?: string; mode?: string; overrideReason?: string }>(request).catch(() => ({}))) as { status?: string; priority?: string; mode?: string; overrideReason?: string };
       const patch: Partial<Task> = {};
       if (body.status) {
         if (!["OPEN", "IN_PROGRESS", "BLOCKED", "DONE", "CANCELLED"].includes(body.status)) return json({ error: "Invalid status" }, 400);
-        patch.status = body.status as never;
-        if (body.status === "DONE") patch.completed_at = nowIso();
+        if (isTerminalTaskStatus(body.status)) {
+          // Closed-loop governance: a task cannot reach DONE / CANCELLED on a
+          // bare status write. Throws GovernanceError(409, EVIDENCE_REQUIRED)
+          // when the task carries no verifiable evidence.
+          this.store.setTaskStatus(id, body.status, {
+            mode: body.mode === "founder_override" ? "founder_override" : undefined,
+            overrideReason: body.overrideReason,
+          });
+        } else {
+          patch.status = body.status as never;
+        }
       }
       if (body.priority && ["P0", "P1", "P2", "P3"].includes(body.priority)) patch.priority = body.priority as never;
-      this.store.updateTask(id, patch);
-      return json({ ok: true });
+      if (Object.keys(patch).length > 0) this.store.updateTask(id, patch);
+      const after = this.store.getTask(id);
+      return json({
+        ok: true,
+        id,
+        status: after?.status,
+        close_reason: after?.close_reason ?? null,
+        evidence: this.store.listTaskEvidence(id).map((e) => ({ id: e.id, kind: e.kind, locator: e.locator, verified: e.verified })),
+      });
     }
+    // Task evidence: the only thing that makes a task closable.
+    const taskEvidenceRoute = /^\/api\/tasks\/([^/]+)\/evidence$/.exec(path);
+    if (taskEvidenceRoute && method === "GET") {
+      const id = decodeURIComponent(taskEvidenceRoute[1]!);
+      if (!this.store.getTask(id)) return json({ error: "Task not found" }, 404);
+      return json({ taskId: id, evidence: this.store.listTaskEvidence(id) });
+    }
+    if (taskEvidenceRoute && method === "POST") {
+      const id = decodeURIComponent(taskEvidenceRoute[1]!);
+      const body = ((await readBody<Record<string, unknown>>(request).catch(() => ({}))) ?? {}) as Record<string, unknown>;
+      const item = this.store.addTaskEvidence(id, {
+        kind: body.kind,
+        locator: body.locator,
+        summary: body.summary,
+        verification_command: body.verification_command ?? body.verificationCommand,
+        verification_output: body.verification_output ?? body.verificationOutput,
+        verified: body.verified,
+        source: "founder",
+      });
+      this.store.insertAudit({
+        id: newId("aud"),
+        actor: "founder",
+        action: "task.evidence.attach",
+        entity_type: "task_evidence",
+        entity_id: item.id,
+        detail_json: JSON.stringify({ task_id: id, kind: item.kind, locator: item.locator }),
+        source: "api",
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      });
+      return json({ ok: true, evidence: item });
+    }
+    const taskEvidenceDelete = /^\/api\/tasks\/evidence\/([^/]+)$/.exec(path);
+    if (taskEvidenceDelete && method === "DELETE") {
+      const evId = decodeURIComponent(taskEvidenceDelete[1]!);
+      return json({ ok: true, deleted: this.store.deleteTaskEvidence(evId) });
+    }
+
 
     // Approvals
     if (path === "/api/approvals" && method === "GET") {
@@ -1230,6 +1622,26 @@ export class ExecutiveAgent {
         source: body.source as string | undefined,
       });
       return json({ ok: true, agent: this.store.getOrgAgent(body.id) });
+    }
+    const agentDeregister = /^\/api\/org\/agents\/([^/]+)$/.exec(path);
+    if (agentDeregister && method === "DELETE") {
+      // Deregister a dead instance (the Doctor's stale-agent action, §31).
+      const id = decodeURIComponent(agentDeregister[1]!);
+      const agent = this.store.getOrgAgent(id);
+      if (!agent) return json({ error: "Agent not found" }, 404);
+      this.store.deleteOrgAgent(id);
+      this.store.insertAudit({
+        id: newId("aud"),
+        actor: "founder",
+        action: "org.agent.deregister",
+        entity_type: "org_agents",
+        entity_id: id,
+        detail_json: JSON.stringify({ role_id: agent.role_id }),
+        source: "api",
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      });
+      return json({ ok: true, id });
     }
     if (path === "/api/org/task-contracts" && method === "GET") {
       return json({ contracts: this.store.listTaskContracts({ limit: 100 }) });
@@ -2000,7 +2412,13 @@ export class ExecutiveAgent {
             updated_at: nowIso(),
           });
         },
-        recordCost: (c) => this.store.record(c),
+        // BOTH tables, always: a tool that spends money must move the same
+        // meter the budget gate reads. This used to be ledger-only.
+        recordCost: (c) => {
+          const tokens = c.inputTokens + c.outputTokens;
+          if (tokens > 0) this.store.addTokenUse("global", undefined, tokens, c.cost);
+          this.store.record(c);
+        },
       });
       return json(result);
     }
@@ -2267,21 +2685,24 @@ export class ExecutiveAgent {
 
     // Local agent health beacon (daemon pings every ~30s).
     if (path === "/api/local-agent/heartbeat" && method === "POST") {
-      const body = (await readBody<{ host?: string; version?: string; pid?: string; claimed?: boolean }>(request).catch(() => ({}))) as { host?: string; version?: string; pid?: string; claimed?: boolean };
-      this.store.upsertLocalAgentHeartbeat({ host: body.host, version: body.version, pid: body.pid, claimed: body.claimed });
+      const body = (await readBody<{ host?: string; version?: string; pid?: string; claimed?: boolean; agent_id?: string }>(request).catch(() => ({}))) as { host?: string; version?: string; pid?: string; claimed?: boolean; agent_id?: string };
+      // Each physical runtime registers under its own instance id (validated;
+      // role is pinned — a heartbeat can never grant itself a role).
+      const agentId = resolveDaemonAgentId(body.agent_id);
+      this.store.upsertLocalAgentHeartbeat({ host: body.host, version: body.version, pid: body.pid, claimed: body.claimed, id: agentId });
       // AOrgI registry: the daemon is a real runtime instance — register it
       // (software-engineering role: it executes local build/render/tooling
       // capability) with the same heartbeat so org liveness is honest.
       this.store.upsertOrgAgent({
-        id: "local_daemon_01",
+        id: agentId,
         roleId: "role_software_engineering",
         kind: "local",
         model: "deepseek-v4",
-        host: body.host ?? "local",
+        host: body.host ?? agentId,
         version: body.version,
         capabilitiesJson: JSON.stringify(["local_execution", "build", "render", "automation"]),
       });
-      return json({ ok: true, lastSeen: nowIso() });
+      return json({ ok: true, lastSeen: nowIso(), agentId });
     }
 
     // Local machine daemon bridge
@@ -2299,13 +2720,15 @@ export class ExecutiveAgent {
       return json({ ok: true });
     }
     if (path === "/api/local-tasks/finish" && method === "POST") {
-      const body = (await readBody<{ id?: string; status?: string; result?: string; error?: string }>(request).catch(() => ({}))) as { id?: string; status?: string; result?: string; error?: string };
+      const body = (await readBody<{ id?: string; status?: string; result?: string; error?: string; agent_id?: string }>(request).catch(() => ({}))) as { id?: string; status?: string; result?: string; error?: string; agent_id?: string };
       this.store.finishLocalTask(body.id ?? "", (body.status === "FAILED" ? "FAILED" : "DONE") as never, body.result, body.error);
       // AOrgI Phase 2 — every finished local task is real evidence and a real
       // protocol message, not theater: trust for the daemon's local-execution
       // capability moves with measured outcomes; the COA receives a RESULT
       // (or DEVIATION on failure) message tied to the task.
-      this.store.recordTrustEvidence("local_daemon_01", "local_execution", body.status !== "FAILED");
+      // Attribute the outcome to the instance that finished (two-runtime
+      // honesty, AOrgI §7) — never to a hardcoded default.
+      this.store.recordTrustEvidence(resolveDaemonAgentId(body.agent_id), "local_execution", body.status !== "FAILED");
       this.store.sendOrgMessage({
         fromRole: "role_software_engineering",
         toRole: "role_coa",
@@ -2338,59 +2761,206 @@ export class ExecutiveAgent {
   // -- chat ------------------------------------------------------------------
 
   private async handleChat(request: Request): Promise<Response> {
-    const body = (await readBody<{ message?: string; sessionId?: string; stream?: boolean }>(request).catch(() => ({}))) as { message?: string; sessionId?: string; stream?: boolean };
+    const body = (await readBody<{
+      message?: string;
+      sessionId?: string;
+      stream?: boolean;
+      model?: string;
+      attachments?: Array<{ id?: string; name?: string; kind?: string }>;
+    }>(request).catch(() => ({}))) as {
+      message?: string;
+      sessionId?: string;
+      stream?: boolean;
+      model?: string;
+      attachments?: Array<{ id?: string; name?: string; kind?: string }>;
+    };
     const message = (body.message ?? "").trim();
     if (!message) return json({ error: "message required" }, 400);
     const sessionId = body.sessionId ?? "default";
-    const registry = this.buildRegistry();
-
-    // Record the user message.
+    // Attachments were uploaded to /api/files first; the manifest lets the
+    // agent read them back with executive.get_file (audit gap 11).
+    const manifest = attachmentManifest(body.attachments);
+    const content = manifest ? `${message}\n\n${manifest}` : message;
     const now = nowIso();
-    this.store.insertChatMessage({ id: newId("msg"), session_id: sessionId, role: "user", content: message, source: "founder", created_at: now, updated_at: now });
+    this.store.insertChatMessage({ id: newId("msg"), session_id: sessionId, role: "user", content, source: "founder", created_at: now, updated_at: now });
+    return this.runChatReply(sessionId, normalizeChatModel(body.model), body.stream === true);
+  }
 
-    // Build history (system + last N messages).
-    const history = this.store.listChatMessages(sessionId, 40);
+  /** Start a turn: stream into a new chat_streams row, or run it synchronously. */
+  private async runChatReply(sessionId: string, model: string, stream: boolean): Promise<Response> {
+    if (stream) {
+      const streamId = newId("str");
+      this.store.openChatStream(streamId, sessionId, nowIso());
+      const promise = this.executeChatTurn(sessionId, model, streamId);
+      const holder = this.state as unknown as { waitUntil?: (p: Promise<unknown>) => void };
+      if (holder.waitUntil) holder.waitUntil(promise);
+      else void promise;
+      return json({ ok: true, streamId, sessionId, model });
+    }
+    try {
+      const result = await this.executeChatTurn(sessionId, model, null);
+      return json({ ok: true, reply: result.text, iterations: result.iterations, toolsCalled: result.toolsCalled, cancelled: result.cancelled });
+    } catch (err) {
+      return json({ error: err instanceof Error ? err.message : String(err) }, 502);
+    }
+  }
+
+  /** Model context for a session: system prompt + the last 40 stored messages. */
+  private chatContext(sessionId: string): ChatMsg[] {
     const messages: ChatMsg[] = [buildSystemContext(this.env)];
-    for (const m of history) {
+    for (const m of this.store.listChatMessagesTail(sessionId, 40)) {
       if (m.role === "user") messages.push({ role: "user", content: m.content });
       else if (m.role === "assistant") messages.push({ role: "assistant", content: m.content });
     }
+    return messages;
+  }
 
-    if (body.stream === true) {
-      // Kick off async streaming into a chat_streams row.
-      const streamId = newId("str");
-      this.store.openChatStream(streamId, sessionId, nowIso());
-      const promise = (async () => {
-        try {
-          const result = await agentLoop({
-            store: this.store,
-            registry,
-            env: this.env,
-            sessionId,
-            messages,
-            onChunk: (text) => this.store.appendChatStreamChunk(streamId, text),
-            maxIterations: 8,
-          });
-          const now2 = nowIso();
-          this.store.insertChatMessage({ id: newId("msg"), session_id: sessionId, role: "assistant", content: result.text, source: "executive", created_at: now2, updated_at: now2 });
-          this.store.completeChatStream(streamId);
-        } catch (err) {
-          this.store.completeChatStream(streamId, err instanceof Error ? err.message : String(err));
+  /**
+   * Execute one chat turn with real provider streaming (gap 1), codepoint-safe
+   * frame batching (gap 26) and true cancellation (gap 6). Persists the
+   * assistant message — including a partial answer when the founder stopped
+   * mid-reply — and best-effort names a brand-new conversation (gap 26).
+   */
+  private async executeChatTurn(
+    sessionId: string,
+    model: string,
+    streamId: string | null,
+  ): Promise<{ text: string; iterations: number; toolsCalled: number; cancelled: boolean }> {
+    const registry = this.buildRegistry();
+    const messages = this.chatContext(sessionId);
+    const controller = new AbortController();
+    if (streamId) this.chatAborts.set(streamId, controller);
+
+    // Frames are JSON ({text}/{reasoning}/{status}/{cancelled}) so the relay can
+    // pass them straight through. They are batched (one write per ~200ms, not
+    // per token) and a flush never splits a UTF-16 surrogate pair — splitting
+    // one would decode as mojibake / U+FFFD mid-emoji.
+    let queue: string[] = [];
+    let pending = "";
+    let lastFlush = Date.now();
+    let partial = "";
+    const push = (frame: Record<string, unknown>) => { queue.push(JSON.stringify(frame)); };
+    const drain = () => {
+      if (streamId && queue.length > 0) {
+        this.store.appendChatStreamChunks(streamId, queue);
+        queue = [];
+      }
+    };
+    const flush = (force = false) => {
+      if (pending.length === 0) return;
+      if (!force && pending.length < 400 && Date.now() - lastFlush < 200) return;
+      let text = pending;
+      let held = "";
+      const lastUnit = text.charCodeAt(text.length - 1);
+      if (lastUnit >= 0xd800 && lastUnit <= 0xdbff) {
+        held = text.slice(-1);
+        text = text.slice(0, -1);
+      }
+      pending = held;
+      if (text.length > 0) push({ text });
+      lastFlush = Date.now();
+      drain();
+    };
+
+    let cancelled = false;
+    let text = "";
+    let iterations = 0;
+    let toolsCalled = 0;
+    try {
+      const result = await agentLoop({
+        store: this.store,
+        registry,
+        env: this.env,
+        sessionId,
+        model,
+        messages,
+        maxIterations: 8,
+        signal: controller.signal,
+        onDelta: streamId
+          ? (d) => {
+              if (d.text) { partial += d.text; pending += d.text; flush(); }
+              if (d.reasoning) { push({ reasoning: d.reasoning }); drain(); }
+            }
+          : undefined,
+        onStatus: streamId ? (s) => { push({ status: s.label, tool: s.tool }); drain(); } : undefined,
+      });
+      text = result.text;
+      iterations = result.iterations;
+      toolsCalled = result.toolsCalled;
+    } catch (err) {
+      if (!controller.signal.aborted) {
+        flush(true);
+        const message = err instanceof Error ? err.message : String(err);
+        if (streamId) {
+          push({ error: message });
+          drain();
+          this.store.completeChatStream(streamId, message);
+          this.chatAborts.delete(streamId);
         }
-      })();
-      // Best-effort: keep the work alive past the response where the runtime
-      // exposes waitUntil on the DO state.
-      (this.state as unknown as { waitUntil?: (p: Promise<unknown>) => void }).waitUntil?.(promise);
-      return json({ ok: true, streamId, sessionId, note: "Poll /api/chat/stream?id=… to read the reply." });
+        throw err;
+      }
+      // Stopped by the founder: keep what they already saw and mark the stream
+      // cancelled so the UI says "stopped", not "failed" (gap 6).
+      cancelled = true;
+      text = partial;
+      if (streamId) push({ cancelled: true });
     }
 
+    flush(true);
+    drain();
+    if (streamId) {
+      this.chatAborts.delete(streamId);
+      this.store.completeChatStream(streamId);
+    }
+
+    const answer = text.trim().length > 0 ? text : "";
+    if (answer.length > 0) {
+      const now = nowIso();
+      this.store.insertChatMessage({
+        id: newId("msg"), session_id: sessionId, role: "assistant", content: answer, model, source: "executive", created_at: now, updated_at: now,
+      });
+    }
+    this.maybeGenerateTitle(sessionId, messages, answer);
+    return { text: answer, iterations, toolsCalled, cancelled };
+  }
+
+  /**
+   * LLM auto-title (gap 26): one cheap, tool-less call to name a brand-new
+   * conversation. Skipped when a title already exists (a founder rename wins)
+   * and never throws — a missing title is cosmetic.
+   */
+  private maybeGenerateTitle(sessionId: string, transcript: ChatMsg[], reply: string): void {
     try {
-      const result = await agentLoop({ store: this.store, registry, env: this.env, sessionId, messages, maxIterations: 8 });
-      const now2 = nowIso();
-      this.store.insertChatMessage({ id: newId("msg"), session_id: sessionId, role: "assistant", content: result.text, source: "executive", created_at: now2, updated_at: now2 });
-      return json({ ok: true, reply: result.text, iterations: result.iterations, toolsCalled: result.toolsCalled });
-    } catch (err) {
-      return json({ error: err instanceof Error ? err.message : String(err) }, 502);
+      if (this.store.getChatSessionTitle(sessionId)) return;
+      const firstUser = transcript.find((m) => m.role === "user")?.content ?? "";
+      if (!firstUser.trim() || !reply.trim()) return;
+      const apiKey = this.env.DEEPSEEK_API_KEY;
+      if (!apiKey) return;
+      const promise = (async () => {
+        try {
+          const out = await callDeepSeek(
+            apiKey,
+            [
+              { role: "system", content: "You name chat threads. Reply with 2-5 words. No quotes, no trailing punctuation, no 'chat about'." },
+              { role: "user", content: `First message: ${firstUser.slice(0, 300)}\nAnswer summary: ${reply.slice(0, 500)}\n\nTitle:` },
+            ],
+            this.buildRegistry(),
+            // The real store, not an empty function. An unmetered title call is real
+            // provider spend that no meter ever sees — the same defect class as
+            // the budget/ledger split, at a smaller scale.
+            this.store,
+            "deepseek-chat",
+            { noTools: true, sessionId },
+          );
+          const title = sanitizeChatTitle(String(out.content ?? ""));
+          if (title.length >= 3) this.store.setChatSessionTitle(sessionId, title, "auto");
+        } catch {
+          /* cosmetic */
+        }
+      })();
+      this.state.waitUntil(promise);
+    } catch {
+      /* cosmetic */
     }
   }
 
@@ -2507,6 +3077,9 @@ async function handleChatSse(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const streamId = url.searchParams.get("streamId") ?? "";
   const auth = request.headers.get("Authorization") ?? "";
+  // Resume support (gap 7): the client reconnects with `after` = the number of
+  // frames it already consumed, so a dropped connection loses nothing.
+  const resumeAfter = Math.max(0, Number(url.searchParams.get("after")) || 0);
   if (!streamId) return json({ error: "streamId required" }, 400);
 
   const id = env.EXECUTIVE_AGENT.idFromName("zarlino");
@@ -2515,8 +3088,9 @@ async function handleChatSse(request: Request, env: Env): Promise<Response> {
 
   const body = new ReadableStream<Uint8Array>({
     async start(controller) {
-      let after = 0;
-      const timeout = 5 * 60 * 1000;
+      let after = resumeAfter;
+      // Tool loops legitimately run for minutes; 5 min used to cut replies off.
+      const timeout = 10 * 60 * 1000;
       const started = Date.now();
       try {
         // Poll the DO's buffered stream until it completes.
@@ -2537,14 +3111,24 @@ async function handleChatSse(request: Request, env: Env): Promise<Response> {
           }
           const data = (await res.json()) as { chunks: string[]; nextIndex: number; complete: boolean; error?: string };
           for (const chunk of data.chunks ?? []) {
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text: chunk })}\n\n`));
+            // Frames are stored pre-encoded ({"text":…}/{"reasoning":…}/{"status":…}/{"cancelled":true}).
+            // Legacy rows hold raw strings — wrap those so old streams still work.
+            let frame = chunk;
+            try {
+              JSON.parse(chunk);
+            } catch {
+              frame = JSON.stringify({ text: chunk });
+            }
+            controller.enqueue(encoder.encode(`data: ${frame}\n\n`));
           }
           after = data.nextIndex ?? after;
           if (data.complete) {
             controller.enqueue(encoder.encode(`event: done\ndata: ${JSON.stringify({ error: data.error ?? null })}\n\n`));
             break;
           }
-          await new Promise((r) => setTimeout(r, 250));
+          // Tighter cadence so streamed tokens land promptly; the DO batches
+          // writes at ~200ms so this does not hammer the database.
+          await new Promise((r) => setTimeout(r, 150));
         }
       } catch (err) {
         controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ error: err instanceof Error ? err.message : String(err) })}\n\n`));
@@ -2557,7 +3141,7 @@ async function handleChatSse(request: Request, env: Env): Promise<Response> {
       }
     },
     cancel() {
-      /* client disconnected — stop polling */
+      /* client disconnected — stop polling (the DO keeps working; POST /api/chat/stop cancels that) */
     },
   });
 

@@ -1,0 +1,13 @@
+# Line-ending normalization — a CRLF checkout must behave identically to CI/LF.
+# (A CRLF worktree once failed the local-run-tests source scan; never again.)
+* text=auto
+*.ts text eol=lf
+*.tsx text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.toml text eol=lf
+*.ps1 text eol=crlf
+*.vbs text eol=crlf

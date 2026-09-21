@@ -1,0 +1,54 @@
+    {
+      name: "projects.add_task_evidence",
+      description:
+        "Attach verifiable evidence to a task. A task cannot be marked DONE (or CANCELLED) without at least one item here. Use kind=commit for a diff/sha, kind=command_output with the RAW command output, kind=file for a repo path, kind=review for a review id, kind=artifact for a build artifact, kind=url for a link. Evidence is the only thing that lets a task be closed.",
+      inputSchema: taskEvidenceSchema,
+      requiredPermission: "create",
+      riskLevel: "LOW",
+      reversible: true,
+      auditRequired: true,
+      run: async (ctx: ToolContext, input: z.infer<typeof taskEvidenceSchema>) => {
+        const store = ctx.store;
+        if (!store) throw new Error("store unavailable");
+        const item = store.addTaskEvidence(input.taskId, {
+          kind: input.kind,
+          locator: input.locator,
+          summary: input.summary,
+          verification_command: input.verificationCommand,
+          verification_output: input.verificationOutput,
+          verified: input.verified,
+          source: "executive",
+        });
+        return { id: item.id, taskId: item.task_id, kind: item.kind, verified: item.verified };
+      },
+    },
+    {
+      name: "projects.list_task_evidence",
+      description: "List the evidence attached to a task (what its DONE state actually rests on).",
+      inputSchema: taskIdSchema,
+      requiredPermission: "read",
+      riskLevel: "LOW",
+      reversible: true,
+      auditRequired: false,
+      run: async (ctx: ToolContext, input: z.infer<typeof taskIdSchema>) => {
+        const store = ctx.store;
+        if (!store) throw new Error("store unavailable");
+        const task = store.getTask(input.taskId);
+        if (!task) throw new Error(`Task ${input.taskId} not found`);
+        return {
+          taskId: task.id,
+          status: task.status,
+          closeReason: task.close_reason ?? null,
+          evidence: store.listTaskEvidence(task.id).map((e) => ({
+            id: e.id,
+            kind: e.kind,
+            locator: e.locator,
+            summary: e.summary,
+            verified: e.verified,
+            verificationCommand: e.verification_command ?? null,
+            verificationOutput: e.verification_output ?? null,
+            createdAt: e.created_at,
+          })),
+        };
+      },
+    },

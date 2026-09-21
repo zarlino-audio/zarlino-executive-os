@@ -9,6 +9,9 @@ export type AutonomyMode = "CONTROLLED" | "DELEGATED" | "FULL";
 export type Confidence = "FACT" | "ESTIMATE" | "ASSUMPTION" | "UNKNOWN";
 export type Priority = "P0" | "P1" | "P2" | "P3";
 export type TaskStatus = "OPEN" | "IN_PROGRESS" | "BLOCKED" | "DONE" | "CANCELLED";
+
+// Closed-loop governance: the evidence model a task's DONE state depends on.
+export type { TaskEvidence, EvidenceKind, VerificationMode } from "./core/tasks/evidence";
 export type DecisionStatus = "DRAFT" | "DECIDED" | "EXECUTING" | "DONE" | "ABANDONED";
 export type DecisionOutcome = "PENDING" | "SUCCESS" | "PARTIAL" | "FAILED";
 export type ApprovalStatus = "PENDING" | "APPROVED" | "REJECTED" | "CANCELLED";
@@ -107,6 +110,9 @@ export interface Task {
   created_at: string;
   updated_at: string;
   completed_at?: string;
+  // Closed-loop governance (migration v31): only set when the task was
+  // closed via the explicit founder override rather than verified evidence.
+  close_reason?: string;
   // Task contract (AOrgI migration v23): acceptance criteria, independent
   // verification owner, autonomy level (L0-L3), deadline, escalation path.
   acceptance_criteria?: string;
@@ -700,6 +706,17 @@ export interface ChatMessage {
   role: string;
   content: string;
   model?: string;
+  /** +1 / -1 founder feedback (migration v30); null/undefined = unrated. */
+  rating?: number | null;
+  source: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Explicit, editable conversation title (migration v30). */
+export interface ChatSessionTitle {
+  session_id: string;
+  title: string;
   source: string;
   created_at: string;
   updated_at: string;

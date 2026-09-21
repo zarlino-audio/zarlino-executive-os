@@ -18,6 +18,10 @@ import { paystackTools } from "../integrations/paystack";
 import { doctorTools } from "../core/doctor";
 import { assessFinancials } from "../core/finance/calc";
 import { createTask } from "../core/tasks/model";
+import {
+  EVIDENCE_KINDS,
+  isTerminalTaskStatus,
+} from "../core/tasks/evidence";
 import { createApprovalRequest } from "../core/approvals/queue";
 import {
   assignTask,
@@ -67,8 +71,21 @@ const taskUpdateSchema = z.object({
   status: z.enum(["OPEN", "IN_PROGRESS", "BLOCKED", "DONE", "CANCELLED"]).optional(),
   priority: z.enum(["P0", "P1", "P2", "P3"]).optional(),
   dueDate: z.string().optional(),
+  // Closed-loop governance: the ONLY way to reach DONE/CANCELLED without
+  // evidence. Requires a written reason (>= 10 chars), stored as the task's
+  // close_reason so an override is visible, never disguised as verification.
+  overrideReason: z.string().min(10).max(1000).optional(),
 });
 const taskIdSchema = z.object({ taskId: z.string().min(1) });
+const taskEvidenceSchema = z.object({
+  taskId: z.string().min(1),
+  kind: z.enum(EVIDENCE_KINDS),
+  locator: z.string().min(1).max(1000).describe("path, commit sha, review id, artifact id or url"),
+  summary: z.string().min(1).max(2000).describe("what this shows and how it was produced"),
+  verificationCommand: z.string().max(2000).optional(),
+  verificationOutput: z.string().max(20000).optional().describe("the RAW output - a claim without output is not evidence"),
+  verified: z.boolean().optional(),
+});
 const campaignIdSchema = z.object({ campaignId: z.string().min(1) });
 const experimentSchema = z.object({
   name: z.string().min(1).max(200),
@@ -233,12 +250,26 @@ function internalTools(): Tool[] {
         if (!store) throw new Error("store unavailable");
         const existing = store.getTask(input.taskId);
         if (!existing) throw new Error(`Task ${input.taskId} not found`);
+        // Closed-loop governance: a terminal status goes through the gate,
+        // which refuses DONE/CANCELLED without verifiable evidence.
+        if (input.status && isTerminalTaskStatus(input.status)) {
+          store.setTaskStatus(input.taskId, input.status, {
+            mode: input.overrideReason ? "founder_override" : undefined,
+            overrideReason: input.overrideReason,
+          });
+        }
         const patch: Record<string, string> = {};
-        if (input.status) patch.status = input.status;
+        if (input.status && !isTerminalTaskStatus(input.status)) patch.status = input.status;
         if (input.priority) patch.priority = input.priority;
         if (input.dueDate) patch.due_date = input.dueDate;
         store.updateTask(input.taskId, patch as never);
-        return { id: input.taskId, updated: true };
+        const evidence = store.listTaskEvidence(input.taskId);
+        return {
+          id: input.taskId,
+          updated: true,
+          status: store.getTask(input.taskId)?.status,
+          evidenceCount: evidence.length,
+        };
       },
     },
     {
@@ -252,10 +283,68 @@ function internalTools(): Tool[] {
       run: async (ctx: ToolContext, input: z.infer<typeof taskIdSchema>) => {
         const store = ctx.store;
         if (!store) throw new Error("store unavailable");
-        store.updateTask(input.taskId, { status: "DONE", completed_at: nowIso() } as never);
-        return { id: input.taskId, status: "DONE" };
+        // The gate refuses DONE when the task carries no verifiable evidence
+        // (EVIDENCE_REQUIRED) - the exact failure mode this layer exists to
+        // make impossible.
+        const task = store.setTaskStatus(input.taskId, "DONE");
+        return { id: task.id, status: task.status, evidenceCount: store.listTaskEvidence(task.id).length };
       },
     },
+    {
+      name: "projects.add_task_evidence",
+      description:
+        "Attach verifiable evidence to a task. A task cannot be marked DONE (or CANCELLED) without at least one item here. Use kind=commit for a diff/sha, kind=command_output with the RAW command output, kind=file for a repo path, kind=review for a review id, kind=artifact for a build artifact, kind=url for a link. Evidence is the only thing that lets a task be closed.",
+      inputSchema: taskEvidenceSchema,
+      requiredPermission: "create",
+      riskLevel: "LOW",
+      reversible: true,
+      auditRequired: true,
+      run: async (ctx: ToolContext, input: z.infer<typeof taskEvidenceSchema>) => {
+        const store = ctx.store;
+        if (!store) throw new Error("store unavailable");
+        const item = store.addTaskEvidence(input.taskId, {
+          kind: input.kind,
+          locator: input.locator,
+          summary: input.summary,
+          verification_command: input.verificationCommand,
+          verification_output: input.verificationOutput,
+          verified: input.verified,
+          source: "executive",
+        });
+        return { id: item.id, taskId: item.task_id, kind: item.kind, verified: item.verified };
+      },
+    },
+    {
+      name: "projects.list_task_evidence",
+      description: "List the evidence attached to a task (what its DONE state actually rests on).",
+      inputSchema: taskIdSchema,
+      requiredPermission: "read",
+      riskLevel: "LOW",
+      reversible: true,
+      auditRequired: false,
+      run: async (ctx: ToolContext, input: z.infer<typeof taskIdSchema>) => {
+        const store = ctx.store;
+        if (!store) throw new Error("store unavailable");
+        const task = store.getTask(input.taskId);
+        if (!task) throw new Error(`Task ${input.taskId} not found`);
+        return {
+          taskId: task.id,
+          status: task.status,
+          closeReason: task.close_reason ?? null,
+          evidence: store.listTaskEvidence(task.id).map((e) => ({
+            id: e.id,
+            kind: e.kind,
+            locator: e.locator,
+            summary: e.summary,
+            verified: e.verified,
+            verificationCommand: e.verification_command ?? null,
+            verificationOutput: e.verification_output ?? null,
+            createdAt: e.created_at,
+          })),
+        };
+      },
+    },
+
     {
       name: "marketing.get_campaign",
       description: "Get a marketing campaign by id",

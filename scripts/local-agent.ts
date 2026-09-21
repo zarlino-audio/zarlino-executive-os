@@ -21,6 +21,16 @@
 import { exec as execRaw } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, copyFileSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { isToolCallSequenceError, repairToolCallSequence, trimTranscript } from "../src/core/transcript.js";
+
+// UTF-8 byte length of a string. Do NOT use String.length for byte counts:
+// it returns UTF-16 code units, so every non-ASCII glyph understates the
+// real size (e.g. "Caf\u00e9" is 4 chars but 5 bytes; an emoji is 2 units
+// but 4-7 bytes). Reporting .length as "bytes" was the local read/write
+// path's encoding defect (sites: local_write_file, local_plugin_ui).
+function byteLen(text: string): number {
+  return Buffer.byteLength(text, "utf8");
+}
 
 // Async exec (promisified) — NEVER use execSync here: a long local command
 // (build, ctest, deploy) can run up to the 10-min timeout, and a blocking
@@ -35,8 +45,15 @@ import { loadDotEnv } from "./dotenv.js";
 
 // ---- paths -----------------------------------------------------------------
 const SCRIPT_DIR = resolve(fileURLToPath(import.meta.url), "..");
-export const REPO_ROOT = resolve(SCRIPT_DIR, "..", ".."); // …/plugin
-export const EXEC_OS = join(REPO_ROOT, "executive-os");
+// The OS root is always the parent of scripts/ — both the monorepo layout
+// (plugin/executive-os) and the standalone repo layout satisfy this.
+export const EXEC_OS = resolve(SCRIPT_DIR, "..");
+// The plugin workspace (builds, renders, website) is either provided by the
+// environment — a remote machine sets ZARLINO_WORKSPACE — or, on the founder
+// machine, is the monorepo root one level above the OS folder.
+export const REPO_ROOT = process.env.ZARLINO_WORKSPACE
+  ? resolve(String(process.env.ZARLINO_WORKSPACE))
+  : resolve(EXEC_OS, "..");
 export const WEBSITE = join(REPO_ROOT, "zarlino-website");
 
 // ---- env -------------------------------------------------------------------
@@ -75,13 +92,36 @@ export interface LocalTool {
 }
 
 export async function runCommand(cmd: string, cwd: string): Promise<string> {
+  // SHELL CORRECTNESS (the local_run_tests defect). The command string is
+  // executed by the HOST shell via child_process.exec, which on Windows
+  // spawns %COMSPEC% (cmd.exe). The string must be runnable by THAT shell and
+  // must not embed another shell's cmdlets or utilities:
+  //
+  //   npx vitest run 2>&1 | Select-Object -Last 12   <- PowerShell cmdlet
+  //   npx vitest run 2>&1 | tail -n 12                <- no tail.exe on Windows
+  //
+  // Both died with is-not-recognized errors, so NO output-limiting pipeline
+  // stage is embedded here: the command stays plain host-shell text and the
+  // bound is applied to the CAPTURED TEXT below, in TypeScript.
   try {
     const { stdout } = await exec(cmd, { cwd, encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 600_000, windowsHide: true });
-    return stdout.length > 8000 ? stdout.slice(0, 8000) + "\n…(truncated)" : stdout;
+    return truncateOutput(stdout);
   } catch (err) {
     const e = err as { stdout?: string; stderr?: string; message?: string };
-    return `COMMAND FAILED:\n${(e.stdout || "")}\n${(e.stderr || e.message || "").slice(0, 4000)}`;
+    return truncateOutput([e.stdout || "", e.stderr || e.message || ""].join("\n"), 4000);
   }
+}
+
+/**
+ * Bound captured command output WITHOUT a shell pipeline stage. Keeps the LAST
+ * `max` characters, not the first: the tail of a build/test log is where
+ * vitest prints its pass/fail summary.
+ */
+export function truncateOutput(text: string, max = 8000): string {
+  const s = String(text ?? "");
+  return s.length > max
+    ? "…(truncated, showing last " + max + " chars)\n" + s.slice(s.length - max)
+    : s;
 }
 
 // ---- plugin-factory helpers -----------------------------------------------------
@@ -261,7 +301,7 @@ export const TOOLS: LocalTool[] = [
     description: "Run the Executive OS test suite (vitest)",
     parameters: { type: "object", properties: {} },
     needsConfirm: false,
-    run: async () => runCommand("npx vitest run 2>&1 | Select-Object -Last 12", EXEC_OS),
+    run: async () => runCommand("npx vitest run 2>&1", EXEC_OS),
   },
   {
     name: "local_build_console",
@@ -293,7 +333,7 @@ export const TOOLS: LocalTool[] = [
       const build = await runCommand("npm run build", WEBSITE);
       if (build.includes("FAILED")) return build;
       const wrangler = join(EXEC_OS, "node_modules", ".bin", "wrangler.cmd");
-      return await runCommand(`& "${wrangler}" deploy 2>&1 | Select-Object -Last 6`, WEBSITE);
+      return await runCommand(`& "${wrangler}" deploy 2>&1`, WEBSITE);
     },
   },
 
@@ -397,7 +437,7 @@ export const TOOLS: LocalTool[] = [
       const buildDir = join(REPO_ROOT, "build");
       const ctest = join(PY_SCRIPTS, "ctest.exe");
       if (!existsSync(join(buildDir, "CTestTestfile.cmake"))) return "build/ not configured — run local_build_plugin first";
-      const cmd = `& "${ctest}" --test-dir "${buildDir}" -C Release --output-on-failure -R "${plugin}" 2>&1 | Select-Object -Last 25`;
+      const cmd = `& "${ctest}" --test-dir "${buildDir}" -C Release --output-on-failure -R "${plugin}" 2>&1`;
       return runPowerShell(cmd);
     },
   },
@@ -685,7 +725,7 @@ if ($alive) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
         const chunk = text.slice(start, start + limit);
         const hasMore = start + chunk.length < total;
         return (
-          `--- ${plugin}/Source/${rel} (${total} bytes; showing ${start}..${start + chunk.length}) ---\n` +
+          `--- ${plugin}/Source/${rel} (${byteLen(text)} bytes; showing ${start}..${start + chunk.length}) ---\n` +
           chunk +
           (hasMore ? `\n…(more — re-call local_plugin_ui action=read with offset=${start + chunk.length} for the next chunk)` : "")
         );
@@ -698,7 +738,7 @@ if ($alive) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
         for (const f of uiFiles.slice(0, 12)) {
           const p = join(srcDir, f);
           const text = readFileSync(p, "utf8");
-          parts.push(`\n===== ${f} (${text.length} bytes) =====\n${text.length > 20000 ? text.slice(0, 20000) + "\n…(truncated)" : text}`);
+          parts.push(`\n===== ${f} (${byteLen(text)} bytes) =====\n${text.length > 20000 ? text.slice(0, 20000) + "\n…(truncated)" : text}`);
         }
         return parts.join("\n");
       }
@@ -788,6 +828,12 @@ export const TOOL_SCHEMAS = TOOLS.map((t) => ({
 
 // ---- model --------------------------------------------------------------------
 export async function callDeepSeek(messages: Array<Record<string, unknown>>): Promise<Record<string, unknown>> {
+  // Never send a structurally invalid transcript: an assistant `tool_calls`
+  // message without one `tool` response per id is an instant HTTP 400
+  // ("An assistant message with 'tool_calls' must be followed by tool messages
+  // responding to each 'tool_call_id'"). No-op when already valid.
+  const repaired = repairToolCallSequence(messages);
+  if (repaired !== messages) messages.splice(0, messages.length, ...repaired);
   const res = await fetch("https://api.deepseek.com/chat/completions", {
     method: "POST",
     headers: { Authorization: `Bearer ${API_KEY}`, "Content-Type": "application/json" },
@@ -907,7 +953,17 @@ export async function runTurn(
     const turnCalls = Math.min(perTurn, totalBudget - total);
     for (let i = 0; i < turnCalls; i++) {
       total++;
-      const reply = await callDeepSeek(messages);
+      let reply: Record<string, unknown>;
+      try {
+        reply = await callDeepSeek(messages);
+      } catch (err) {
+        // Self-heal a broken tool-call sequence and retry once — without this,
+        // one malformed transcript kills an hours-long task outright.
+        if (!isToolCallSequenceError(err)) throw err;
+        console.log("\x1b[33m⚠ transcript repair: retrying with a rebuilt tool-call sequence\x1b[0m");
+        messages.splice(0, messages.length, ...repairToolCallSequence(messages));
+        reply = await callDeepSeek(messages);
+      }
       messages.push(reply);
       const toolCalls = reply.tool_calls as Array<{ id: string; function: { name: string; arguments: string } }> | undefined;
       if (toolCalls && toolCalls.length > 0) {
@@ -928,10 +984,12 @@ export async function runTurn(
     }
     // Keep the conversation bounded: system + history + original prompt, then
     // the most recent exchange (drop the middle once it grows very large).
+    // The trim is tool-call-group aligned — a raw `slice(0, 20)` + `slice(-60)`
+    // could keep an assistant `tool_calls` message and drop its `tool`
+    // responses (or the reverse), which DeepSeek rejects with HTTP 400
+    // ("insufficient tool messages following tool_calls message").
     if (messages.length > 100) {
-      const head = messages.slice(0, 20);
-      const tail = messages.slice(-60);
-      messages.splice(0, messages.length, ...head, ...tail);
+      messages.splice(0, messages.length, ...trimTranscript(messages, { keepHead: 20, keepTail: 60 }));
     }
     console.log(`\x1b[33m↻ turn ${turn}: ${total}/${totalBudget} calls used, continuing…\x1b[0m`);
     messages.push({

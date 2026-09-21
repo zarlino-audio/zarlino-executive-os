@@ -11,7 +11,7 @@
  *   - tests (node:sqlite).
  */
 
-export const SCHEMA_VERSION = 29;
+export const SCHEMA_VERSION = 32;
 
 /**
  * System Doctor (migration v17): persistent log of every Doctor run — what
@@ -1805,3 +1805,30 @@ CREATE TABLE IF NOT EXISTS org_topology_proposals (
 CREATE INDEX IF NOT EXISTS idx_org_topology_status ON org_topology_proposals(status);
 CREATE INDEX IF NOT EXISTS idx_org_topology_role ON org_topology_proposals(role_id);
 `;
+
+/**
+ * Chat enhancements (migration v30): founder feedback on assistant messages
+ * and durable, editable conversation titles.
+ *
+ * - `chat_messages.rating` — +1 / -1 thumbs feedback (NULL = unrated). This is
+ *   the quality signal the audit's gap 12 called out as missing; it is
+ *   additive so every existing row stays valid.
+ * - `chat_session_titles` — a human (or auto-generated) title per session,
+ *   overriding the derived "first message" text. Rename is gap 16, LLM
+ *   auto-title is gap 26; both write here.
+ */
+export const CHAT_ENHANCE_SQL = `
+ALTER TABLE chat_messages ADD COLUMN rating INTEGER;
+
+CREATE TABLE IF NOT EXISTS chat_session_titles (
+  session_id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'founder',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_chat_titles_updated ON chat_session_titles(updated_at);
+`;
+
+export { TASK_EVIDENCE_SQL } from "./task-evidence-schema";
+export { METER_USAGE_SQL } from "./meter-usage-schema";

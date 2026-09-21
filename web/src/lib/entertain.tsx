@@ -209,87 +209,386 @@ function decodeEntities(s: string): string {
     .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)));
 }
 
-function inline(s: string, key: number): ReactNode[] {
-  // Split code spans first, then bold/italic on the remainder.
-  const parts = s.split(/(`[^`]+`)/g);
-  return parts.map((p, i) => {
-    if (p.startsWith("`") && p.endsWith("`")) return <code key={`${key}-${i}`}>{p.slice(1, -1)}</code>;
-    const bold = p.split(/(\*\*[^*]+\*\*)/g);
-    return bold.map((b, j) => {
-      if (b.startsWith("**") && b.endsWith("**")) return <strong key={`${key}-${i}-${j}`}>{b.slice(2, -2)}</strong>;
-      const it = b.split(/(\*[^*]+\*)/g);
-      return it.map((x, k) =>
-        x.startsWith("*") && x.endsWith("*") && x.length > 2 ? <em key={`${key}-${i}-${j}-${k}`}>{x.slice(1, -1)}</em> : <span key={`${key}-${i}-${j}-${k}`}>{x}</span>,
-      );
-    });
-  });
+// ---- syntax highlighting (tiny, dependency-free) ---------------------------
+
+const HASH_COMMENT_LANGS = new Set(["python", "py", "bash", "sh", "shell", "zsh", "yaml", "yml", "toml", "rb", "ruby", "ps1", "powershell", "r", "pl", "perl", "ini", "conf"]);
+
+const KEYWORDS = new Set([
+  // JS/TS
+  "const", "let", "var", "function", "return", "if", "else", "for", "while", "do", "class", "extends", "super", "new", "import", "from", "export", "default", "async", "await", "try", "catch", "finally", "throw", "typeof", "instanceof", "interface", "type", "enum", "implements", "public", "private", "protected", "readonly", "static", "void", "yield", "of", "in", "this",
+  // Python
+  "def", "elif", "lambda", "pass", "raise", "with", "as", "global", "nonlocal", "assert", "del", "yield",
+  // SQL
+  "select", "from", "where", "insert", "update", "delete", "join", "left", "right", "inner", "outer", "group", "order", "by", "limit", "offset", "create", "table", "alter", "drop", "index", "values", "set", "into", "on", "having", "distinct", "union", "case", "when", "then", "end",
+  // Shell / misc
+  "echo", "cd", "ls", "grep", "then", "fi", "done", "export", "sudo", "npm", "npx", "git",
+]);
+
+const BOOLEANS = new Set(["true", "false", "null", "undefined", "None", "True", "False", "nil", "NaN", "Infinity"]);
+
+interface Tok { text: string; cls?: string }
+
+/**
+ * Minimal scanner that colours the constructs people actually read: comments,
+ * strings, numbers, keywords, booleans, function calls and properties. It is
+ * deliberately language-agnostic — it never needs to be "correct", only useful
+ * — and it emits class names the stylesheet already defines (.tok-*).
+ */
+function highlight(code: string, langRaw: string): Tok[] {
+  const lang = langRaw.toLowerCase();
+  const hashComments = HASH_COMMENT_LANGS.has(lang);
+  const out: Tok[] = [];
+  const isWord = (c: string | undefined) => !!c && /[A-Za-z0-9_$]/.test(c);
+  let i = 0;
+  while (i < code.length) {
+    const c = code[i]!;
+    const next = code[i + 1];
+    // block comment
+    if (c === "/" && next === "*") {
+      const end = code.indexOf("*/", i + 2);
+      const stop = end === -1 ? code.length : end + 2;
+      out.push({ text: code.slice(i, stop), cls: "tok-c" });
+      i = stop;
+      continue;
+    }
+    // line comment
+    if ((c === "/" && next === "/") || (hashComments && c === "#" && !isWord(code[i - 1]))) {
+      const end = code.indexOf("\n", i);
+      const stop = end === -1 ? code.length : end;
+      out.push({ text: code.slice(i, stop), cls: "tok-c" });
+      i = stop;
+      continue;
+    }
+    // strings (single, double, backtick)
+    if (c === '"' || c === "'" || c === "`") {
+      let j = i + 1;
+      while (j < code.length) {
+        if (code[j] === "\\") { j += 2; continue; }
+        if (code[j] === c) { j += 1; break; }
+        if (code[j] === "\n" && c !== "`") break;
+        j++;
+      }
+      out.push({ text: code.slice(i, j), cls: "tok-str" });
+      i = j;
+      continue;
+    }
+    // number
+    if (/[0-9]/.test(c) && !isWord(code[i - 1])) {
+      const m = /^[0-9][0-9a-fA-F_xX.]*(?:e[+-]?\d+)?/.exec(code.slice(i));
+      const text = m?.[0] ?? c;
+      out.push({ text, cls: "tok-num" });
+      i += text.length;
+      continue;
+    }
+    // word
+    if (isWord(c)) {
+      let j = i;
+      while (j < code.length && isWord(code[j])) j++;
+      const word = code.slice(i, j);
+      const lower = word.toLowerCase();
+      let cls: string | undefined;
+      if (KEYWORDS.has(word) || KEYWORDS.has(lower)) cls = "tok-kw";
+      else if (BOOLEANS.has(word)) cls = "tok-bool";
+      else if (code[j] === "(") cls = "tok-fn";
+      else if (code[j] === ":") cls = "tok-prop";
+      out.push({ text: word, cls });
+      i = j;
+      continue;
+    }
+    // tag-ish (<div …) for markup languages
+    if ((lang === "html" || lang === "xml" || lang === "svg") && c === "<") {
+      const m = /^<\/?[A-Za-z][\w:-]*/.exec(code.slice(i));
+      if (m) {
+        out.push({ text: m[0], cls: "tok-tag" });
+        i += m[0].length;
+        continue;
+      }
+    }
+    // operators / punctuation
+    if ("+-*/%=<>!&|^~?:;,.(){}[]".includes(c)) {
+      const m = /^(=>|===|!==|==|!=|<=|>=|&&|\|\||\?\?|\+\+|--|\.\.\.|\*\*|::|->|\+=|-=|\*=|\/=|[+\-*/%=<>!&|^~?:;,.(){}[\]])/.exec(code.slice(i));
+      const text = m?.[0] ?? c;
+      out.push({ text, cls: /[a-z]/i.test(text) ? "tok-op" : undefined });
+      i += text.length;
+      continue;
+    }
+    out.push({ text: c });
+    i++;
+  }
+  return out;
 }
 
-export function Markdown({ text }: { text: string }) {
-  const t = decodeEntities(text);
-  const lines = t.split(/\n/);
+/** Fenced code block: language pill + copy button + highlighted body. */
+function CodeBlock({ code, lang }: { code: string; lang: string }) {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(code);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1600);
+    } catch {
+      /* clipboard unavailable — no-op */
+    }
+  };
+  const tokens = highlight(code, lang);
+  return (
+    <div className="md-codeblock">
+      <div className="md-codeblock-head">
+        <span className="md-lang">{lang || "text"}</span>
+        <button type="button" className={copied ? "copied-ok" : ""} onClick={() => void copy()} aria-label={copied ? "Code copied" : "Copy code"}>
+          {copied ? "copied" : "copy"}
+        </button>
+      </div>
+      <pre>
+        <code>
+          {tokens.map((tk, i) => (tk.cls ? <span key={i} className={tk.cls}>{tk.text}</span> : <span key={i}>{tk.text}</span>))}
+        </code>
+      </pre>
+    </div>
+  );
+}
+
+// ---- markdown --------------------------------------------------------------
+
+/** Only these URL shapes are rendered as links/images (no javascript: etc.). */
+function safeUrl(url: string): boolean {
+  return /^(https?:\/\/|mailto:|data:image\/)/i.test(url.trim());
+}
+
+/** Turn bare http(s) URLs into anchors so pasted links are clickable. */
+function linkify(text: string, keyBase: string): ReactNode[] {
+  const parts = text.split(/(https?:\/\/[^\s<>()]+)/g);
+  return parts.map((p, i) =>
+    /^https?:\/\//.test(p) ? (
+      <a key={`${keyBase}-l${i}`} href={p} target="_blank" rel="noreferrer noopener">{p}</a>
+    ) : (
+      <span key={`${keyBase}-l${i}`}>{p}</span>
+    ),
+  );
+}
+
+function inlineNodes(text: string, keyBase: string): ReactNode[] {
+  const pattern = /(`[^`]+`)|(!\[[^\]]*\]\([^)\s]+\))|(\[[^\]]+\]\([^)\s]+\))|(\*\*[^*]+\*\*)|(~~[^~]+~~)|(\*[^*]+\*)|(_[^_\n]+_)/g;
   const out: ReactNode[] = [];
-  let list: string[] = [];
-  let code: string[] = [];
-  let inCode = false;
-
-  const flushList = (k: number) => {
-    if (list.length) {
-      out.push(
-        <ul key={`ul${k}`}>
-          {list.map((li, i) => (
-            <li key={i}>{inline(li.replace(/^[-*]\s+/, ""), k * 100 + i)}</li>
-          ))}
-        </ul>,
-      );
-      list = [];
-    }
-  };
-  const flushCode = (k: number) => {
-    if (code.length) {
-      out.push(<pre key={`pre${k}`}><code>{code.join("\n")}</code></pre>);
-      code = [];
-    }
-  };
-
-  lines.forEach((raw, i) => {
-    const line = raw.trimEnd();
-    if (line.startsWith("```")) {
-      if (inCode) {
-        flushCode(i);
-        inCode = false;
-      } else {
-        flushList(i);
-        inCode = true;
-      }
-      return;
-    }
-    if (inCode) {
-      code.push(line);
-      return;
-    }
-    if (/^\s*[-*]\s+/.test(line)) {
-      flushCode(i);
-      list.push(line);
-      return;
-    }
-    flushList(i);
-    flushCode(i);
-    if (line === "") {
-      out.push(<div key={i} className="md-gap" />);
-    } else if (line.startsWith("### ")) {
-      out.push(<h4 key={i}>{inline(line.slice(4), i)}</h4>);
-    } else if (line.startsWith("## ")) {
-      out.push(<h3 key={i}>{inline(line.slice(3), i)}</h3>);
-    } else if (line.startsWith("# ")) {
-      out.push(<h2 key={i}>{inline(line.slice(2), i)}</h2>);
+  let last = 0;
+  let n = 0;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(text)) !== null) {
+    if (m.index > last) out.push(<span key={`${keyBase}-t${n++}`}>{linkify(text.slice(last, m.index), `${keyBase}-t${n}`)}</span>);
+    const tok = m[0]!;
+    const key = `${keyBase}-${n++}`;
+    if (tok.startsWith("`")) {
+      out.push(<code key={key} className="md-inline-code">{tok.slice(1, -1)}</code>);
+    } else if (tok.startsWith("![")) {
+      const alt = /^!\[([^\]]*)\]/.exec(tok)?.[1] ?? "";
+      const src = /\]\(([^)]+)\)$/.exec(tok)?.[1] ?? "";
+      out.push(safeUrl(src) ? <img key={key} src={src} alt={alt} loading="lazy" /> : <span key={key}>{alt}</span>);
+    } else if (tok.startsWith("[")) {
+      const label = /^\[([^\]]+)\]/.exec(tok)?.[1] ?? tok;
+      const href = /\]\(([^)]+)\)$/.exec(tok)?.[1] ?? "";
+      out.push(safeUrl(href) ? <a key={key} href={href} target="_blank" rel="noreferrer noopener">{label}</a> : <span key={key}>{label}</span>);
+    } else if (tok.startsWith("**")) {
+      out.push(<strong key={key}>{tok.slice(2, -2)}</strong>);
+    } else if (tok.startsWith("~~")) {
+      out.push(<del key={key}>{tok.slice(2, -2)}</del>);
     } else {
-      out.push(<p key={i}>{inline(line, i)}</p>);
+      out.push(<em key={key}>{tok.slice(1, -1)}</em>);
     }
-  });
-  flushList(9999);
-  flushCode(9998);
-  return <div className="markdown">{out}</div>;
+    last = m.index + tok.length;
+  }
+  if (last < text.length) out.push(<span key={`${keyBase}-t${n++}`}>{linkify(text.slice(last), `${keyBase}-t${n}`)}</span>);
+  return out;
+}
+
+interface ListItem { indent: number; ordered: boolean; text: string; checked?: boolean }
+
+function buildList(items: ListItem[], keyBase: string): ReactNode {
+  if (items.length === 0) return null;
+  const Tag = items[0]!.ordered ? "ol" : "ul";
+  const nodes: ReactNode[] = [];
+  let i = 0;
+  while (i < items.length) {
+    const item = items[i]!;
+    const base = item.indent;
+    const children: ListItem[] = [];
+    let j = i + 1;
+    while (j < items.length && items[j]!.indent > base) {
+      children.push(items[j]!);
+      j++;
+    }
+    nodes.push(
+      <li key={`${keyBase}-i${i}`}>
+        {item.checked !== undefined && (
+          <input className="md-task-box" type="checkbox" checked={item.checked} readOnly tabIndex={-1} aria-hidden="true" />
+        )}
+        {inlineNodes(item.text, `${keyBase}-i${i}`)}
+        {children.length > 0 && <div className="md-nest">{buildList(children, `${keyBase}-i${i}n`)}</div>}
+      </li>,
+    );
+    i = j;
+  }
+  return <Tag key={`${keyBase}-list`}>{nodes}</Tag>;
+}
+
+function buildTable(rows: string[][], aligns: string[], keyBase: string): ReactNode {
+  const [head, ...body] = rows;
+  const align = (i: number) => ({ textAlign: (aligns[i] ?? "left") as "left" | "center" | "right" });
+  return (
+    <table key={keyBase} className="md-table">
+      <thead>
+        <tr>
+          {(head ?? []).map((cell, i) => (
+            <th key={i} style={align(i)}>{inlineNodes(cell, `${keyBase}-h${i}`)}</th>
+          ))}
+        </tr>
+      </thead>
+      <tbody>
+        {body.map((row, ri) => (
+          <tr key={ri}>
+            {row.map((cell, ci) => (
+              <td key={ci} style={align(ci)}>{inlineNodes(cell, `${keyBase}-${ri}-${ci}`)}</td>
+            ))}
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+/**
+ * Safe markdown renderer (React elements only — never dangerouslySetInnerHTML).
+ * Blocks: fenced code (highlighted + copy), headings, hr, blockquotes, GFM
+ * tables, ordered/unordered/nested/task lists, paragraphs with `<br>` on
+ * double-space. Inline: links, images, bold, italic, strikethrough, code and
+ * bare-URL linkifying.
+ */
+export function Markdown({ text, caret = false }: { text: string; caret?: boolean }) {
+  const t = decodeEntities(text);
+  const lines = t.split(/\r?\n/);
+  const out: ReactNode[] = [];
+  let key = 0;
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i] ?? "";
+
+    // fenced code
+    if (/^\s*```/.test(line)) {
+      const lang = line.trim().replace(/^```/, "").trim().split(/\s+/)[0] ?? "";
+      const buf: string[] = [];
+      i++;
+      while (i < lines.length && !/^\s*```/.test(lines[i] ?? "")) {
+        buf.push(lines[i] ?? "");
+        i++;
+      }
+      i++; // closing fence (or EOF)
+      out.push(<CodeBlock key={`cb${key++}`} code={buf.join("\n")} lang={lang} />);
+      continue;
+    }
+
+    // horizontal rule
+    if (/^\s*(---|\*\*\*|___)\s*$/.test(line)) {
+      out.push(<hr key={`hr${key++}`} />);
+      i++;
+      continue;
+    }
+
+    // blockquote
+    if (/^\s*>/.test(line)) {
+      const buf: string[] = [];
+      while (i < lines.length && /^\s*>/.test(lines[i] ?? "")) {
+        buf.push((lines[i] ?? "").replace(/^\s*>\s?/, ""));
+        i++;
+      }
+      out.push(<blockquote key={`bq${key++}`} className="md-quote">{inlineNodes(buf.join(" "), `bq${key}`)}</blockquote>);
+      continue;
+    }
+
+    // table
+    if (line.includes("|") && (lines[i + 1] ?? "").includes("-") && /^\s*\|?[\s:|-]+\|?\s*$/.test(lines[i + 1] ?? "")) {
+      const splitRow = (r: string) => r.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim());
+      const header = splitRow(line);
+      const aligns = splitRow(lines[i + 1] ?? "").map((c) => (c.startsWith(":") && c.endsWith(":") ? "center" : c.endsWith(":") ? "right" : "left"));
+      i += 2;
+      const body: string[][] = [];
+      while (i < lines.length && (lines[i] ?? "").includes("|") && (lines[i] ?? "").trim() !== "") {
+        body.push(splitRow(lines[i] ?? ""));
+        i++;
+      }
+      out.push(buildTable([header, ...body], aligns, `tb${key++}`));
+      continue;
+    }
+
+    // lists (ordered / unordered / nested / task)
+    if (/^\s*([-*+]|\d+[.)])\s+/.test(line)) {
+      const items: ListItem[] = [];
+      while (i < lines.length && /^\s*([-*+]|\d+[.)])\s+/.test(lines[i] ?? "")) {
+        const m = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/.exec(lines[i] ?? "")!;
+        const indent = Math.floor((m[1] ?? "").replace(/\t/g, "  ").length / 2);
+        const ordered = /^\d/.test(m[2] ?? "");
+        let bodyText = m[3] ?? "";
+        let checked: boolean | undefined;
+        const task = /^\[( |x|X)\]\s*(.*)$/.exec(bodyText);
+        if (task) {
+          checked = task[1] !== " ";
+          bodyText = task[2] ?? "";
+        }
+        items.push({ indent, ordered, text: bodyText, checked });
+        i++;
+      }
+      out.push(buildList(items, `ls${key++}`));
+      continue;
+    }
+
+    // headings
+    const heading = /^(#{1,6})\s+(.*)$/.exec(line);
+    if (heading) {
+      const level = (heading[1] ?? "#").length;
+      const content = inlineNodes(heading[2] ?? "", `h${key}`);
+      if (level === 1) out.push(<h2 key={`h${key++}`}>{content}</h2>);
+      else if (level === 2) out.push(<h3 key={`h${key++}`}>{content}</h3>);
+      else if (level === 3) out.push(<h4 key={`h${key++}`}>{content}</h4>);
+      else out.push(<h5 key={`h${key++}`}>{content}</h5>);
+      i++;
+      continue;
+    }
+
+    // blank line
+    if (line.trim() === "") {
+      out.push(<div key={`g${key++}`} className="md-gap" />);
+      i++;
+      continue;
+    }
+
+    // paragraph (consecutive plain lines; two trailing spaces = hard break)
+    const para: string[] = [];
+    while (
+      i < lines.length &&
+      (lines[i] ?? "").trim() !== "" &&
+      !/^\s*```/.test(lines[i] ?? "") &&
+      !/^\s*>/.test(lines[i] ?? "") &&
+      !/^\s*([-*+]|\d+[.)])\s+/.test(lines[i] ?? "") &&
+      !/^#{1,6}\s/.test(lines[i] ?? "") &&
+      !/^\s*(---|\*\*\*|___)\s*$/.test(lines[i] ?? "")
+    ) {
+      para.push(lines[i] ?? "");
+      i++;
+    }
+    const nodes: ReactNode[] = [];
+    para.forEach((raw, idx) => {
+      const hardBreak = /\s{2,}$/.test(raw);
+      nodes.push(<span key={`pl${idx}`}>{inlineNodes(raw.trimEnd(), `p${key}-${idx}`)}</span>);
+      if (idx < para.length - 1) nodes.push(hardBreak ? <br key={`br${idx}`} /> : <span key={`sp${idx}`}> </span>);
+    });
+    out.push(<p key={`p${key++}`}>{nodes}</p>);
+  }
+
+  return (
+    <div className="markdown" dir="auto">
+      {out}
+      {caret && <span className="md-caret" aria-hidden="true" />}
+    </div>
+  );
 }
 
 // ---- CommandPalette --------------------------------------------------------

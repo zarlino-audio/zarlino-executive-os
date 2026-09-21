@@ -1,0 +1,108 @@
+  // -- closed-loop governance: task evidence (migration v31) ---------------
+  /**
+   * Move a task to a new status, REFUSING terminal transitions (DONE /
+   * CANCELLED) that carry no verifiable evidence. This is the backstop: the
+   * tool registry and the HTTP routes call it, so a task cannot be closed
+   * "without evidence" through any transport - including code paths added
+   * later that forget the check.
+   *
+   * A founder override (mode + reason) is the only other way through, and it
+   * records the reason on the task itself via `close_reason`, so an override
+   * is never indistinguishable from verified completion.
+   */
+  setTaskStatus(
+    taskId: string,
+    status: string,
+    opts: { mode?: VerificationMode; overrideReason?: string } = {},
+  ): Task {
+    const task = this.getTask(taskId);
+    if (!task) throw new GovernanceError("TASK_NOT_FOUND", `Task ${taskId} not found`, 404, { taskId });
+    const evidence = this.listTaskEvidence(taskId);
+    assertCanTransitionTask({
+      taskId,
+      status,
+      evidenceCount: evidence.length,
+      verifiedEvidenceCount: evidence.filter((e) => e.verified).length,
+      mode: opts.mode,
+      overrideReason: opts.overrideReason,
+    });
+    const patch: Partial<Task> = { status };
+    if (isTerminalTaskStatus(status)) {
+      patch.completed_at = new Date().toISOString();
+      if (opts.mode === "founder_override") patch.close_reason = (opts.overrideReason ?? "").trim();
+    }
+    this.updateTask(taskId, patch);
+    return this.getTask(taskId) as Task;
+  }
+
+  /** All evidence attached to a task (verified items first, then newest). */
+  listTaskEvidence(taskId: string): TaskEvidence[] {
+    const rows = this.sql.all<Row>(
+      "SELECT * FROM task_evidence WHERE task_id = ? ORDER BY verified DESC, created_at DESC",
+      taskId,
+    );
+    return rows.map((r) => taskEvidenceRow(r));
+  }
+
+  getTaskEvidence(id: string): TaskEvidence | null {
+    const rows = this.sql.all<Row>("SELECT * FROM task_evidence WHERE id = ?", id);
+    return rows.length ? taskEvidenceRow(rows[0]!) : null;
+  }
+
+  /** Evidence counts for many tasks at once (list rendering, no N+1 queries). */
+  countTaskEvidence(): Record<string, { total: number; verified: number }> {
+    const out: Record<string, { total: number; verified: number }> = {};
+    for (const r of this.sql.all<Row>(
+      "SELECT task_id, COUNT(*) AS total, SUM(CASE WHEN verified = 1 THEN 1 ELSE 0 END) AS verified FROM task_evidence GROUP BY task_id",
+    )) {
+      out[String(r.task_id)] = { total: Number(r.total ?? 0), verified: Number(r.verified ?? 0) };
+    }
+    return out;
+  }
+
+  /**
+   * Attach a piece of evidence to a task. Input is validated first (kind,
+   * locator, and - for command_output/review - the raw verification output),
+   * so an item that cannot prove anything is rejected before it reaches SQL
+   * and gives the caller the false impression the task is now provable.
+   */
+  addTaskEvidence(taskId: string, input: EvidenceInput & { source?: string }): TaskEvidence {
+    const task = this.getTask(taskId);
+    if (!task) throw new GovernanceError("TASK_NOT_FOUND", `Task ${taskId} not found`, 404, { taskId });
+    const check = validateEvidence(input);
+    if (!check.ok) throw new GovernanceError(check.code, check.error, 400, { taskId });
+    const now = new Date().toISOString();
+    const item: TaskEvidence = {
+      id: newId("tev"),
+      task_id: taskId,
+      kind: check.value.kind,
+      locator: check.value.locator,
+      summary: check.value.summary,
+      verification_command: check.value.verification_command,
+      verification_output: check.value.verification_output,
+      verified: check.value.verified,
+      source: typeof input.source === "string" && input.source.trim() ? input.source.trim() : "executive",
+      created_at: now,
+      updated_at: now,
+    };
+    this.insert("task_evidence", item);
+    return item;
+  }
+
+  deleteTaskEvidence(id: string): boolean {
+    const existing = this.getTaskEvidence(id);
+    if (!existing) return false;
+    this.sql.run("DELETE FROM task_evidence WHERE id = ?", id);
+    return true;
+  }
+
+  /**
+   * A task plus the evidence it was closed on - what the console renders for a
+   * DONE task. Derived, never stored: status alone can no longer imply proof.
+   */
+  getTaskWithEvidence(taskId: string): (Task & { evidence: TaskEvidence[] }) | null {
+    const task = this.getTask(taskId);
+    if (!task) return null;
+    return { ...task, evidence: this.listTaskEvidence(taskId) };
+  }
+

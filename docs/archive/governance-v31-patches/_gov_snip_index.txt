@@ -1,0 +1,75 @@
+    const taskPatch = /^\/api\/tasks\/([^/]+)$/.exec(path);
+    if (taskPatch && method === "GET") {
+      const id = decodeURIComponent(taskPatch[1]!);
+      const withEvidence = this.store.getTaskWithEvidence(id);
+      if (!withEvidence) return json({ error: "Task not found" }, 404);
+      return json({ task: withEvidence });
+    }
+    if (taskPatch && method === "PATCH") {
+      const id = decodeURIComponent(taskPatch[1]!);
+      const task = this.store.getTask(id);
+      if (!task) return json({ error: "Task not found" }, 404);
+      const body = (await readBody<{ status?: string; priority?: string; mode?: string; overrideReason?: string }>(request).catch(() => ({}))) as { status?: string; priority?: string; mode?: string; overrideReason?: string };
+      const patch: Partial<Task> = {};
+      if (body.status) {
+        if (!["OPEN", "IN_PROGRESS", "BLOCKED", "DONE", "CANCELLED"].includes(body.status)) return json({ error: "Invalid status" }, 400);
+        if (isTerminalTaskStatus(body.status)) {
+          // Closed-loop governance: a task cannot reach DONE / CANCELLED on a
+          // bare status write. Throws GovernanceError(409, EVIDENCE_REQUIRED)
+          // when the task carries no verifiable evidence.
+          this.store.setTaskStatus(id, body.status, {
+            mode: body.mode === "founder_override" ? "founder_override" : undefined,
+            overrideReason: body.overrideReason,
+          });
+        } else {
+          patch.status = body.status as never;
+        }
+      }
+      if (body.priority && ["P0", "P1", "P2", "P3"].includes(body.priority)) patch.priority = body.priority as never;
+      if (Object.keys(patch).length > 0) this.store.updateTask(id, patch);
+      const after = this.store.getTask(id);
+      return json({
+        ok: true,
+        id,
+        status: after?.status,
+        close_reason: after?.close_reason ?? null,
+        evidence: this.store.listTaskEvidence(id).map((e) => ({ id: e.id, kind: e.kind, locator: e.locator, verified: e.verified })),
+      });
+    }
+    // Task evidence: the only thing that makes a task closable.
+    const taskEvidenceRoute = /^\/api\/tasks\/([^/]+)\/evidence$/.exec(path);
+    if (taskEvidenceRoute && method === "GET") {
+      const id = decodeURIComponent(taskEvidenceRoute[1]!);
+      if (!this.store.getTask(id)) return json({ error: "Task not found" }, 404);
+      return json({ taskId: id, evidence: this.store.listTaskEvidence(id) });
+    }
+    if (taskEvidenceRoute && method === "POST") {
+      const id = decodeURIComponent(taskEvidenceRoute[1]!);
+      const body = ((await readBody<Record<string, unknown>>(request).catch(() => ({}))) ?? {}) as Record<string, unknown>;
+      const item = this.store.addTaskEvidence(id, {
+        kind: body.kind,
+        locator: body.locator,
+        summary: body.summary,
+        verification_command: body.verification_command ?? body.verificationCommand,
+        verification_output: body.verification_output ?? body.verificationOutput,
+        verified: body.verified,
+        source: "founder",
+      });
+      this.store.insertAudit({
+        id: newId("aud"),
+        actor: "founder",
+        action: "task.evidence.attach",
+        entity_type: "task_evidence",
+        entity_id: item.id,
+        detail_json: JSON.stringify({ task_id: id, kind: item.kind, locator: item.locator }),
+        source: "api",
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      });
+      return json({ ok: true, evidence: item });
+    }
+    const taskEvidenceDelete = /^\/api\/tasks\/evidence\/([^/]+)$/.exec(path);
+    if (taskEvidenceDelete && method === "DELETE") {
+      const evId = decodeURIComponent(taskEvidenceDelete[1]!);
+      return json({ ok: true, deleted: this.store.deleteTaskEvidence(evId) });
+    }

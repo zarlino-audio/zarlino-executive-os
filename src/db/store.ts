@@ -11,6 +11,15 @@
  */
 
 import { migrate } from "./migrations";
+import {
+  assertCanTransitionTask,
+  GovernanceError,
+  isTerminalTaskStatus,
+  validateEvidence,
+  type EvidenceInput,
+  type TaskEvidence,
+  type VerificationMode,
+} from "../core/tasks/evidence";
 import { PRODUCT_METRICS_SQL } from "./schema";
 import { newId } from "../ids";
 import type { Sql, SqlParam } from "./sql";
@@ -20,6 +29,7 @@ import type {
   AuditEvent,
   CalendarEvent,
   ChatMessage,
+  ChatSessionTitle,
   Contact,
   Contradiction,
   ContradictionStatus,
@@ -258,6 +268,114 @@ export class ExecutiveStore implements CostStorage {
   updateTask(id: string, patch: Partial<Task>): void {
     this.update("tasks", id, patch as Row);
   }
+  // -- closed-loop governance: task evidence (migration v31) ---------------
+  /**
+   * Move a task to a new status, REFUSING terminal transitions (DONE /
+   * CANCELLED) that carry no verifiable evidence. This is the backstop: the
+   * tool registry and the HTTP routes call it, so a task cannot be closed
+   * "without evidence" through any transport - including code paths added
+   * later that forget the check.
+   *
+   * A founder override (mode + reason) is the only other way through, and it
+   * records the reason on the task itself via `close_reason`, so an override
+   * is never indistinguishable from verified completion.
+   */
+  setTaskStatus(
+    taskId: string,
+    status: string,
+    opts: { mode?: VerificationMode; overrideReason?: string } = {},
+  ): Task {
+    const task = this.getTask(taskId);
+    if (!task) throw new GovernanceError("TASK_NOT_FOUND", `Task ${taskId} not found`, 404, { taskId });
+    const evidence = this.listTaskEvidence(taskId);
+    assertCanTransitionTask({
+      taskId,
+      status,
+      evidenceCount: evidence.length,
+      verifiedEvidenceCount: evidence.filter((e) => e.verified).length,
+      mode: opts.mode,
+      overrideReason: opts.overrideReason,
+    });
+    const patch: Partial<Task> = { status };
+    if (isTerminalTaskStatus(status)) {
+      patch.completed_at = new Date().toISOString();
+      if (opts.mode === "founder_override") patch.close_reason = (opts.overrideReason ?? "").trim();
+    }
+    this.updateTask(taskId, patch);
+    return this.getTask(taskId) as Task;
+  }
+
+  /** All evidence attached to a task (verified items first, then newest). */
+  listTaskEvidence(taskId: string): TaskEvidence[] {
+    const rows = this.sql.all<Row>(
+      "SELECT * FROM task_evidence WHERE task_id = ? ORDER BY verified DESC, created_at DESC",
+      taskId,
+    );
+    return rows.map((r) => taskEvidenceRow(r));
+  }
+
+  getTaskEvidence(id: string): TaskEvidence | null {
+    const rows = this.sql.all<Row>("SELECT * FROM task_evidence WHERE id = ?", id);
+    return rows.length ? taskEvidenceRow(rows[0]!) : null;
+  }
+
+  /** Evidence counts for many tasks at once (list rendering, no N+1 queries). */
+  countTaskEvidence(): Record<string, { total: number; verified: number }> {
+    const out: Record<string, { total: number; verified: number }> = {};
+    for (const r of this.sql.all<Row>(
+      "SELECT task_id, COUNT(*) AS total, SUM(CASE WHEN verified = 1 THEN 1 ELSE 0 END) AS verified FROM task_evidence GROUP BY task_id",
+    )) {
+      out[String(r.task_id)] = { total: Number(r.total ?? 0), verified: Number(r.verified ?? 0) };
+    }
+    return out;
+  }
+
+  /**
+   * Attach a piece of evidence to a task. Input is validated first (kind,
+   * locator, and - for command_output/review - the raw verification output),
+   * so an item that cannot prove anything is rejected before it reaches SQL
+   * and gives the caller the false impression the task is now provable.
+   */
+  addTaskEvidence(taskId: string, input: EvidenceInput & { source?: string }): TaskEvidence {
+    const task = this.getTask(taskId);
+    if (!task) throw new GovernanceError("TASK_NOT_FOUND", `Task ${taskId} not found`, 404, { taskId });
+    const check = validateEvidence(input);
+    if (!check.ok) throw new GovernanceError(check.code, check.error, 400, { taskId });
+    const now = new Date().toISOString();
+    const item: TaskEvidence = {
+      id: newId("tev"),
+      task_id: taskId,
+      kind: check.value.kind,
+      locator: check.value.locator,
+      summary: check.value.summary,
+      verification_command: check.value.verification_command,
+      verification_output: check.value.verification_output,
+      verified: check.value.verified,
+      source: typeof input.source === "string" && input.source.trim() ? input.source.trim() : "executive",
+      created_at: now,
+      updated_at: now,
+    };
+    this.insert("task_evidence", item);
+    return item;
+  }
+
+  deleteTaskEvidence(id: string): boolean {
+    const existing = this.getTaskEvidence(id);
+    if (!existing) return false;
+    this.sql.run("DELETE FROM task_evidence WHERE id = ?", id);
+    return true;
+  }
+
+  /**
+   * A task plus the evidence it was closed on - what the console renders for a
+   * DONE task. Derived, never stored: status alone can no longer imply proof.
+   */
+  getTaskWithEvidence(taskId: string): (Task & { evidence: TaskEvidence[] }) | null {
+    const task = this.getTask(taskId);
+    if (!task) return null;
+    return { ...task, evidence: this.listTaskEvidence(taskId) };
+  }
+
   countOpenTasks(): number {
     const rows = this.sql.all<Row>("SELECT COUNT(*) AS c FROM tasks WHERE status IN ('OPEN','IN_PROGRESS','BLOCKED')");
     return Number(rows[0]?.c ?? 0);
@@ -1503,31 +1621,115 @@ export class ExecutiveStore implements CostStorage {
     this.insert("chat_messages", m);
   }
   listChatMessages(sessionId: string, limit = 200): ChatMessage[] {
-    return this.sql.all<Row>("SELECT * FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC LIMIT ?", sessionId, limit).map((r) => rowTo<ChatMessage>(r));
+    return this.sql.all<Row>("SELECT * FROM chat_messages WHERE session_id = ? ORDER BY rowid ASC LIMIT ?", sessionId, limit).map((r) => rowTo<ChatMessage>(r));
+  }
+  /** The most recent `limit` messages of a session, oldest-first (model context). */
+  listChatMessagesTail(sessionId: string, limit = 40): ChatMessage[] {
+    return this.sql
+      .all<Row>("SELECT * FROM chat_messages WHERE session_id = ? ORDER BY rowid DESC LIMIT ?", sessionId, limit)
+      .map((r) => rowTo<ChatMessage>(r))
+      .reverse();
+  }
+  getChatMessage(id: string): ChatMessage | null {
+    const rows = this.sql.all<Row>("SELECT * FROM chat_messages WHERE id = ?", id);
+    return rows.length ? rowTo<ChatMessage>(rows[0]) : null;
+  }
+  /** Founder feedback on an assistant message (+1 / -1 / 0 to clear). */
+  rateChatMessage(id: string, rating: number): void {
+    this.sql.run(
+      "UPDATE chat_messages SET rating = ?, updated_at = ? WHERE id = ?",
+      rating === 0 ? null : rating, new Date().toISOString(), id,
+    );
+  }
+  /**
+   * Delete `messageId` and everything inserted after it in the same session
+   * (rowid order = insertion order). Used by edit-and-resend (gap 5) and
+   * regenerate (gap 4). Returns how many rows were removed.
+   */
+  truncateChatFrom(sessionId: string, messageId: string): number {
+    const rows = this.sql.all<Row>("SELECT rowid FROM chat_messages WHERE id = ? AND session_id = ?", messageId, sessionId);
+    if (!rows.length) return 0;
+    const from = Number(rows[0]!.rowid);
+    const target = this.sql.all<Row>("SELECT COUNT(*) AS c FROM chat_messages WHERE session_id = ? AND rowid >= ?", sessionId, from);
+    this.sql.run("DELETE FROM chat_messages WHERE session_id = ? AND rowid >= ?", sessionId, from);
+    return Number(target[0]?.c ?? 0);
+  }
+  /** The most recent assistant message in a session, if any. */
+  lastAssistantMessage(sessionId: string): ChatMessage | null {
+    const rows = this.sql.all<Row>(
+      "SELECT * FROM chat_messages WHERE session_id = ? AND role = 'assistant' ORDER BY rowid DESC LIMIT 1",
+      sessionId,
+    );
+    return rows.length ? rowTo<ChatMessage>(rows[0]) : null;
+  }
+  countChatMessages(sessionId: string): number {
+    const rows = this.sql.all<Row>("SELECT COUNT(*) AS c FROM chat_messages WHERE session_id = ?", sessionId);
+    return Number(rows[0]?.c ?? 0);
+  }
+  /**
+   * One page of a conversation, newest-last for display. `before` is an
+   * exclusive ISO cursor (return messages strictly older than it) — gap 14/23
+   * pagination, replacing the old hard 200-message cap.
+   */
+  listChatMessagesPage(sessionId: string, opts: { limit?: number; before?: string } = {}): { messages: ChatMessage[]; hasMore: boolean; total: number } {
+    const limit = Math.max(1, Math.min(300, opts.limit ?? 80));
+    const params: SqlParam[] = [sessionId];
+    let sql = "SELECT * FROM chat_messages WHERE session_id = ?";
+    if (opts.before) { sql += " AND created_at < ?"; params.push(opts.before); }
+    sql += " ORDER BY rowid DESC LIMIT ?";
+    params.push(limit + 1);
+    const rows = this.sql.all<Row>(sql, ...params).map((r) => rowTo<ChatMessage>(r));
+    const hasMore = rows.length > limit;
+    const messages = rows.slice(0, limit).reverse();
+    return { messages, hasMore, total: this.countChatMessages(sessionId) };
   }
 
-  /** Recent chat sessions (history), most recent first. */
-  listChatSessions(limit = 20): Array<{ session_id: string; message_count: number; last_at: string; last_message: string }> {
+  /** Recent chat sessions (history), most recent first, with explicit titles. */
+  listChatSessions(limit = 20, offset = 0): Array<{ session_id: string; message_count: number; last_at: string; last_message: string; title: string | null }> {
     return this.sql
       .all<Row>(
         `SELECT session_id, COUNT(*) AS message_count, MAX(created_at) AS last_at,
            (SELECT content FROM chat_messages AS inner_m
              WHERE inner_m.session_id = outer_m.session_id
-             ORDER BY inner_m.created_at DESC LIMIT 1) AS last_message
+             ORDER BY inner_m.rowid DESC LIMIT 1) AS last_message,
+           (SELECT title FROM chat_session_titles AS t
+             WHERE t.session_id = outer_m.session_id LIMIT 1) AS title
          FROM chat_messages AS outer_m
-         GROUP BY session_id ORDER BY last_at DESC LIMIT ?`,
+         GROUP BY session_id ORDER BY last_at DESC LIMIT ? OFFSET ?`,
         limit,
+        offset,
       )
       .map((r) => ({
         session_id: String(r.session_id),
         message_count: Number(r.message_count),
         last_at: String(r.last_at),
         last_message: String(r.last_message ?? ""),
+        title: r.title == null ? null : String(r.title),
       }));
+  }
+  countChatSessions(): number {
+    const rows = this.sql.all<Row>("SELECT COUNT(DISTINCT session_id) AS c FROM chat_messages");
+    return Number(rows[0]?.c ?? 0);
+  }
+
+  // -- chat session titles (migration v30) --------------------------------
+  setChatSessionTitle(sessionId: string, title: string, source = "founder"): void {
+    const now = new Date().toISOString();
+    this.sql.run(
+      `INSERT INTO chat_session_titles (session_id, title, source, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(session_id) DO UPDATE SET title = excluded.title, source = excluded.source, updated_at = excluded.updated_at`,
+      sessionId, title, source, now, now,
+    );
+  }
+  getChatSessionTitle(sessionId: string): ChatSessionTitle | null {
+    const rows = this.sql.all<Row>("SELECT * FROM chat_session_titles WHERE session_id = ?", sessionId);
+    return rows.length ? rowTo<ChatSessionTitle>(rows[0]) : null;
   }
 
   clearChat(sessionId: string): void {
     this.sql.run("DELETE FROM chat_messages WHERE session_id = ?", sessionId);
+    this.sql.run("DELETE FROM chat_session_titles WHERE session_id = ?", sessionId);
   }
 
   // -- chat streams (migration v6 — buffered SSE deltas) ------------------
@@ -1541,6 +1743,17 @@ export class ExecutiveStore implements CostStorage {
     const rows = this.sql.all<Row>("SELECT chunks_json FROM chat_streams WHERE id = ?", id);
     const chunks = rows.length ? (JSON.parse(String(rows[0]!.chunks_json ?? "[]")) as string[]) : [];
     chunks.push(text);
+    this.sql.run(
+      "UPDATE chat_streams SET chunks_json = ?, updated_at = ? WHERE id = ?",
+      JSON.stringify(chunks), new Date().toISOString(), id,
+    );
+  }
+  /** Append several frames in one write (streaming batches — avoids O(n²) writes). */
+  appendChatStreamChunks(id: string, texts: string[]): void {
+    if (texts.length === 0) return;
+    const rows = this.sql.all<Row>("SELECT chunks_json FROM chat_streams WHERE id = ?", id);
+    const chunks = rows.length ? (JSON.parse(String(rows[0]!.chunks_json ?? "[]")) as string[]) : [];
+    for (const t of texts) chunks.push(t);
     this.sql.run(
       "UPDATE chat_streams SET chunks_json = ?, updated_at = ? WHERE id = ?",
       JSON.stringify(chunks), new Date().toISOString(), id,
@@ -1585,6 +1798,16 @@ export class ExecutiveStore implements CostStorage {
       session_id: call.sessionId ?? null,
       run_id: call.runId ?? null,
       latency_ms: call.latencyMs,
+      // Provenance (migration v32): WITHOUT these the ledger stores only the
+      // single chosen dollar figure, so a call priced from a char fallback is
+      // indistinguishable from one the provider actually billed -- which is how
+      // recorded spend could sit at $0.068 while a "token exhausted" condition
+      // was being surfaced. `usage_reported = 0` now marks an UNMEASURED call
+      // instead of letting it look like a free one.
+      provider_cost: call.providerCost ?? null,
+      meter_cost: call.meterCost ?? null,
+      usage_reported: call.usageReported ? 1 : 0,
+      meter_source: call.meterSource ?? "legacy",
       source: "executive",
       created_at: now,
       updated_at: now,
@@ -1612,6 +1835,44 @@ export class ExecutiveStore implements CostStorage {
     const rows = this.sql.all<Row>("SELECT COALESCE(SUM(input_tokens),0) + COALESCE(SUM(output_tokens),0) AS t FROM model_costs WHERE substr(created_at,1,7) = ?", month);
     return Number(rows[0]?.t ?? 0);
   }
+  /**
+   * Reconciliation view over the ledger (migration v32).
+   *
+   * `ledger` is the SUM over model_costs -- what every dollar figure is derived
+   * from. `unmeasured` counts calls the provider never reported usage for, which
+   * were nonetheless booked (char fallback). Those rows are the honest blind spot
+   * of the meter: real spend, but not MEASURED spend, and the one remaining way
+   * a recorded total can diverge from what the provider bills. Surfacing them is
+   * the difference between "we do not know" and "we recorded zero".
+   */
+  meterReconciliation(): {
+    tokens: number;
+    cost: number;
+    calls: number;
+    unmeasuredCalls: number;
+    unmeasuredCost: number;
+    providerReportedCost: number;
+    priceTableCost: number;
+  } {
+    const row = this.sql.all<Row>(
+      "SELECT COALESCE(SUM(input_tokens),0) + COALESCE(SUM(output_tokens),0) AS tokens, " +
+        "COALESCE(SUM(cost),0) AS cost, " +
+        "COUNT(*) AS calls, " +
+        "COALESCE(SUM(CASE WHEN usage_reported = 0 THEN 1 ELSE 0 END),0) AS unmeasured_calls, " +
+        "COALESCE(SUM(CASE WHEN usage_reported = 0 THEN cost ELSE 0 END),0) AS unmeasured_cost, " +
+        "COALESCE(SUM(provider_cost),0) AS provider_cost, " +
+        "COALESCE(SUM(meter_cost),0) AS meter_cost FROM model_costs",
+    )[0];
+    return {
+      tokens: Number(row?.tokens ?? 0),
+      cost: Number(row?.cost ?? 0),
+      calls: Number(row?.calls ?? 0),
+      unmeasuredCalls: Number(row?.unmeasured_calls ?? 0),
+      unmeasuredCost: Number(row?.unmeasured_cost ?? 0),
+      providerReportedCost: Number(row?.provider_cost ?? 0),
+      priceTableCost: Number(row?.meter_cost ?? 0),
+    };
+  }
   spentThisRun(runId?: string): number {
     if (!runId) return 0;
     const rows = this.sql.all<Row>("SELECT COALESCE(SUM(cost),0) AS s FROM model_costs WHERE run_id = ?", runId);
@@ -1634,6 +1895,10 @@ export class ExecutiveStore implements CostStorage {
       runId: r.run_id ? String(r.run_id) : undefined,
       latencyMs: Number(r.latency_ms),
       timestamp: String(r.created_at),
+      providerCost: r.provider_cost === null || r.provider_cost === undefined ? undefined : Number(r.provider_cost),
+      meterCost: r.meter_cost === null || r.meter_cost === undefined ? undefined : Number(r.meter_cost),
+      usageReported: Number(r.usage_reported ?? 0) === 1,
+      meterSource: (r.meter_source ? String(r.meter_source) : "legacy") as ModelCallRecord["meterSource"],
     }));
   }
 
@@ -2165,7 +2430,10 @@ export class ExecutiveStore implements CostStorage {
 
   // -- local agent health beacon (migration v20) --------------------------
   getLocalAgentStatus(): { id: string; host?: string; version?: string; pid?: string; last_seen?: string; last_claim_at?: string; started_at?: string } | null {
-    const rows = this.sql.all<Row>("SELECT * FROM local_agent_status WHERE id = 'local'");
+    // Per-instance rows (one per runtime, AOrgI §7): the primary liveness
+    // signal is the FRESHEST heartbeat; per-instance liveness lives in
+    // org_agents (heartbeats register there too).
+    const rows = this.sql.all<Row>("SELECT * FROM local_agent_status ORDER BY last_seen DESC, rowid DESC LIMIT 1");
     if (rows.length === 0) return null;
     const r = rows[0]!;
     return {
@@ -2178,13 +2446,14 @@ export class ExecutiveStore implements CostStorage {
       started_at: r.started_at ? String(r.started_at) : undefined,
     };
   }
-  /** Record a heartbeat from the local daemon (idempotent single row). */
-  upsertLocalAgentHeartbeat(input: { host?: string; version?: string; pid?: string; claimed?: boolean }): void {
+  /** Record a heartbeat from a local daemon (one row per instance id). */
+  upsertLocalAgentHeartbeat(input: { host?: string; version?: string; pid?: string; claimed?: boolean; id?: string }): void {
+    const rowId = input.id && /^[a-z0-9_]{3,40}$/.test(input.id) ? input.id : "local";
     const now = new Date().toISOString();
-    const existing = this.sql.all<Row>("SELECT id FROM local_agent_status WHERE id = 'local'");
+    const existing = this.sql.all<Row>("SELECT id FROM local_agent_status WHERE id = ?", rowId);
     if (existing.length === 0) {
       this.insert("local_agent_status", {
-        id: "local",
+        id: rowId,
         host: input.host ?? null,
         version: input.version ?? null,
         pid: input.pid ?? null,
@@ -2202,7 +2471,7 @@ export class ExecutiveStore implements CostStorage {
     if (input.version) { sets.push("version = ?"); params.push(input.version); }
     if (input.pid) { sets.push("pid = ?"); params.push(input.pid); }
     if (input.claimed) { sets.push("last_claim_at = ?"); params.push(now); }
-    params.push("local");
+    params.push(rowId);
     this.sql.run(`UPDATE local_agent_status SET ${sets.join(", ")} WHERE id = ?`, ...params);
   }
   /** Age (ms) since the daemon's last heartbeat, or null if never seen. */
@@ -2729,6 +2998,7 @@ export class ExecutiveStore implements CostStorage {
 export const SNAPSHOT_TABLES = [
   "executive_state", "founder_profile", "organizations", "objectives", "projects",
   "tasks", "decisions", "approval_requests", "risks", "metrics", "financial_snapshots",
+  "task_evidence",
   "products", "product_status", "engineering_issues", "marketing_campaigns", "persons",
   "delegations", "memories", "doctrine_rules", "policies", "audit_events", "chat_messages",
   "tool_executions", "workstreams", "pipeline_gates", "model_costs", "founder_credentials",
@@ -2745,6 +3015,12 @@ export const SNAPSHOT_TABLES = [
   "org_incidents",
   "org_topology_proposals",
 ];
+
+/** Map a task_evidence row: `verified` is stored as 0/1 in SQLite. */
+function taskEvidenceRow(row: Row): TaskEvidence {
+  const rec = rowTo<TaskEvidence>(row) as TaskEvidence & { verified: unknown };
+  return { ...rec, verified: Number(rec.verified ?? 0) === 1 };
+}
 
 function rowTo<T>(row: Row | undefined): T {
   return row as unknown as T;

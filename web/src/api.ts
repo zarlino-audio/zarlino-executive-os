@@ -112,24 +112,66 @@ export const api = {
       body: JSON.stringify({}),
     }),
 
-  chat: (message: string, sessionId: string) =>
+  chat: (message: string, sessionId: string, model?: string) =>
     request<ChatReply>("/api/chat", {
       method: "POST",
-      body: JSON.stringify({ message, sessionId }),
+      body: JSON.stringify({ message, sessionId, model }),
     }),
-  chatSessions: () => request<{ sessions: ChatSession[] }>("/api/chat/sessions"),
-  chatMessages: (sessionId: string) =>
-    request<{ messages: ChatMessage[] }>(`/api/chat/messages?sessionId=${encodeURIComponent(sessionId)}`),
+  chatSessions: (opts: { limit?: number; offset?: number } = {}) =>
+    request<{ sessions: ChatSession[]; hasMore: boolean; total: number }>(
+      `/api/chat/sessions?limit=${opts.limit ?? 40}&offset=${opts.offset ?? 0}`,
+    ),
+  chatMessages: (sessionId: string, opts: { limit?: number; before?: string } = {}) =>
+    request<{ messages: ChatMessage[]; hasMore: boolean; total: number; title: string | null }>(
+      `/api/chat/messages?sessionId=${encodeURIComponent(sessionId)}&limit=${opts.limit ?? 80}` +
+        (opts.before ? `&before=${encodeURIComponent(opts.before)}` : ""),
+    ),
   /** Kick off a streaming reply; returns the stream id to consume via chatSse. */
-  chatStreamStart: (message: string, sessionId: string) =>
-    request<{ ok: boolean; streamId: string; sessionId: string }>("/api/chat", {
+  chatStreamStart: (message: string, sessionId: string, opts: { model?: string; attachments?: ChatAttachment[] } = {}) =>
+    request<{ ok: boolean; streamId: string; sessionId: string; model: string }>("/api/chat", {
       method: "POST",
-      body: JSON.stringify({ message, sessionId, stream: true }),
+      body: JSON.stringify({ message, sessionId, stream: true, model: opts.model, attachments: opts.attachments }),
+    }),
+  /** Re-run the last assistant turn (the server truncates it first). */
+  chatRegenerate: (sessionId: string, model?: string) =>
+    request<{ ok: boolean; streamId: string; sessionId: string }>("/api/chat/regenerate", {
+      method: "POST",
+      body: JSON.stringify({ sessionId, model, stream: true }),
+    }),
+  /** Really cancel the in-flight provider call for a stream (gap 6). */
+  chatStop: (streamId: string) =>
+    request<{ ok: boolean; stopped: boolean }>("/api/chat/stop", {
+      method: "POST",
+      body: JSON.stringify({ streamId }),
+    }),
+  /** Thumbs feedback on an assistant message (gap 12). */
+  chatRate: (messageId: string, rating: number) =>
+    request<{ ok: boolean; rating: number }>("/api/chat/rate", {
+      method: "POST",
+      body: JSON.stringify({ messageId, rating }),
+    }),
+  /** Rename a conversation (gap 16). */
+  chatRename: (sessionId: string, title: string) =>
+    request<{ ok: boolean; title: string }>("/api/chat/rename", {
+      method: "POST",
+      body: JSON.stringify({ sessionId, title }),
+    }),
+  /** Drop a message and everything after it — edit-and-resend (gap 5). */
+  chatTruncate: (sessionId: string, messageId: string) =>
+    request<{ ok: boolean; removed: number }>("/api/chat/truncate", {
+      method: "POST",
+      body: JSON.stringify({ sessionId, messageId }),
     }),
   clearChat: (sessionId: string) =>
     request<{ ok: boolean }>("/api/chat/clear", {
       method: "POST",
       body: JSON.stringify({ sessionId }),
+    }),
+  /** Upload an attachment (base64) — used by the chat composer (gap 11). */
+  uploadFile: (name: string, mime: string, dataBase64: string) =>
+    request<{ ok: boolean; fileId: string; kind: string; sizeBytes: number }>("/api/files", {
+      method: "POST",
+      body: JSON.stringify({ name, mime, dataBase64 }),
     }),
 
   tasks: () => request<{ tasks: Task[] }>("/api/tasks"),
@@ -628,6 +670,16 @@ export interface ChatSession {
   message_count: number;
   last_at: string;
   last_message: string;
+  /** Explicit or auto-generated title (settled server-side, gap 16/26). */
+  title?: string | null;
+}
+
+/** A file attached to a chat message (uploaded via /api/files first). */
+export interface ChatAttachment {
+  id: string;
+  name: string;
+  kind?: string;
+  sizeBytes?: number;
 }
 
 export interface ChatMessage {
@@ -635,50 +687,123 @@ export interface ChatMessage {
   session_id: string;
   role: "user" | "assistant";
   content: string;
+  model?: string | null;
+  /** +1 / -1 founder feedback (gap 12). */
+  rating?: number | null;
   source: string;
   created_at: string;
 }
 
+/** One decoded frame of a chat stream. */
+export interface ChatStreamFrame {
+  text?: string;
+  reasoning?: string;
+  status?: string;
+  tool?: string;
+  cancelled?: boolean;
+  error?: string | null;
+}
+
+export interface ChatSseHandlers {
+  onFrame: (frame: ChatStreamFrame) => void;
+  /** Fired once the stream finishes (normally, on stop, or on provider error). */
+  onDone?: (info: { error?: string | null; cancelled: boolean }) => void;
+  signal?: AbortSignal;
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 /**
- * Consume a streaming reply via SSE. Calls onText for each chunk and resolves
- * when the stream finishes. Throws on an error event.
+ * Consume a streaming reply via SSE.
+ *
+ * - Emits every frame (text / reasoning / status / cancelled) as it arrives —
+ *   this is what makes the reply type itself out instead of appearing as one
+ *   lump after a long wait.
+ * - Honours `event: done` (previously ignored, which left partial bubbles
+ *   permanently stuck).
+ * - Reconnects with `after=<frames consumed>` when the connection drops, so a
+ *   flaky network loses nothing and duplicates nothing (gap 7).
  */
-export async function chatSse(
-  streamId: string,
-  onText: (text: string) => void,
-  signal?: AbortSignal,
-): Promise<void> {
-  const res = await fetch(`/api/chat/sse?streamId=${encodeURIComponent(streamId)}`, {
-    headers: { Authorization: `Bearer ${getToken()}` },
-    signal,
-  });
-  if (!res.ok || !res.body) throw new Error(`SSE HTTP ${res.status}`);
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const parts = buffer.split("\n\n");
-    buffer = parts.pop() ?? "";
-    for (const part of parts) {
-      for (const line of part.split("\n")) {
-        if (line.startsWith("data: ")) {
-          try {
-            const payload = JSON.parse(line.slice(6)) as { text?: string; error?: string | null };
-            if (payload.text) onText(payload.text);
-            if (payload.error) throw new Error(payload.error);
-          } catch (e) {
-            if (e instanceof Error && e.message !== "Unexpected end of JSON input") throw e;
+export async function chatSse(streamId: string, handlers: ChatSseHandlers): Promise<void> {
+  let frames = 0;
+  let cancelled = false;
+  let lastError: string | null = null;
+  const maxAttempts = 4;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (handlers.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    let finished = false;
+    try {
+      const res = await fetch(`/api/chat/sse?streamId=${encodeURIComponent(streamId)}&after=${frames}`, {
+        headers: { Authorization: `Bearer ${getToken()}` },
+        signal: handlers.signal,
+      });
+      if (!res.ok || !res.body) throw new Error(`SSE HTTP ${res.status}`);
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let event = "message";
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop() ?? "";
+        for (const part of parts) {
+          for (const line of part.split("\n")) {
+            if (line.startsWith("event: ")) {
+              event = line.slice(7).trim();
+              continue;
+            }
+            if (!line.startsWith("data: ")) continue;
+            const payload = line.slice(6);
+            if (event === "done") {
+              let info: { error?: string | null } = {};
+              try {
+                info = JSON.parse(payload) as { error?: string | null };
+              } catch {
+                /* empty done payload */
+              }
+              lastError = info.error ?? null;
+              finished = true;
+              continue;
+            }
+            if (event === "error") {
+              let info: { error?: string } = {};
+              try {
+                info = JSON.parse(payload) as { error?: string };
+              } catch {
+                /* empty error payload */
+              }
+              throw new Error(info.error ?? "Stream failed");
+            }
+            let frame: ChatStreamFrame;
+            try {
+              frame = JSON.parse(payload) as ChatStreamFrame;
+            } catch {
+              frame = { text: payload }; // legacy raw-string chunk
+            }
+            frames++;
+            if (frame.cancelled) cancelled = true;
+            if (frame.error) lastError = frame.error;
+            handlers.onFrame(frame);
           }
-        } else if (line.startsWith("event: error")) {
-          throw new Error("Stream failed");
+          event = "message";
         }
       }
+      if (finished) {
+        handlers.onDone?.({ error: lastError, cancelled });
+        return;
+      }
+      // Stream ended without `event: done` — reconnect and resume.
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") throw err;
+      if (attempt === maxAttempts - 1) throw err;
     }
+    await sleep(250 * (attempt + 1));
   }
+  handlers.onDone?.({ error: lastError, cancelled });
 }
 
 export interface Task {
