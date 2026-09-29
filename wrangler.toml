@@ -24,6 +24,15 @@ binding = "ZARLINO_KV"
 id = "66bc47e33fe145f697cf1f80912f269e"
 
 # ---------------------------------------------------------------------------
+# Artifact storage (R2, mandate §25): renders, build packages, reports —
+# large outputs live OUTSIDE the DO's SQLite and are served through
+# /api/artifacts. Created 2026-09-29 (bucket "zarlino-artifacts").
+# ---------------------------------------------------------------------------
+[[r2_buckets]]
+binding = "ARTIFACTS"
+bucket_name = "zarlino-artifacts"
+
+# ---------------------------------------------------------------------------
 # Static assets: the Founder web console (React+Vite, built to web/dist).
 # run_worker_first = true so /api/* reaches the Worker; the Worker then serves
 # the console via env.ASSETS.fetch(request) for every non-API path.
