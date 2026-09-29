@@ -166,6 +166,25 @@ describe("ExecutiveStore (node:sqlite)", () => {
     expect(store.countLimitReachedRuns()).toBe(1);
     expect(store.listLimitReachedRuns(10).map((r) => r.id)).toContain("run_limit");
     expect(store.listLimitReachedRuns(10).map((r) => r.id)).not.toContain("run_halted");
+
+    // A run whose TASK is already closed is not resumable — it must never be
+    // counted or selected (the old behaviour kept the Doctor red forever).
+    const now2 = new Date().toISOString();
+    store.insertTask({ id: "tsk_closed_work", title: "finished work", priority: "P1", source: "test", status: "DONE", created_at: now2, updated_at: now2 });
+    store.createAgentRun({
+      id: "run_of_closed_task", task_id: "tsk_closed_work", prompt: "long work", status: "STOPPED", iterations: 40, tools_called: 90,
+      started_at: now2, source: "system", created_at: now2, updated_at: now2,
+      error: "Hit the 40-iteration per-sweep limit — auto-continue scheduled.",
+    });
+    store.insertTask({ id: "tsk_open_work", title: "open work", priority: "P1", source: "test", status: "OPEN", created_at: now2, updated_at: now2 });
+    store.createAgentRun({
+      id: "run_of_open_task", task_id: "tsk_open_work", prompt: "long work", status: "STOPPED", iterations: 40, tools_called: 90,
+      started_at: now2, source: "system", created_at: now2, updated_at: now2,
+      error: "Hit the 40-iteration per-sweep limit — auto-continue scheduled.",
+    });
+    expect(store.listLimitReachedRuns(20).map((r) => r.id)).not.toContain("run_of_closed_task");
+    expect(store.listLimitReachedRuns(20).map((r) => r.id)).toContain("run_of_open_task");
+
     const resumed = store.resetLimitReachedRuns(10);
     expect(resumed).toContain("run_limit");
     const run = store.getAgentRun("run_limit")!;
@@ -207,6 +226,24 @@ describe("ExecutiveStore (node:sqlite)", () => {
     });
     const f = store.recentProviderFailure();
     expect(f?.kind).toBe("cloud");
+  });
+
+  it("a historical 402 clears once a later success proves the provider works", () => {
+    // Future-stamped so shared-store rows from other tests cannot interfere.
+    const failAt = new Date(Date.now() + 60_000).toISOString();
+    const okAt = new Date(Date.now() + 120_000).toISOString();
+    store.createAgentRun({
+      id: "run_402_recovery_fail", prompt: "z", status: "FAILED", iterations: 1, tools_called: 0,
+      started_at: failAt, source: "system", created_at: failAt, updated_at: failAt,
+      error: 'DeepSeek HTTP 402: {"error":{"message":"Insufficient Balance"}}',
+    });
+    expect(store.recentProviderFailure()).not.toBeNull();
+    // A successful run AFTER the failure = the account works again.
+    store.createAgentRun({
+      id: "run_402_recovery_ok", prompt: "z", status: "DONE", iterations: 2, tools_called: 3,
+      started_at: okAt, source: "system", created_at: okAt, updated_at: okAt,
+    });
+    expect(store.recentProviderFailure()).toBeNull();
   });
 
   it("files and decides review items (sound/UI vetting)", () => {

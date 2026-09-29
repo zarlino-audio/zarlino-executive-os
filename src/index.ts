@@ -2676,6 +2676,13 @@ export class ExecutiveAgent {
       const id = decodeURIComponent(runContinue[1]!);
       const run = this.store.listAgentRuns(100).find((r) => r.id === id);
       if (!run) return json({ error: "Run not found" }, 404);
+      if (run.status === "RUNNING") return json({ error: "Run is already RUNNING" }, 409);
+      // Never re-execute work whose task is already closed: that spends money
+      // on a finished outcome and puts a stale checkpoint back on the wire.
+      const runTask = run.task_id ? this.store.getTask(run.task_id) : null;
+      if (runTask && (runTask.status === "DONE" || runTask.status === "CANCELLED")) {
+        return json({ error: `Task ${runTask.id} is ${runTask.status} — nothing to continue; create a new task instead` }, 409);
+      }
       this.store.resetAgentRun(id);
       // Actually re-execute the reopened run instead of leaving it RUNNING
       // forever (the old behaviour just let it get reaped again).

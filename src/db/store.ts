@@ -2198,19 +2198,21 @@ export class ExecutiveStore implements CostStorage {
   listLimitReachedRuns(limit = 50): AgentRun[] {
     return this.sql
       .all<Row>(
-        "SELECT * FROM agent_jobs WHERE status = 'STOPPED' AND error LIKE '%auto-continue%' ORDER BY updated_at ASC LIMIT ?",
+        "SELECT * FROM agent_jobs WHERE status = 'STOPPED' AND error LIKE '%auto-continue%' AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.id = agent_jobs.task_id AND t.status IN ('DONE','CANCELLED')) ORDER BY updated_at ASC LIMIT ?",
         limit,
       )
       .map((r) => rowTo<AgentRun>(r));
   }
   countLimitReachedRuns(): number {
-    const rows = this.sql.all<Row>("SELECT COUNT(*) AS c FROM agent_jobs WHERE status = 'STOPPED' AND error LIKE '%auto-continue%'");
+    // Only runs whose task is still open are resumable; a closed task's run
+    // would be skipped by the sweep forever and kept the Doctor red.
+    const rows = this.sql.all<Row>("SELECT COUNT(*) AS c FROM agent_jobs WHERE status = 'STOPPED' AND error LIKE '%auto-continue%' AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.id = agent_jobs.task_id AND t.status IN ('DONE','CANCELLED'))");
     return Number(rows[0]?.c ?? 0);
   }
   /** Reopen a batch of limit-reached runs back to RUNNING (checkpoint preserved). */
   resetLimitReachedRuns(limit = 10): string[] {
     const rows = this.sql.all<Row>(
-      "SELECT id FROM agent_jobs WHERE status = 'STOPPED' AND error LIKE '%auto-continue%' ORDER BY updated_at ASC LIMIT ?",
+      "SELECT id FROM agent_jobs WHERE status = 'STOPPED' AND error LIKE '%auto-continue%' AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.id = agent_jobs.task_id AND t.status IN ('DONE','CANCELLED')) ORDER BY updated_at ASC LIMIT ?",
       limit,
     );
     const ids: string[] = [];
@@ -2252,15 +2254,29 @@ export class ExecutiveStore implements CostStorage {
    * as a first-class Doctor concern instead of dozens of cryptic 402 errors.
    */
   recentProviderFailure(): { kind: string; at: string } | null {
-    const runs = this.sql.all<Row>(
-      "SELECT error, updated_at FROM agent_jobs WHERE error LIKE '%402%' OR error LIKE '%Insufficient Balance%' ORDER BY updated_at DESC LIMIT 1",
+    const cloud = this.sql.all<Row>(
+      "SELECT updated_at FROM agent_jobs WHERE error LIKE '%402%' OR error LIKE '%Insufficient Balance%' ORDER BY updated_at DESC LIMIT 1",
     );
-    if (runs.length) return { kind: "cloud", at: String(runs[0]?.updated_at ?? "") };
     const local = this.sql.all<Row>(
-      "SELECT error, updated_at FROM local_tasks WHERE error LIKE '%402%' OR error LIKE '%Insufficient Balance%' ORDER BY updated_at DESC LIMIT 1",
+      "SELECT updated_at FROM local_tasks WHERE error LIKE '%402%' OR error LIKE '%Insufficient Balance%' ORDER BY updated_at DESC LIMIT 1",
     );
-    if (local.length) return { kind: "local-daemon", at: String(local[0]?.updated_at ?? "") };
-    return null;
+    const failures: Array<{ kind: string; at: string }> = [];
+    if (cloud.length) failures.push({ kind: "cloud", at: String(cloud[0]?.updated_at ?? "") });
+    if (local.length) failures.push({ kind: "local-daemon", at: String(local[0]?.updated_at ?? "") });
+    if (failures.length === 0) return null;
+    const newestFailure = failures.reduce((a, b) => (a.at >= b.at ? a : b));
+    // The provider's payment state is RECENT, not historical: the 402 is only
+    // a current problem while no provider call has succeeded after it. (A
+    // top-up used to leave the Doctor red for weeks because old rows lived on
+    // forever — the first successful run/chat/local task must clear it.)
+    const okCloud = this.sql.all<Row>("SELECT MAX(updated_at) AS at FROM agent_jobs WHERE status = 'DONE'");
+    const okLocal = this.sql.all<Row>("SELECT MAX(updated_at) AS at FROM local_tasks WHERE status = 'DONE'");
+    const successAt = [okCloud[0]?.at, okLocal[0]?.at]
+      .filter((v): v is string => typeof v === "string" && v.length > 0)
+      .sort()
+      .pop();
+    if (successAt && successAt > newestFailure.at) return null;
+    return newestFailure;
   }
   /** True if the task had a run end in a terminal failure within `withinMs` (re-creation backoff). */
   hasRecentFailedRunForTask(taskId: string, withinMs = 10 * 60_000): boolean {

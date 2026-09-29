@@ -21,3 +21,5 @@ Thumbs.db
 # --- runtime logs ---
 local-daemon.log
 
+
+dist-worker/
