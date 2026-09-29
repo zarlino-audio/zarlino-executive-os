@@ -1,0 +1,41 @@
+# Executive OS — CI (typecheck, tests, console build, worker bundle dry-run).
+#
+# This repo is the CANONICAL home of the Executive OS (moved out of the
+# Zarlino plugin monorepo 2026-09-29). Deploys are founder-run
+# (`npx wrangler deploy`); CI only verifies that the tree is shippable.
+name: Executive OS CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install (root)
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Tests
+        run: npx vitest run
+
+      - name: Install + build the console (web/)
+        run: |
+          npm --prefix web ci
+          npm --prefix web run build
+
+      - name: Worker bundle dry-run (validates bindings + assets)
+        run: npx wrangler deploy --dry-run --outdir dist-worker
