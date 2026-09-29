@@ -2674,7 +2674,9 @@ export class ExecutiveAgent {
     const runContinue = /^\/api\/agents\/runs\/([^/]+)\/continue$/.exec(path);
     if (runContinue && method === "POST") {
       const id = decodeURIComponent(runContinue[1]!);
-      const run = this.store.listAgentRuns(100).find((r) => r.id === id);
+      // Any run by id — the old top-100-window scan 404'd old runs even when
+      // they existed (and the window shrank as more runs were recorded).
+      const run = this.store.getAgentRun(id);
       if (!run) return json({ error: "Run not found" }, 404);
       if (run.status === "RUNNING") return json({ error: "Run is already RUNNING" }, 409);
       // Never re-execute work whose task is already closed: that spends money
