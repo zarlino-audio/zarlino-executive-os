@@ -25,6 +25,10 @@ from the same local-task queue with leases.
 
 ## Provisioning (one-time, on the remote machine)
 
+0. **Start the VM first.** As of 2026-09-29 the box does NOT answer on
+   `102.37.153.164:3389` (the Azure VM appears deallocated — deallocation
+   stops billing but also stops the box; start it in the Azure portal and
+   re-test before RDP).
 1. Power on the machine and RDP in (credentials prompt on connect).
 2. Copy `scripts/remote-provision.ps1` from this repo to the remote desktop
    (drag-and-drop over RDP works).
@@ -34,6 +38,16 @@ from the same local-task queue with leases.
    cd $env:USERPROFILE\Desktop
    .\remote-provision.ps1 -CloneWorkspace
    ```
+
+   Notes:
+   - The provisioner does a **FULL `npm ci`** and verifies `tsx` afterwards:
+     the daemon runs through `tsx` (a devDependency), so an `--omit=dev`
+     install would leave `npm run agent:daemon:loop` unable to start.
+   - Website tools from the box additionally need the website repo cloned
+     INSIDE the workspace clone: `C:\Zarlino\Zarlino\zarlino-website`
+     (`git clone https://github.com/zarlino-audio/zarlino-website` there).
+   - Until VS/CMake/Python/FL Studio are installed on the box, build/render
+     local tools will report honest failures — the daemon itself works.
 
    `-CloneWorkspace` also clones the Zarlino plugins repo so build/render
    local tools work. You will be prompted for:

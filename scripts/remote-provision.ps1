@@ -94,8 +94,17 @@ Set-Content -Path $devVars -Value @("DEEPSEEK_API_KEY=$deepseek", "FOUNDER_AUTH_
 # -- 4. dependencies ----------------------------------------------------------
 Step "4/7 Installing npm dependencies"
 Push-Location $OsDir
-npm ci --omit=dev 2>$null
+# FULL install (do NOT use --omit=dev): the daemon runs through tsx, which is a
+# devDependency — an omit=dev install leaves `agent:daemon:loop` unable to start.
+npm ci
 if ($LASTEXITCODE -ne 0) { npm install }
+# Sanity: the daemon cannot start without tsx.
+npx --no-install tsx --version *> "$null"
+if ($LASTEXITCODE -ne 0) {
+  Write-Error "tsx missing after install — the daemon (npm run agent:daemon:loop) would fail. Fix the install and re-run."
+  Pop-Location
+  exit 1
+}
 Pop-Location
 
 # -- 5. optional plugin workspace ---------------------------------------------
