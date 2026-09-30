@@ -45,6 +45,7 @@ import {
   CHAT_ENHANCE_SQL,
   TASK_EVIDENCE_SQL,
   METER_USAGE_SQL,
+  CEO_WHATSAPP_SQL,
 } from "./schema";
 import type { Sql } from "./sql";
 
@@ -156,6 +157,7 @@ export const MIGRATIONS: Migration[] = [
   { version: 30, name: "chat_enhance", sql: [CHAT_ENHANCE_SQL] },
   { version: 31, name: "task_evidence", sql: [TASK_EVIDENCE_SQL] },
   { version: 32, name: "meter_provider_usage", sql: [METER_USAGE_SQL] },
+  { version: 33, name: "ceo_whatsapp", sql: [CEO_WHATSAPP_SQL] },
 
 ];
 

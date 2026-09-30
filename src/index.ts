@@ -21,8 +21,11 @@ import type { ToolRegistry } from "./core/tools/registry";
 import { runDoctor } from "./core/doctor";
 import { isToolCallSequenceError, repairToolCallSequence, trimTranscript } from "./core/transcript";
 import { collectiveMetrics, runChaosTest, runOrgAnalyst } from "./core/org/intelligence";
+import { runCeoCycle } from "./core/org/ceo";
 import { resolveDaemonAgentId } from "./core/org/agents";
 import { artifactKey, normalizeArtifactPath, MAX_ARTIFACT_BYTES } from "./core/artifacts";
+import { escalateToFounder, sendWhatsApp } from "./integrations/whatsapp";
+import { executiveGenerate, neuronBudget, neuronsUsedToday } from "./integrations/workersai";
 import { createTask } from "./core/tasks/model";
 import { hashPassword, timingSafeEqual, verifyPassword } from "./core/auth/passwords";
 import { estimateCost } from "./core/model/pricing";
@@ -77,6 +80,19 @@ export interface Env {
   DOCTOR_AUTOFIX?: string;
   MAX_AUTO_JOBS?: string;
   MAX_RUN_ITERATIONS?: string;
+  // Executive tier (Workers AI neurons) + founder WhatsApp channel + CEO policy.
+  AI?: unknown;
+  EXEC_AI_MODEL?: string;
+  AI_NEURON_DAILY_BUDGET?: string;
+  WHATSAPP_PROVIDER?: string;
+  WHATSAPP_TO?: string;
+  WHATSAPP_APIKEY?: string;
+  TWILIO_ACCOUNT_SID?: string;
+  TWILIO_AUTH_TOKEN?: string;
+  TWILIO_WHATSAPP_FROM?: string;
+  META_WHATSAPP_TOKEN?: string;
+  META_PHONE_NUMBER_ID?: string;
+  CEO_AUTO_APPROVE?: string;
 }
 
 const INTERNAL_HEADER = "x-exec-internal";
@@ -954,6 +970,13 @@ export class ExecutiveAgent {
     } catch {
       /* analyst must never break wake */
     }
+    // CEO agent: decide what policy allows, escalate the rest to the founder
+    // on WhatsApp — one message per cycle, never theater.
+    try {
+      await runCeoCycle(this.store, this.env, trigger);
+    } catch {
+      /* the CEO cycle must never break wake */
+    }
     // Start + resume long-horizon runs (bounded, "automate fixing"). Runs are
     // executed on EVERY maintenance sweep — on wake via state.waitUntil (keeps
     // the DO alive without blocking the request) so a run can never sit as a
@@ -1618,6 +1641,47 @@ export class ExecutiveAgent {
         updated_at: nowIso(),
       });
       return json({ ok: true, id: approval.id, status: decision });
+    }
+
+    // CEO agent + founder notifications (WhatsApp)
+    if (path === "/api/ceo/run" && method === "POST") {
+      const result = await runCeoCycle(this.store, this.env, "manual");
+      return json(result);
+    }
+    if (path === "/api/ceo/reports" && method === "GET") {
+      return json({ reports: this.store.listCeoReports(20) });
+    }
+    if (path === "/api/notifications" && method === "GET") {
+      return json({ notifications: this.store.listNotifications(50) });
+    }
+    if (path === "/api/notify/founder" && method === "POST") {
+      const body = (await readBody<{ subject?: string; body?: string; priority?: string }>(request).catch(() => ({}))) as { subject?: string; body?: string; priority?: string };
+      if (!body.body || !String(body.body).trim()) return json({ error: "body required" }, 400);
+      const r = await escalateToFounder(this.store, this.env, { subject: body.subject ?? "Message from the OS", body: String(body.body), source: "api", priority: body.priority });
+      return json(r);
+    }
+    if (path === "/api/notify/test" && method === "POST") {
+      const r = await sendWhatsApp(this.env, "Zarlino OS test \u2014 the founder channel works.");
+      return json(r);
+    }
+    if (path === "/api/ai/exec-probe" && method === "GET") {
+      const probe = await executiveGenerate(this.env, this.store, [
+        { role: "system", content: "Reply with exactly one word: ALIVE" },
+        { role: "user", content: "ping" },
+      ], { maxTokens: 16 });
+      // Debug aid: surface the RAW Workers AI error when the tier fails.
+      let rawError: string | null = null;
+      if (!probe && this.env.AI) {
+        try {
+          await (this.env.AI as { run: (m: string, i: unknown) => Promise<unknown> }).run(
+            this.env.EXEC_AI_MODEL || "@cf/meta/llama-3.1-8b-instruct-fp8",
+            { messages: [{ role: "user", content: "ping" }], max_tokens: 8 },
+          );
+        } catch (err) {
+          rawError = err instanceof Error ? err.message : String(err);
+        }
+      }
+      return json({ bound: !!this.env.AI, result: probe, rawError, neuronsToday: neuronsUsedToday(this.store), dailyBudget: neuronBudget(this.env) });
     }
 
     // Review queue — remote operator vetting of produced work (sound / UI / artifacts)

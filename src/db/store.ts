@@ -2490,6 +2490,76 @@ export class ExecutiveStore implements CostStorage {
     params.push(rowId);
     this.sql.run(`UPDATE local_agent_status SET ${sets.join(", ")} WHERE id = ?`, ...params);
   }
+  // -- CEO agent + founder notifications (migration v33) --------------------
+  insertNotification(input: {
+    id: string; channel: string; provider?: string | null; recipient?: string | null;
+    subject?: string | null; body: string; status: string; error?: string | null;
+    source: string; created_at: string;
+  }): void {
+    this.insert("notifications", {
+      id: input.id,
+      channel: input.channel,
+      provider: input.provider ?? null,
+      recipient: input.recipient ?? null,
+      subject: input.subject ?? null,
+      body: input.body,
+      status: input.status,
+      error: input.error ?? null,
+      source: input.source,
+      created_at: input.created_at,
+    });
+  }
+  listNotifications(limit = 50): Array<{
+    id: string; channel: string; provider?: string; recipient?: string; subject?: string;
+    body: string; status: string; error?: string; source: string; created_at: string;
+  }> {
+    return this.sql.all<Row>("SELECT * FROM notifications ORDER BY created_at DESC LIMIT ?", limit).map((r) => ({
+      id: String(r.id),
+      channel: String(r.channel),
+      provider: r.provider ? String(r.provider) : undefined,
+      recipient: r.recipient ? String(r.recipient) : undefined,
+      subject: r.subject ? String(r.subject) : undefined,
+      body: String(r.body),
+      status: String(r.status),
+      error: r.error ? String(r.error) : undefined,
+      source: String(r.source),
+      created_at: String(r.created_at),
+    }));
+  }
+  insertCeoReport(input: {
+    id: string; trigger: string; decided_json: string; escalated_json: string;
+    summary?: string | null; summary_model?: string | null; neurons_used?: number; created_at: string;
+  }): void {
+    this.insert("ceo_reports", {
+      id: input.id,
+      trigger: input.trigger,
+      decided_json: input.decided_json,
+      escalated_json: input.escalated_json,
+      summary: input.summary ?? null,
+      summary_model: input.summary_model ?? null,
+      neurons_used: input.neurons_used ?? 0,
+      created_at: input.created_at,
+    });
+  }
+  listCeoReports(limit = 20): Array<{
+    id: string; trigger: string; decided_json: string; escalated_json: string;
+    summary?: string; summary_model?: string; neurons_used?: number; created_at: string;
+  }> {
+    return this.sql.all<Row>("SELECT * FROM ceo_reports ORDER BY created_at DESC LIMIT ?", limit).map((r) => ({
+      id: String(r.id),
+      trigger: String(r.trigger),
+      decided_json: String(r.decided_json),
+      escalated_json: String(r.escalated_json),
+      summary: r.summary ? String(r.summary) : undefined,
+      summary_model: r.summary_model ? String(r.summary_model) : undefined,
+      neurons_used: Number(r.neurons_used ?? 0),
+      created_at: String(r.created_at),
+    }));
+  }
+  latestCeoReport(): { id: string; created_at: string } | null {
+    const rows = this.sql.all<Row>("SELECT id, created_at FROM ceo_reports ORDER BY created_at DESC LIMIT 1");
+    return rows.length ? { id: String(rows[0]!.id), created_at: String(rows[0]!.created_at) } : null;
+  }
   /** Age (ms) since the daemon's last heartbeat, or null if never seen. */
   localAgentSeenAgoMs(): number | null {
     const s = this.getLocalAgentStatus();

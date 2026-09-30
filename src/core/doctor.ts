@@ -551,6 +551,36 @@ export const DOCTOR_CHECKS: DoctorCheck[] = [
     },
   },
   {
+    id: "org.ceo.fresh",
+    label: "CEO agent has run recently",
+    severity: "LOW",
+    run: (ctx, _autoFix) => {
+      // The CEO cycle runs on every maintenance sweep (wake/cron) and decides
+      // what policy allows; a stale/absent report means governance stopped.
+      const latest = ctx.store.latestCeoReport();
+      if (!latest) {
+        return warnResult(
+          "org.ceo.fresh",
+          "CEO agent has run recently",
+          "LOW",
+          "No CEO cycle has run yet.",
+          "Run POST /api/ceo/run (it also runs on every maintenance sweep).",
+        );
+      }
+      const ageMs = Date.now() - Date.parse(latest.created_at);
+      if (ageMs > 26 * 60 * 60 * 1000) {
+        return warnResult(
+          "org.ceo.fresh",
+          "CEO agent has run recently",
+          "LOW",
+          `Last CEO cycle was ${Math.round(ageMs / 3_600_000)}h ago.`,
+          "Run POST /api/ceo/run; check the maintenance sweep.",
+        );
+      }
+      return okResult("org.ceo.fresh", "CEO agent has run recently", "LOW", `Last CEO cycle ${Math.round(ageMs / 60_000)}m ago.`);
+    },
+  },
+  {
     id: "org.analyst.fresh",
     label: "Organizational analyst has observed the org recently (§36)",
     severity: "LOW",

@@ -11,7 +11,7 @@
  *   - tests (node:sqlite).
  */
 
-export const SCHEMA_VERSION = 32;
+export const SCHEMA_VERSION = 33;
 
 /**
  * System Doctor (migration v17): persistent log of every Doctor run — what
@@ -1832,3 +1832,4 @@ CREATE INDEX IF NOT EXISTS idx_chat_titles_updated ON chat_session_titles(update
 
 export { TASK_EVIDENCE_SQL } from "./task-evidence-schema";
 export { METER_USAGE_SQL } from "./meter-usage-schema";
+export { CEO_WHATSAPP_SQL } from "./ceo-schema";
