@@ -7,6 +7,10 @@
 *.sqlite-wal
 *.sqlite-shm
 
+# --- WhatsApp bridge (auth = live session credentials!) ---
+tools/whatsapp-bridge/auth/
+tools/whatsapp-bridge/qr.png
+
 # --- Build output ---
 dist/
 node_modules/

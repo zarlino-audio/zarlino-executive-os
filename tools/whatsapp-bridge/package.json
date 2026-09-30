@@ -1,0 +1,16 @@
+{
+  "name": "zarlino-whatsapp-bridge",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Linked-device bridge: links the business WhatsApp account (QR scan) to the Zarlino Executive OS. Inbound messages go to /api/whatsapp/inbound (founder vs stranger); queued founder escalations are drained from /api/whatsapp/outbox.",
+  "main": "index.mjs",
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "pino": "^9.5.0",
+    "qrcode": "^1.5.4"
+  }
+}
