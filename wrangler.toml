@@ -4,6 +4,15 @@ compatibility_date = "2025-04-01"
 compatibility_flags = ["nodejs_compat"]
 
 # ---------------------------------------------------------------------------
+# The OS's real home: os.zarlinoaudio.com (also on the product domain, not a
+# workers.dev subdomain). workers.dev stays enabled as a fallback but all
+# first-party references use the custom domain.
+# ---------------------------------------------------------------------------
+[[routes]]
+pattern = "os.zarlinoaudio.com"
+custom_domain = true
+
+# ---------------------------------------------------------------------------
 # Durable Object: the Executive's brain. SQLite-backed (use_sqlite = true) so
 # the whole business store lives in the DO's embedded database and survives
 # restarts. `migrations` block migrates the class on deploy.

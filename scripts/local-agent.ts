@@ -60,7 +60,7 @@ export const WEBSITE = join(REPO_ROOT, "zarlino-website");
 const dotenv = loadDotEnv(join(EXEC_OS, ".dev.vars"));
 export const API_KEY = process.env.DEEPSEEK_API_KEY ?? dotenv.DEEPSEEK_API_KEY ?? "";
 export const TOKEN = process.env.FOUNDER_AUTH_TOKEN ?? dotenv.FOUNDER_AUTH_TOKEN ?? "";
-export const EXEC_URL = process.env.EXEC_OS_URL ?? "https://zarlino-executive-os.zarlino001.workers.dev";
+export const EXEC_URL = process.env.EXEC_OS_URL ?? "https://os.zarlinoaudio.com";
 export const AUTO_YES = process.argv.includes("--yes");
 
 export function ensureApiKey(): void {

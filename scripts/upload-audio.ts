@@ -30,7 +30,7 @@ const EXEC_OS = resolve(SCRIPT_DIR, "..");
 
 const dotenv = loadDotEnv(join(EXEC_OS, ".dev.vars"));
 const TOKEN = process.env.FOUNDER_AUTH_TOKEN ?? dotenv.FOUNDER_AUTH_TOKEN ?? "";
-const EXEC_URL = process.env.EXEC_OS_URL ?? "https://zarlino-executive-os.zarlino001.workers.dev";
+const EXEC_URL = process.env.EXEC_OS_URL ?? "https://os.zarlinoaudio.com";
 
 const MAX_BASE64_CHARS = 15_000_000;
 const WAV_KIND = "audio";

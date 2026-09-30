@@ -132,7 +132,7 @@ if ($CloneWorkspace) {
 Step "6/7 Registering this machine as '$AgentId' in the org registry"
 $headers = @{ Authorization = "Bearer $founder"; "Content-Type" = "application/json" }
 $execUrl = $env:EXEC_OS_URL
-if (-not $execUrl) { $execUrl = "https://zarlino-executive-os.zarlino001.workers.dev" }
+if (-not $execUrl) { $execUrl = "https://os.zarlinoaudio.com" }
 $body = @{ id = $AgentId; role_id = "role_software_engineering"; kind = "local"; model = "deepseek-v4"; source = "runtime" } | ConvertTo-Json
 try {
   $reg = Invoke-RestMethod -Uri "$execUrl/api/org/agents" -Method Post -Headers $headers -Body $body
