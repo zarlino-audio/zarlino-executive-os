@@ -21,7 +21,7 @@ import {
   type VerificationMode,
 } from "../core/tasks/evidence";
 import { PRODUCT_METRICS_SQL } from "./schema";
-import { newId } from "../ids";
+import { newId, nowIso } from "../ids";
 import type { Sql, SqlParam } from "./sql";
 import type {
   AgentRun,
@@ -2568,6 +2568,115 @@ export class ExecutiveStore implements CostStorage {
     if (Number.isNaN(t)) return null;
     return Date.now() - t;
   }
+
+  // -- WhatsApp bridge (migration v34) --------------------------------------
+  /** Outbound queue for the linked-device bridge: notifications awaiting a
+   * real send (QUEUED*), oldest first so escalation order is preserved. */
+  listQueuedNotifications(limit = 20): Array<{
+    id: string; channel: string; provider?: string; recipient?: string; subject?: string;
+    body: string; status: string; source: string; created_at: string;
+  }> {
+    return this.sql
+      .all<Row>(
+        "SELECT * FROM notifications WHERE status LIKE 'QUEUED%' ORDER BY created_at ASC LIMIT ?",
+        limit,
+      )
+      .map((r) => ({
+        id: String(r.id),
+        channel: String(r.channel),
+        provider: r.provider ? String(r.provider) : undefined,
+        recipient: r.recipient ? String(r.recipient) : undefined,
+        subject: r.subject ? String(r.subject) : undefined,
+        body: String(r.body),
+        status: String(r.status),
+        source: String(r.source),
+        created_at: String(r.created_at),
+      }));
+  }
+  updateNotification(id: string, patch: { status?: string; error?: string | null; provider?: string | null }): void {
+    const sets: string[] = [];
+    const params: SqlParam[] = [];
+    if (patch.status !== undefined) {
+      sets.push("status = ?");
+      params.push(patch.status);
+    }
+    if (patch.error !== undefined) {
+      sets.push("error = ?");
+      params.push(patch.error ?? null);
+    }
+    if (patch.provider !== undefined) {
+      sets.push("provider = ?");
+      params.push(patch.provider ?? null);
+    }
+    if (!sets.length) return;
+    params.push(id);
+    this.sql.run(`UPDATE notifications SET ${sets.join(", ")} WHERE id = ?`, ...params);
+  }
+  insertWhatsAppMessage(input: {
+    id: string; direction: string; wa_from: string; wa_to?: string | null; wa_name?: string | null;
+    role: string; body: string; reply?: string | null; message_id?: string | null;
+    status?: string; source?: string; created_at: string; updated_at: string;
+  }): void {
+    this.insert("whatsapp_messages", {
+      id: input.id,
+      direction: input.direction,
+      wa_from: input.wa_from,
+      wa_to: input.wa_to ?? null,
+      wa_name: input.wa_name ?? null,
+      role: input.role,
+      body: input.body,
+      reply: input.reply ?? null,
+      message_id: input.message_id ?? null,
+      status: input.status ?? "RECEIVED",
+      source: input.source ?? "bridge",
+      created_at: input.created_at,
+      updated_at: input.updated_at,
+    });
+  }
+  findWhatsAppMessage(messageId: string): { id: string } | null {
+    const rows = this.sql.all<Row>("SELECT id FROM whatsapp_messages WHERE message_id = ? LIMIT 1", messageId);
+    return rows.length ? { id: String(rows[0]!.id) } : null;
+  }
+  listWhatsAppMessages(limit = 50): Array<{
+    id: string; direction: string; wa_from: string; wa_to?: string; wa_name?: string;
+    role: string; body: string; reply?: string; message_id?: string; status: string;
+    source: string; created_at: string;
+  }> {
+    return this.sql
+      .all<Row>("SELECT * FROM whatsapp_messages ORDER BY created_at DESC LIMIT ?", limit)
+      .map((r) => ({
+        id: String(r.id),
+        direction: String(r.direction),
+        wa_from: String(r.wa_from),
+        wa_to: r.wa_to ? String(r.wa_to) : undefined,
+        wa_name: r.wa_name ? String(r.wa_name) : undefined,
+        role: String(r.role),
+        body: String(r.body),
+        reply: r.reply ? String(r.reply) : undefined,
+        message_id: r.message_id ? String(r.message_id) : undefined,
+        status: String(r.status),
+        source: String(r.source),
+        created_at: String(r.created_at),
+      }));
+  }
+  updateWhatsAppMessage(id: string, patch: { reply?: string | null; status?: string }): void {
+    const sets: string[] = [];
+    const params: SqlParam[] = [];
+    if (patch.reply !== undefined) {
+      sets.push("reply = ?");
+      params.push(patch.reply ?? null);
+    }
+    if (patch.status !== undefined) {
+      sets.push("status = ?");
+      params.push(patch.status);
+    }
+    if (!sets.length) return;
+    sets.push("updated_at = ?");
+    params.push(nowIso());
+    params.push(id);
+    this.sql.run(`UPDATE whatsapp_messages SET ${sets.join(", ")} WHERE id = ?`, ...params);
+  }
+
   /** Count PENDING local tasks older than the given age (ms). */
   countAgingPendingLocalTasks(olderThanMs: number): number {
     const cutoff = new Date(Date.now() - olderThanMs).toISOString();

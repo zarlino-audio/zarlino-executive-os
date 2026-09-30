@@ -23,6 +23,7 @@ import { isToolCallSequenceError, repairToolCallSequence, trimTranscript } from 
 import { collectiveMetrics, runChaosTest, runOrgAnalyst } from "./core/org/intelligence";
 import { runCeoCycle } from "./core/org/ceo";
 import { resolveDaemonAgentId } from "./core/org/agents";
+import { handleInboundWhatsApp } from "./core/org/founder-channel";
 import { artifactKey, normalizeArtifactPath, MAX_ARTIFACT_BYTES } from "./core/artifacts";
 import { escalateToFounder, sendWhatsApp } from "./integrations/whatsapp";
 import { executiveGenerate, neuronBudget, neuronsUsedToday } from "./integrations/workersai";
@@ -93,6 +94,7 @@ export interface Env {
   TWILIO_WHATSAPP_FROM?: string;
   META_WHATSAPP_TOKEN?: string;
   META_PHONE_NUMBER_ID?: string;
+  WHATSAPP_FOUNDER_NUMBER?: string;
   CEO_AUTO_APPROVE?: string;
 }
 
@@ -1691,6 +1693,61 @@ export class ExecutiveAgent {
     if (path === "/api/notify/test" && method === "POST") {
       const r = await sendWhatsApp(this.env, "Zarlino OS test \u2014 the founder channel works.");
       return json(r);
+    }
+
+    // WhatsApp linked-device bridge (tools/whatsapp-bridge). The bridge asks
+    // who a message is from (founder vs stranger), sends the reply itself,
+    // and drains the founder escalation queue. Behind the normal auth gate.
+    if (path === "/api/whatsapp/inbound" && method === "POST") {
+      const body = (await readBody<{ from?: string; name?: string; text?: string; messageId?: string }>(request).catch(() => ({}))) as { from?: string; name?: string; text?: string; messageId?: string };
+      if (!body.from || !body.text) return json({ error: "from and text required" }, 400);
+      const r = await handleInboundWhatsApp(this.store, this.env, {
+        from: String(body.from),
+        name: body.name ? String(body.name) : undefined,
+        text: String(body.text),
+        messageId: body.messageId ? String(body.messageId) : undefined,
+      });
+      return json(r);
+    }
+    if (path === "/api/whatsapp/outbox" && method === "GET") {
+      const queued = this.store.listQueuedNotifications(20);
+      return json({
+        founderNumber: this.env.WHATSAPP_FOUNDER_NUMBER ?? "+233546778438",
+        messages: queued.map((n) => ({
+          id: n.id,
+          to: n.recipient ?? null,
+          channel: n.channel,
+          subject: n.subject ?? null,
+          text: `[Zarlino OS | ${n.source}] ${n.subject ?? "Update"}\n\n${n.body}`,
+          created_at: n.created_at,
+        })),
+      });
+    }
+    const waAck = /^\/api\/whatsapp\/outbox\/([^/]+)\/ack$/.exec(path);
+    if (waAck && method === "POST") {
+      const id = decodeURIComponent(waAck[1]!);
+      const body = (await readBody<{ status?: string; error?: string }>(request).catch(() => ({}))) as { status?: string; error?: string };
+      const status = body.status === "SENT" ? "SENT" : "FAILED";
+      this.store.updateNotification(id, {
+        status,
+        error: status === "SENT" ? null : (body.error ?? "bridge send failed"),
+        provider: "bridge",
+      });
+      this.store.insertAudit({
+        id: newId("aud"),
+        actor: "whatsapp_bridge",
+        action: status === "SENT" ? "whatsapp.delivered" : "whatsapp.delivery_failed",
+        entity_type: "notifications",
+        entity_id: id,
+        detail_json: JSON.stringify({ error: body.error ?? null }),
+        source: "runtime",
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      });
+      return json({ ok: true, id, status });
+    }
+    if (path === "/api/whatsapp/messages" && method === "GET") {
+      return json({ messages: this.store.listWhatsAppMessages(50) });
     }
     if (path === "/api/ai/exec-probe" && method === "GET") {
       const probe = await executiveGenerate(this.env, this.store, [
@@ -3353,7 +3410,7 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
-    if (path.startsWith("/api/") || path === "/mcp") {
+    if (path.startsWith("/api/")) {
       // Chat SSE: stream the DO-buffered reply to the browser as real
       // Server-Sent Events (the DO runs the agent loop; we relay chunks).
       if (path === "/api/chat/sse" && request.method === "GET") {

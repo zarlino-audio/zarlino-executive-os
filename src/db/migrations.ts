@@ -46,6 +46,7 @@ import {
   TASK_EVIDENCE_SQL,
   METER_USAGE_SQL,
   CEO_WHATSAPP_SQL,
+  WHATSAPP_BRIDGE_SQL,
 } from "./schema";
 import type { Sql } from "./sql";
 
@@ -158,6 +159,7 @@ export const MIGRATIONS: Migration[] = [
   { version: 31, name: "task_evidence", sql: [TASK_EVIDENCE_SQL] },
   { version: 32, name: "meter_provider_usage", sql: [METER_USAGE_SQL] },
   { version: 33, name: "ceo_whatsapp", sql: [CEO_WHATSAPP_SQL] },
+  { version: 34, name: "whatsapp_bridge", sql: [WHATSAPP_BRIDGE_SQL] },
 
 ];
 
