@@ -25,7 +25,8 @@
 param(
   [string]$AgentId = "remote_daemon_01",
   [switch]$CloneWorkspace,
-  [switch]$NoStart
+  [switch]$NoStart,
+  [switch]$CheckOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -40,6 +41,25 @@ Step "1/7 Checking git + node"
 $git = Get-Command git -ErrorAction SilentlyContinue
 $node = Get-Command node -ErrorAction SilentlyContinue
 $winget = Get-Command winget -ErrorAction SilentlyContinue
+
+if ($CheckOnly) {
+  Step "Check-only: reporting the environment, changing nothing"
+  $gitSrc = "MISSING"; if ($git) { $gitSrc = $git.Source }
+  $nodeSrc = "MISSING"; if ($node) { $nodeSrc = $node.Source }
+  $wingetSrc = "MISSING"; if ($winget) { $wingetSrc = $winget.Source }
+  Write-Host "git:    $gitSrc"
+  Write-Host "node:   $nodeSrc"
+  Write-Host "winget: $wingetSrc"
+  Write-Host ""
+  Write-Host "Planned actions (without -CheckOnly):"
+  if ($winget) { Write-Host "  - install git/node via winget where missing" } else { Write-Host "  - git/node must be installed MANUALLY (no winget on this machine)" }
+  Write-Host "  - clone $RepoUrl into $OsDir"
+  Write-Host "  - write secrets to $OsDir\.dev.vars (you type them; never printed)"
+  Write-Host "  - npm ci (full install; tsx is required for the daemon)"
+  Write-Host "  - register this machine as '$AgentId' at https://os.zarlinoaudio.com"
+  Write-Host "  - install a startup launcher so the daemon survives reboots"
+  exit 0
+}
 
 if (-not $git -or -not $node) {
   if (-not $winget) {
