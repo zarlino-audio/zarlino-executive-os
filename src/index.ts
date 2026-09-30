@@ -26,6 +26,7 @@ import { resolveDaemonAgentId } from "./core/org/agents";
 import { artifactKey, normalizeArtifactPath, MAX_ARTIFACT_BYTES } from "./core/artifacts";
 import { escalateToFounder, sendWhatsApp } from "./integrations/whatsapp";
 import { executiveGenerate, neuronBudget, neuronsUsedToday } from "./integrations/workersai";
+import { handleMcpMessage, MCP_PROTOCOL_VERSION, type McpEnv } from "./mcp/server";
 import { createTask } from "./core/tasks/model";
 import { hashPassword, timingSafeEqual, verifyPassword } from "./core/auth/passwords";
 import { estimateCost } from "./core/model/pricing";
@@ -1215,6 +1216,33 @@ export class ExecutiveAgent {
     if (path === "/api/auth/status" && method === "GET") return json({ ok: true, authenticated: true });
     if (path === "/api/auth/bootstrap" && method === "POST") return this.handleBootstrap(request);
     if (path === "/api/auth/change-password" && method === "POST") return this.handleChangePassword(request);
+
+    // MCP — the READ-ONLY inspection plane for external AI clients (JSON-RPC
+    // 2.0 over POST). Authenticated like everything else; no mutating tools.
+    if (path === "/mcp") {
+      if (method === "GET") {
+        return json({
+          ok: true,
+          service: "zarlino-executive-os",
+          mcp: true,
+          readOnly: true,
+          protocol: MCP_PROTOCOL_VERSION,
+          transport: "json-rpc-2.0 over POST /mcp (authenticated)",
+        });
+      }
+      if (method === "POST") {
+        let raw: unknown;
+        try {
+          raw = await request.json();
+        } catch {
+          return json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error: invalid JSON." } });
+        }
+        const body = await handleMcpMessage(this.store, this.env as McpEnv, raw);
+        if (body === null) return new Response(null, { status: 202 });
+        return json(body);
+      }
+      return json({ error: "Method not allowed" }, 405);
+    }
 
     // Overview
     if (path === "/api/executive/overview" && method === "GET") {
@@ -3325,7 +3353,7 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
-    if (path.startsWith("/api/")) {
+    if (path.startsWith("/api/") || path === "/mcp") {
       // Chat SSE: stream the DO-buffered reply to the browser as real
       // Server-Sent Events (the DO runs the agent loop; we relay chunks).
       if (path === "/api/chat/sse" && request.method === "GET") {
