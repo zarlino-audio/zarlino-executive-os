@@ -24,6 +24,7 @@ import { collectiveMetrics, runChaosTest, runOrgAnalyst } from "./core/org/intel
 import { runCeoCycle } from "./core/org/ceo";
 import { resolveDaemonAgentId } from "./core/org/agents";
 import { handleInboundWhatsApp } from "./core/org/founder-channel";
+import { composeFounderDigest, cooldown, markFounderMessageSent } from "./core/org/voice";
 import { artifactKey, normalizeArtifactPath, MAX_ARTIFACT_BYTES } from "./core/artifacts";
 import { escalateToFounder, sendWhatsApp } from "./integrations/whatsapp";
 import { executiveGenerate, neuronBudget, neuronsUsedToday } from "./integrations/workersai";
@@ -1710,41 +1711,66 @@ export class ExecutiveAgent {
       return json(r);
     }
     if (path === "/api/whatsapp/outbox" && method === "GET") {
-      const queued = this.store.listQueuedNotifications(20);
+      const founderNumber = this.env.WHATSAPP_FOUNDER_NUMBER ?? "+233546778438";
+      const queued = this.store.listQueuedNotifications(50);
+      if (!queued.length) return json({ founderNumber, messages: [] });
+
+      // Quiet gap: at most one founder message per WHATSAPP_MIN_GAP_MINUTES
+      // (default 240) unless nothing was ever sent. No spam, ever.
+      const held = cooldown(this.store, this.env);
+      if (held.held) {
+        return json({
+          founderNumber,
+          messages: [],
+          holdUntil: held.holdUntil,
+          queued: queued.length,
+        });
+      }
+
+      // Coalesce EVERYTHING queued into ONE message; duplicate items merge.
+      const digest = await composeFounderDigest(this.store, this.env, queued);
       return json({
-        founderNumber: this.env.WHATSAPP_FOUNDER_NUMBER ?? "+233546778438",
-        messages: queued.map((n) => ({
-          id: n.id,
-          to: n.recipient ?? null,
-          channel: n.channel,
-          subject: n.subject ?? null,
-          text: `[Zarlino OS | ${n.source}] ${n.subject ?? "Update"}\n\n${n.body}`,
-          created_at: n.created_at,
-        })),
+        founderNumber,
+        messages: [
+          {
+            ids: digest.ids,
+            to: queued[0]?.recipient ?? null,
+            text: digest.text,
+            itemCount: digest.items.length,
+            composedBy: digest.model ?? "template",
+          },
+        ],
       });
     }
     const waAck = /^\/api\/whatsapp\/outbox\/([^/]+)\/ack$/.exec(path);
     if (waAck && method === "POST") {
-      const id = decodeURIComponent(waAck[1]!);
-      const body = (await readBody<{ status?: string; error?: string }>(request).catch(() => ({}))) as { status?: string; error?: string };
+      const rawId = decodeURIComponent(waAck[1]!);
+      const body = (await readBody<{ status?: string; error?: string; ids?: string[] }>(request).catch(() => ({}))) as { status?: string; error?: string; ids?: string[] };
       const status = body.status === "SENT" ? "SENT" : "FAILED";
-      this.store.updateNotification(id, {
-        status,
-        error: status === "SENT" ? null : (body.error ?? "bridge send failed"),
-        provider: "bridge",
-      });
+      const ids =
+        Array.isArray(body.ids) && body.ids.length
+          ? body.ids.filter((x) => typeof x === "string").slice(0, 50)
+          : [rawId];
+      for (const id of ids) {
+        this.store.updateNotification(id, {
+          status,
+          error: status === "SENT" ? null : (body.error ?? "bridge send failed"),
+          provider: "bridge",
+        });
+      }
+      if (status === "SENT") markFounderMessageSent(this.store);
       this.store.insertAudit({
         id: newId("aud"),
         actor: "whatsapp_bridge",
         action: status === "SENT" ? "whatsapp.delivered" : "whatsapp.delivery_failed",
         entity_type: "notifications",
-        entity_id: id,
-        detail_json: JSON.stringify({ error: body.error ?? null }),
+        entity_id: ids[0] ?? rawId,
+        detail_json: JSON.stringify({ ids: ids.length, error: body.error ?? null }),
         source: "runtime",
         created_at: nowIso(),
         updated_at: nowIso(),
       });
-      return json({ ok: true, id, status });
+      return json({ ok: true, ids, status });
     }
     if (path === "/api/whatsapp/messages" && method === "GET") {
       return json({ messages: this.store.listWhatsAppMessages(50) });

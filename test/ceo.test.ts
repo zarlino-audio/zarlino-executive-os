@@ -61,7 +61,7 @@ describe("CEO agent — autonomous decisions, founder-only escalation", () => {
     const notes = store.listNotifications(10);
     expect(notes.length).toBeGreaterThanOrEqual(1);
     expect(notes[0]!.status).toBe("QUEUED_UNCONFIGURED");
-    expect(notes[0]!.subject ?? "").toContain("need the founder");
+    expect(notes[0]!.subject ?? "").toContain("awaiting the founder");
 
     // The cycle itself is on record (report + audit), summary model honest.
     const reports = store.listCeoReports(10);

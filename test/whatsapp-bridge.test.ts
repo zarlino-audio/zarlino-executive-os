@@ -10,6 +10,12 @@ import {
   strangerReply,
   FOUNDER_WHATSAPP_DEFAULT,
 } from "../src/core/org/founder-channel";
+import {
+  cooldown,
+  composeFounderDigest,
+  markFounderMessageSent,
+  naturalDigestFallback,
+} from "../src/core/org/voice";
 
 describe("WhatsApp founder channel — FR-1 founder vs stranger", () => {
   let db: DatabaseSync;
@@ -82,9 +88,11 @@ describe("WhatsApp founder channel — FR-1 founder vs stranger", () => {
     expect(r.duplicate).toBe(false);
     // Deterministic fallback (no Workers AI binding in tests) yet grounded in
     // the real store state — pending approvals are surfaced to the founder.
-    expect(r.reply).toContain("pending approval");
     expect(r.reply).toContain("Secret internal approval");
-    expect(r.reply).not.toContain("zarlinoaudio.com and the right person");
+    // AND it must not read like a machine wrote it.
+    expect(r.reply).not.toContain("[");
+    expect(r.reply).not.toContain("decision(s)");
+    expect(r.reply).not.toMatch(/\b(ai|bot|automated|automation|system|agent)\b/i);
 
     const rows = store.listWhatsAppMessages(10);
     expect(rows[0]!.role).toBe("FOUNDER");
@@ -134,5 +142,60 @@ describe("WhatsApp founder channel — FR-1 founder vs stranger", () => {
     // The row still exists (delivery history) — only the queue moved on.
     const all = store.listNotifications(50);
     expect(all.find((n) => n.id === "ntf_bridge_test")?.status).toBe("SENT");
+  });
+
+  it("coalesces the whole backlog into ONE natural message — duplicates merged, no machine traces", async () => {
+    const at = new Date().toISOString();
+    const mk = (id: string, subject: string, body: string) =>
+      store.insertNotification({
+        id,
+        channel: "whatsapp",
+        provider: "unconfigured",
+        recipient: null,
+        subject,
+        body,
+        status: "QUEUED_UNCONFIGURED",
+        error: null,
+        source: "ceo",
+        created_at: at,
+      });
+    mk("ntf_c1", "1 item awaiting the founder", "• Approve ZTame 1.2 release (approval appr_x)\n\nApprove or reject in the console.");
+    mk("ntf_c2", "1 item awaiting the founder", "• Approve ZTame 1.2 release (approval appr_x)\n\nApprove or reject in the console.");
+    mk("ntf_c3", "1 item awaiting the founder", "• Name 3 trusted producers (approval appr_y)\n\nApprove or reject in the console.");
+
+    const rows = store.listQueuedNotifications(50);
+    const digest = await composeFounderDigest(store, {}, rows);
+
+    // ONE message covering three queued rows, duplicate item merged.
+    expect(digest.ids.length).toBe(3);
+    expect(digest.items.length).toBe(2);
+    expect(digest.text).toContain("• Approve ZTame 1.2 release");
+    expect(digest.text).toContain("• Name 3 trusted producers");
+    expect(digest.text).not.toContain("[Zarlino OS");
+    expect(digest.text).not.toContain("decision(s)");
+    expect(digest.text).not.toMatch(/\b(ai|bot|automated|automation|agent)\b/i);
+    expect(digest.model).toBeNull(); // deterministic voice without AI binding
+  });
+
+  it("keeps a quiet gap between founder messages (override-able)", () => {
+    const now = Date.parse("2026-10-01T10:00:00.000Z");
+    expect(cooldown(store, {}, now).held).toBe(false); // nothing sent yet
+
+    markFounderMessageSent(store, new Date(now).toISOString());
+    const held = cooldown(store, {}, now + 60_000);
+    expect(held.held).toBe(true);
+    expect(held.holdUntil).toBe(new Date(now + 240 * 60_000).toISOString());
+    expect(cooldown(store, {}, now + 241 * 60_000).held).toBe(false);
+
+    // env override lets the founder tighten or loosen the gap
+    expect(cooldown(store, { WHATSAPP_MIN_GAP_MINUTES: "1" }, now + 30_000).held).toBe(true);
+    expect(cooldown(store, { WHATSAPP_MIN_GAP_MINUTES: "1" }, now + 61_000).held).toBe(false);
+  });
+
+  it("the deterministic digest voice passes the no-machine-traces bar", () => {
+    const t = naturalDigestFallback(["Approve ZTame 1.2 release"]);
+    expect(t).toContain("• Approve ZTame 1.2 release");
+    expect(t).not.toMatch(/\b(ai|bot|automated|automation|system|agent)\b/i);
+    expect(t).not.toContain("decision");
   });
 });

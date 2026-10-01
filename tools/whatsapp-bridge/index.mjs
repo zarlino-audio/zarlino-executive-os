@@ -203,26 +203,32 @@ async function drainOutbox() {
   } catch {
     return;
   }
+  if (data.holdUntil) {
+    log(`quiet gap active — holding ${data.queued ?? "queued"} item(s) until ${data.holdUntil}`);
+    return;
+  }
   for (const msg of data.messages ?? []) {
     const digits = String(msg.to || data.founderNumber || "").replace(/[^\d]/g, "");
     if (!digits) continue;
     const jid = `${digits}@s.whatsapp.net`;
+    const ids = Array.isArray(msg.ids) && msg.ids.length ? msg.ids : [msg.id].filter(Boolean);
+    const ackUrl = `${EXEC_URL}/api/whatsapp/outbox/${encodeURIComponent(ids[0] ?? "unknown")}/ack`;
     try {
       await sock.sendMessage(jid, { text: msg.text });
-      await fetch(`${EXEC_URL}/api/whatsapp/outbox/${encodeURIComponent(msg.id)}/ack`, {
+      await fetch(ackUrl, {
         method: "POST",
         headers: headers(),
-        body: JSON.stringify({ status: "SENT" }),
+        body: JSON.stringify({ status: "SENT", ids }),
       });
-      log(`escalation delivered → ${digits} (${msg.id})`);
+      log(`delivered (${msg.itemCount ?? "?"} item(s), ${ids.length} queued) → ${digits}`);
     } catch (err) {
       const errText = String(err?.message ?? err).slice(0, 200);
-      await fetch(`${EXEC_URL}/api/whatsapp/outbox/${encodeURIComponent(msg.id)}/ack`, {
+      await fetch(ackUrl, {
         method: "POST",
         headers: headers(),
-        body: JSON.stringify({ status: "FAILED", error: errText }),
+        body: JSON.stringify({ status: "FAILED", error: errText, ids }),
       }).catch(() => {});
-      log(`escalation FAILED → ${digits} (${msg.id}): ${errText}`);
+      log(`delivery FAILED → ${digits}: ${errText}`);
     }
   }
 }

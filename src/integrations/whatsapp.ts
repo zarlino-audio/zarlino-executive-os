@@ -108,7 +108,7 @@ export async function escalateToFounder(
   env: NotifyEnv,
   input: { subject: string; body: string; source?: string; priority?: string },
 ): Promise<EscalationResult> {
-  const text = `[Zarlino OS | ${input.priority ?? "NORMAL"}] ${input.subject}\n\n${input.body}`;
+  const text = `${input.subject}\n\n${input.body}`;
   const r = await sendWhatsApp(env, text);
   const status = r.sent ? "SENT" : r.provider === "unconfigured" ? "QUEUED_UNCONFIGURED" : "FAILED";
   const id = newId("ntf");

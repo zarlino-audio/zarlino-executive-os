@@ -20,14 +20,20 @@
  */
 import type { ExecutiveStore } from "../../db/store";
 import { newId, nowIso } from "../../ids";
-import { executiveGenerate, type AiEnv } from "../../integrations/workersai";
+import {
+  naturalFounderReply,
+  naturalReplyFallback,
+  strangerReply,
+  type FounderStateContext,
+  type VoiceEnv,
+} from "./voice";
 
 /** The founder's personal number — the ONLY number treated as the founder. */
 export const FOUNDER_WHATSAPP_DEFAULT = "+233546778438";
 
-export interface FounderChannelEnv extends AiEnv {
-  WHATSAPP_FOUNDER_NUMBER?: string;
-}
+export type FounderChannelEnv = VoiceEnv;
+
+export { strangerReply };
 
 /** Digits only, so +233 54 677 8438, 233546778438 and 0546778438 all normalize. */
 export function normalizePhone(raw: string): string {
@@ -67,14 +73,7 @@ export interface InboundWhatsAppResult {
 }
 
 /** A stranger gets exactly this — polite, public, zero internal context. */
-export function strangerReply(): string {
-  return (
-    "Hello! This is the Zarlino Audio assistant. This line is monitored automatically " +
-    "and is not the founder's personal line. For anything about our plugins — support, " +
-    "licensing, downloads — please visit https://zarlinoaudio.com and the right person " +
-    "will pick it up. Your message has been logged. Thank you!"
-  );
-}
+// (strangerReply now lives in ./voice, re-exported above.)
 
 function safeCounts(raw: string | undefined): { ok?: number; warn?: number; fail?: number } | null {
   if (!raw) return null;
@@ -86,14 +85,9 @@ function safeCounts(raw: string | undefined): { ok?: number; warn?: number; fail
   }
 }
 
-export interface FounderContext {
-  pendingApprovals: string[];
-  openTasks: number;
-  ceoSummary: string | null;
-  doctor: { ok?: number; warn?: number; fail?: number } | null;
-}
+export type FounderContext = FounderStateContext;
 
-export function buildFounderContext(store: ExecutiveStore): FounderContext {
+export function buildFounderContext(store: ExecutiveStore): FounderStateContext {
   const pending = store
     .listApprovals({ status: "PENDING", limit: 5 })
     .map((a) => a.action_label || a.id);
@@ -110,52 +104,12 @@ export function buildFounderContext(store: ExecutiveStore): FounderContext {
   };
 }
 
-function deterministicFounderReply(ctx: FounderContext): string {
-  const parts: string[] = [];
-  parts.push(`Received. ${ctx.pendingApprovals.length} pending approval(s), ${ctx.openTasks} open task(s).`);
-  if (ctx.pendingApprovals.length) {
-    parts.push(`Awaiting you: ${ctx.pendingApprovals.slice(0, 3).join(" | ")}.`);
-  }
-  if (ctx.doctor) {
-    parts.push(`Doctor: ${ctx.doctor.ok ?? "?"} OK / ${ctx.doctor.warn ?? "?"} WARN / ${ctx.doctor.fail ?? "?"} FAIL.`);
-  }
-  if (ctx.ceoSummary) {
-    parts.push(`CEO: ${ctx.ceoSummary.slice(0, 220)}`);
-  }
-  return parts.join(" ");
-}
-
 async function founderReply(
   store: ExecutiveStore,
   env: FounderChannelEnv,
   text: string,
 ): Promise<string> {
-  const ctx = buildFounderContext(store);
-  const ai = await executiveGenerate(
-    env,
-    store,
-    [
-      {
-        role: "system",
-        content:
-          "You are the Zarlino Audio Executive OS answering the FOUNDER over WhatsApp. " +
-          "Be concise (max 4 short lines), factual, no fluff, no markdown tables. " +
-          "Use ONLY the provided state context — never invent numbers. If the founder asks for " +
-          "an action, say it will be handled by the CEO agent and logged. " +
-          "State context: " +
-          JSON.stringify({
-            pending_approvals: ctx.pendingApprovals,
-            open_tasks: ctx.openTasks,
-            doctor: ctx.doctor,
-            ceo_last_summary: ctx.ceoSummary?.slice(0, 400) ?? null,
-          }),
-      },
-      { role: "user", content: text.slice(0, 1500) },
-    ],
-    { maxTokens: 320 },
-  );
-  if (ai && ai.text.trim()) return ai.text.trim().slice(0, 900);
-  return deterministicFounderReply(ctx);
+  return naturalFounderReply(store, env, text, buildFounderContext(store));
 }
 
 /**
@@ -181,7 +135,7 @@ export async function handleInboundWhatsApp(
   try {
     reply = role === "FOUNDER" ? await founderReply(store, env, text) : strangerReply();
   } catch {
-    reply = role === "FOUNDER" ? deterministicFounderReply(buildFounderContext(store)) : strangerReply();
+    reply = role === "FOUNDER" ? naturalReplyFallback(buildFounderContext(store)) : strangerReply();
   }
 
   const id = newId("wam");

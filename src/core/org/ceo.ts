@@ -111,12 +111,12 @@ export async function runCeoCycle(store: ExecutiveStore, env: CeoEnv, trigger: s
   // 3. One founder message per cycle — only when something needs them.
   let escalationStatus = "none";
   if (escalated.length) {
-    const lines = escalated.map((e, i) => `${i + 1}. ${e.label}  (approval ${e.id})`).join("\n");
+    const lines = escalated.map((e) => `• ${e.label} (approval ${e.id})`).join("\n");
     const r = await escalateToFounder(store, env, {
-      subject: `${escalated.length} decision(s) need the founder`,
-      body: `${lines}\n\nApprove or reject in the console (os.zarlinoaudio.com) — the CEO agent holds them until you do.`,
+      subject: `${escalated.length} item${escalated.length === 1 ? "" : "s"} awaiting the founder`,
+      body: `${lines}\n\nApprove or reject in the console.`,
       source: "ceo",
-      priority: "HIGH",
+      priority: "NORMAL",
     });
     escalationStatus = r.sent
       ? "sent"
