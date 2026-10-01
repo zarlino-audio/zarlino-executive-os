@@ -3436,7 +3436,10 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
-    if (path.startsWith("/api/")) {
+    // NOTE: /mcp must stay in this forward condition — the read-only MCP
+    // plane lives on the DO, and dropping it 404s the whole plane (regression
+    // guard in test/mcp.test.ts asserts this line).
+    if (path.startsWith("/api/") || path === "/mcp") {
       // Chat SSE: stream the DO-buffered reply to the browser as real
       // Server-Sent Events (the DO runs the agent loop; we relay chunks).
       if (path === "/api/chat/sse" && request.method === "GET") {

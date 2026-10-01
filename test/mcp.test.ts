@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { createNodeSql } from "../src/db/sql";
 import { ExecutiveStore } from "../src/db/store";
@@ -139,5 +140,13 @@ describe("MCP read-only plane", () => {
     expect(sc.summary.warn).toBe(1);
     expect(sc.summary.fail).toBe(0);
     expect(sc.problems.map((p) => p.id)).toEqual(["b.warn"]);
+  });
+
+  it("REGRESSION GUARD: the worker forwards /mcp to the DO (dropping it 404s the whole plane)", () => {
+    const src = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
+    // The outer worker fetch must forward BOTH /api/* and /mcp.
+    expect(src).toMatch(/path\.startsWith\("\/api\/"\)\s*\|\|\s*path === "\/mcp"/);
+    // And the DO itself must handle the path.
+    expect(src).toMatch(/if \(path === "\/mcp"\)/);
   });
 });
