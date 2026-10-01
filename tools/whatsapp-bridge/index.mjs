@@ -32,6 +32,18 @@ const QR_PORT = Number(process.env.QR_PORT || 3037);
 const POLL_MS = Number(process.env.OUTBOX_POLL_MS || 15000);
 const logger = P({ level: "silent" });
 
+// Baileys' signal layer dumps raw session objects and Bad-MAC chatter on the
+// console — keep the bridge log readable (our own log() lines still pass).
+const NOISE = ["Closing session", "Closing open session", "Failed to decrypt message", "Session error"];
+const quiet = (orig) =>
+  (...args) => {
+    const first = typeof args[0] === "string" ? args[0] : "";
+    if (NOISE.some((p) => first.startsWith(p))) return;
+    orig(...args);
+  };
+console.log = quiet(console.log.bind(console));
+console.error = quiet(console.error.bind(console));
+
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }

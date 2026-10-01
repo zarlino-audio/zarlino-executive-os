@@ -10,6 +10,7 @@
 # --- WhatsApp bridge (auth = live session credentials!) ---
 tools/whatsapp-bridge/auth/
 tools/whatsapp-bridge/qr.png
+tools/whatsapp-bridge/bridge.log
 
 # --- Build output ---
 dist/
