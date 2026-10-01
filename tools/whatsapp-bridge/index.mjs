@@ -33,12 +33,18 @@ const POLL_MS = Number(process.env.OUTBOX_POLL_MS || 15000);
 const logger = P({ level: "silent" });
 
 // Baileys' signal layer dumps raw session objects and Bad-MAC chatter on the
-// console — keep the bridge log readable (our own log() lines still pass).
-const NOISE = ["Closing session", "Closing open session", "Failed to decrypt message", "Session error"];
+// console. Drop the dumps, but keep a COMPACT warning when a message fails to
+// decrypt — that line is the difference between "nothing arrived" and
+// "arrived but couldn't be read" during diagnosis.
+const NOISE_DROP = ["Closing session", "Closing open session", "Session error"];
 const quiet = (orig) =>
   (...args) => {
     const first = typeof args[0] === "string" ? args[0] : "";
-    if (NOISE.some((p) => first.startsWith(p))) return;
+    if (NOISE_DROP.some((p) => first.startsWith(p))) return;
+    if (first.startsWith("Failed to decrypt message")) {
+      orig(`[${new Date().toISOString()}] [warn] a message couldn't be decrypted — requesting retry from WhatsApp`);
+      return;
+    }
     orig(...args);
   };
 console.log = quiet(console.log.bind(console));
@@ -168,19 +174,34 @@ async function connect() {
 
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
+    log(`upsert: ${messages.length} new message(s)`);
     for (const m of messages) {
       try {
-        if (!m.message || m.key.fromMe) continue;
-        const jid = m.key.remoteJid || "";
-        if (!jid || jid.endsWith("@g.us") || jid === "status@broadcast") continue; // groups/status ignored
+        const jid = m.key?.remoteJid || "";
+        if (m.key?.fromMe) {
+          log(`skip: own outgoing message (${jid || "self"})`);
+          continue;
+        }
+        if (!m.message) {
+          log(`skip: no message body (${jid || "unknown"})`);
+          continue;
+        }
+        if (!jid || jid.endsWith("@g.us") || jid === "status@broadcast") {
+          log(`skip: group/status (${jid || "unknown"})`);
+          continue;
+        }
         const text =
           m.message.conversation ||
           m.message.extendedTextMessage?.text ||
           m.message.imageMessage?.caption ||
           m.message.videoMessage?.caption ||
           "";
-        if (!text.trim()) continue;
+        if (!text.trim()) {
+          log(`skip: no text content (${jid})`);
+          continue;
+        }
         const from = jid.split("@")[0].split(":")[0];
+        log(`inbound text from ${from} (${text.length} chars) — asking the OS`);
         const res = await fetch(`${EXEC_URL}/api/whatsapp/inbound`, {
           method: "POST",
           headers: headers(),
@@ -192,8 +213,12 @@ async function connect() {
         }
         const data = await res.json();
         if (data.reply && !data.duplicate) {
-          await sock.sendMessage(jid, { text: data.reply });
-          log(`[${data.role}] replied to ${from}`);
+          try {
+            await sock.sendMessage(jid, { text: data.reply });
+            log(`[${data.role}] replied to ${from}`);
+          } catch (sendErr) {
+            log(`[${data.role}] SEND FAILED to ${from}: ${sendErr?.message ?? sendErr}`);
+          }
         } else {
           log(`[${data.role}] ${from}: no reply (duplicate=${data.duplicate})`);
         }

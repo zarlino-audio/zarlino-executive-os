@@ -23,7 +23,7 @@ import { isToolCallSequenceError, repairToolCallSequence, trimTranscript } from 
 import { collectiveMetrics, runChaosTest, runOrgAnalyst } from "./core/org/intelligence";
 import { runCeoCycle } from "./core/org/ceo";
 import { resolveDaemonAgentId } from "./core/org/agents";
-import { handleInboundWhatsApp } from "./core/org/founder-channel";
+import { handleInboundWhatsApp, DIGEST_APPROVALS_SETTING } from "./core/org/founder-channel";
 import { composeFounderDigest, cooldown, markFounderMessageSent } from "./core/org/voice";
 import { artifactKey, normalizeArtifactPath, MAX_ARTIFACT_BYTES } from "./core/artifacts";
 import { escalateToFounder, sendWhatsApp } from "./integrations/whatsapp";
@@ -1729,6 +1729,26 @@ export class ExecutiveAgent {
 
       // Coalesce EVERYTHING queued into ONE message; duplicate items merge.
       const digest = await composeFounderDigest(this.store, this.env, queued);
+
+      // Remember WHICH approvals this digest referenced, so a bare "approve"
+      // reply from the founder can actually decide them (48h window).
+      const approvalIds: string[] = [];
+      for (const row of queued) {
+        const re = /\(approval (appr_[A-Za-z0-9_]+)\)/g;
+        let m: RegExpExecArray | null;
+        while ((m = re.exec(row.body ?? "")) !== null) approvalIds.push(m[1]!);
+      }
+      const uniqueApprovals = Array.from(new Set(approvalIds));
+      if (uniqueApprovals.length) {
+        try {
+          this.store.setSetting(
+            DIGEST_APPROVALS_SETTING,
+            JSON.stringify({ ids: uniqueApprovals, at: nowIso() }),
+          );
+        } catch {
+          /* never blocks a delivery */
+        }
+      }
       return json({
         founderNumber,
         messages: [

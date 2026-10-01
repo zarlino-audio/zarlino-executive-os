@@ -198,4 +198,66 @@ describe("WhatsApp founder channel — FR-1 founder vs stranger", () => {
     expect(t).not.toMatch(/\b(ai|bot|automated|automation|system|agent)\b/i);
     expect(t).not.toContain("decision");
   });
+
+  it("a bare 'approve' reply decides the pending item from the last digest", async () => {
+    const ap = createApprovalRequest({ action_label: "Approve nightly builds", reason: "ci", requested_by: "executive" });
+    store.insertApproval(ap);
+    store.setSetting(
+      "whatsapp:pending_digest_approvals",
+      JSON.stringify({ ids: [ap.id], at: new Date().toISOString() }),
+    );
+    const r = await handleInboundWhatsApp(store, {}, {
+      from: "+233546778438",
+      text: "Approve",
+      messageId: "msg_decide_1",
+    });
+    expect(r.role).toBe("FOUNDER");
+    expect(store.getApproval(ap.id)?.status).toBe("APPROVED");
+    expect(store.getApproval(ap.id)?.decided_by).toBe("founder");
+    expect(r.reply).toContain("approved");
+    expect(r.reply).toContain("Approve nightly builds");
+  });
+
+  it("'no' rejects; plain chat decides nothing", async () => {
+    const ap2 = createApprovalRequest({ action_label: "Enable telemetry trial", reason: "analytics", requested_by: "executive" });
+    store.insertApproval(ap2);
+    store.setSetting(
+      "whatsapp:pending_digest_approvals",
+      JSON.stringify({ ids: [ap2.id], at: new Date().toISOString() }),
+    );
+
+    const chat = await handleInboundWhatsApp(store, {}, {
+      from: "+233546778438",
+      text: "what needs me right now?",
+      messageId: "msg_chat_x",
+    });
+    expect(store.getApproval(ap2.id)?.status).toBe("PENDING");
+    expect(chat.reply).not.toContain("rejected");
+
+    const r = await handleInboundWhatsApp(store, {}, {
+      from: "+233546778438",
+      text: "no",
+      messageId: "msg_decide_2",
+    });
+    expect(store.getApproval(ap2.id)?.status).toBe("REJECTED");
+    expect(store.getApproval(ap2.id)?.decided_by).toBe("founder");
+    expect(r.reply).toContain("rejected");
+    expect(r.reply).toContain("Enable telemetry trial");
+  });
+
+  it("intent against a stale digest acts on nothing (48h safety window)", async () => {
+    const ap3 = createApprovalRequest({ action_label: "Old pending thing", reason: "x", requested_by: "executive" });
+    store.insertApproval(ap3);
+    store.setSetting(
+      "whatsapp:pending_digest_approvals",
+      JSON.stringify({ ids: [ap3.id], at: new Date(Date.now() - 72 * 3600_000).toISOString() }),
+    );
+    const r = await handleInboundWhatsApp(store, {}, {
+      from: "+233546778438",
+      text: "approve",
+      messageId: "msg_decide_3",
+    });
+    expect(store.getApproval(ap3.id)?.status).toBe("PENDING");
+    expect(r.reply).not.toContain("Done");
+  });
 });
