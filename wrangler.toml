@@ -77,6 +77,11 @@ AI_DAILY_BUDGET = "5"
 AI_MONTHLY_BUDGET = "80"
 AI_PER_TASK_BUDGET = "2"
 AI_PER_RUN_BUDGET = "8"
+# The founder's WhatsApp identity. His real number (+233546778438) is the
+# default in code; this LID is how HIS account actually addresses the business
+# line (WhatsApp linked-ID privacy mode hides the phone number entirely), so
+# messages must be recognized as founder, not stranger.
+WHATSAPP_FOUNDER_LIDS = "23790595616867"
 
 # ---------------------------------------------------------------------------
 # Constant maintenance: the System Doctor auto-runs on this schedule (and on
