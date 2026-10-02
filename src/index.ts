@@ -27,7 +27,7 @@ import { handleInboundWhatsApp, DIGEST_APPROVALS_SETTING } from "./core/org/foun
 import { composeFounderDigest, cooldown, markFounderMessageSent } from "./core/org/voice";
 import { artifactKey, normalizeArtifactPath, MAX_ARTIFACT_BYTES } from "./core/artifacts";
 import { escalateToFounder, sendWhatsApp } from "./integrations/whatsapp";
-import { executiveGenerate, neuronBudget, neuronsUsedToday } from "./integrations/workersai";
+import { DEFAULT_EXEC_MODEL, executiveGenerate, neuronBudget, neuronsUsedToday } from "./integrations/workersai";
 import { handleMcpMessage, MCP_PROTOCOL_VERSION, type McpEnv } from "./mcp/server";
 import { createTask } from "./core/tasks/model";
 import { hashPassword, timingSafeEqual, verifyPassword } from "./core/auth/passwords";
@@ -1796,6 +1796,42 @@ export class ExecutiveAgent {
     if (path === "/api/whatsapp/messages" && method === "GET") {
       return json({ messages: this.store.listWhatsAppMessages(50) });
     }
+    // Bridge liveness: whichever machine hosts the founder channel reports in
+    // here (the doctor's whatsapp.bridge check reads it back). This makes
+    // "the bridge died with the old machine" visible in the cloud instead of
+    // silently queueing messages.
+    if (path === "/api/whatsapp/bridge/heartbeat" && method === "POST") {
+      const body = (await readBody<{ host?: string; linkedAs?: string }>(request).catch(() => ({}))) as { host?: string; linkedAs?: string };
+      const at = nowIso();
+      this.store.setSetting(
+        "whatsapp_bridge_last_seen",
+        JSON.stringify({
+          at,
+          host: body.host ? String(body.host).slice(0, 80) : null,
+          linkedAs: body.linkedAs ? String(body.linkedAs).slice(0, 80) : null,
+        }),
+      );
+      return json({ ok: true, at });
+    }
+    if (path === "/api/whatsapp/bridge" && method === "GET") {
+      const raw = this.store.getSetting("whatsapp_bridge_last_seen");
+      type BridgeSeen = { at?: string; host?: string | null; linkedAs?: string | null };
+      let seen: BridgeSeen | null = null;
+      if (raw) {
+        try {
+          seen = JSON.parse(raw) as BridgeSeen;
+        } catch {
+          seen = null;
+        }
+      }
+      const ageMs = seen?.at ? Date.now() - Date.parse(seen.at) : null;
+      return json({
+        bridge: seen
+          ? { ...seen, ageMs, fresh: ageMs !== null && ageMs <= 5 * 60 * 1000 }
+          : null,
+        queued: this.store.listQueuedNotifications(50).length,
+      });
+    }
     if (path === "/api/ai/exec-probe" && method === "GET") {
       const probe = await executiveGenerate(this.env, this.store, [
         { role: "system", content: "Reply with exactly one word: ALIVE" },
@@ -1806,7 +1842,7 @@ export class ExecutiveAgent {
       if (!probe && this.env.AI) {
         try {
           await (this.env.AI as { run: (m: string, i: unknown) => Promise<unknown> }).run(
-            this.env.EXEC_AI_MODEL || "@cf/meta/llama-3.1-8b-instruct-fp8",
+            this.env.EXEC_AI_MODEL || DEFAULT_EXEC_MODEL,
             { messages: [{ role: "user", content: "ping" }], max_tokens: 8 },
           );
         } catch (err) {

@@ -3,18 +3,20 @@
  *
  * One cycle (runs on every maintenance sweep + on demand):
  *   1. Registers itself as a real runtime instance (org registry, honest §7).
- *   2. Reads the pending approval queue. Decisions that are reversible and
- *      carry no spend / irreversible / legal / credential markers are
- *      APPROVED autonomously (audited as `ceo_agent`, capped per cycle).
- *      Everything else is ESCALATED — batched into ONE WhatsApp message to
- *      the founder per cycle (recorded even when WhatsApp is unconfigured).
+ *   2. Reads the pending approval queue. Everything is APPROVED autonomously
+ *      (audited as `ceo_agent`, capped per cycle) EXCEPT a hard line that
+ *      always reaches the founder: money movement, legal/contracts,
+ *      credentials/secrets, irreversible destruction, domain/DNS/ownership.
+ *      Those are ESCALATED — batched into ONE WhatsApp message per cycle
+ *      (recorded even when WhatsApp is unconfigured).
  *   3. Compresses the state into a short executive summary on the Workers AI
  *      executive tier (10k neurons/day budget); falls back to a deterministic
  *      digest when the tier is unavailable. No theater: the summary model and
  *      neuron count are recorded with the report.
  *
- * Policy is intentionally conservative: escalate rather than guess. The
- * founder can flip CEO_AUTO_APPROVE=off to make every approval wait for them.
+ * Policy: the CEO runs the company; the founder is reached only over the
+ * hard line above (money/legal/credentials/irreversible). Flip
+ * CEO_AUTO_APPROVE=off to make every approval wait for the founder again.
  */
 import type { ExecutiveStore } from "../../db/store";
 import { newId, nowIso } from "../../ids";
@@ -25,9 +27,14 @@ export interface CeoEnv extends AiEnv, NotifyEnv {
   CEO_AUTO_APPROVE?: string;
 }
 
-/** Matters that must never be decided autonomously. */
-const ESCALATE_RE =
-  /(deploy|payment|purchase|pricing|price|money|spend|budget|refund|delete|destroy|remove|legal|contract|license key|credential|secret|rotate|publish|release|ship|transfer|domain|dns|paystack|bank|terminate|termination)/i;
+/**
+ * The founder's hard line — the only matters the CEO will not decide alone.
+ * Everything else, including deploys/releases/publishes, is decided
+ * autonomously and audited. Keep this list short and serious: money
+ * movement, legal, credentials, irreversible destruction, domain/ownership.
+ */
+const HARD_ESCALATE_RE =
+  /\b(pay|payment|payout|paystack|invoice|refund|bank|wire|transfer|money|spend|budget|pricing|price|salary|purchase|buy|legal|contract)\b|licen[cs]e key|credential|password|secret|api key|\brotate\b|\bdelete|\bdestroy|\berase|\bwipe\b|\bpurge\b|\bterminate|ownership|\bdomain\b|\bdns\b|irreversible/i;
 
 export interface CeoDecision {
   id: string;
@@ -63,11 +70,11 @@ export async function runCeoCycle(store: ExecutiveStore, env: CeoEnv, trigger: s
   for (const a of pending) {
     const label = a.action_label || a.id;
     const haystack = `${label} ${a.reason ?? ""} ${a.max_downside ?? ""}`;
-    if (autoApprove && !ESCALATE_RE.test(haystack) && decided.length < 10) {
+    if (autoApprove && !HARD_ESCALATE_RE.test(haystack) && decided.length < 25) {
       store.updateApproval(a.id, {
         status: "APPROVED",
         decided_by: "ceo_agent",
-        decision_note: "Auto-approved by the CEO agent: reversible, within policy (no spend/irreversible/legal markers).",
+        decision_note: "Decided by the CEO agent under the founder's replacement mandate (no money/legal/credential/irreversible markers). Audited.",
       } as never);
       store.insertAudit({
         id: newId("aud"),

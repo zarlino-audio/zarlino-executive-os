@@ -1,4 +1,7 @@
-# Zarlino Executive OS — Remote Dev Machine Provisioner
+# Zarlino Executive OS - Remote Dev Machine Provisioner (daemon-only, LEGACY)
+# SUPERSEDED: the canonical kit is scripts/instance-provision.ps1 (daemon +
+# WhatsApp bridge + session import + end-to-end verification) - that is what
+# the downloadable ZarlinoInstanceSetup.exe runs.
 #
 # Turns a fresh Windows machine (the RDP box: Zarlino1.rdp, host 102.37.153.164)
 # into a RELIABLE always-on runtime instance for the artificial organization.
@@ -6,20 +9,20 @@
 # WHAT IT DOES
 #   1. Verifies git + node (installs via winget when missing and winget exists).
 #   2. Clones https://github.com/zarlino-audio/zarlino-executive-os (private).
-#   3. Creates .dev.vars — YOU type DEEPSEEK_API_KEY + FOUNDER_AUTH_TOKEN here,
+#   3. Creates .dev.vars - YOU type DEEPSEEK_API_KEY + FOUNDER_AUTH_TOKEN here,
 #      on this machine. Secrets are never printed or sent anywhere else.
 #   4. npm install.
 #   5. Optionally clones the Zarlino plugins repo and points the daemon at it
 #      (ZARLINO_WORKSPACE) so build/render local tools work here.
 #   6. Registers this machine in the org registry as its OWN instance id
-#      (default: remote_daemon_01) — an honest second runtime, not a clone.
+#      (default: remote_daemon_01) - an honest second runtime, not a clone.
 #   7. Installs a startup launcher so the daemon survives reboots.
 #
 # USAGE (run ON the remote machine, from any PowerShell):
 #   .\remote-provision.ps1 [-AgentId remote_daemon_01] [-CloneWorkspace] [-StartNow]
 #
 # NOTE: machine-specific tool paths in scripts/local-agent.ts (VS vcvars,
-# FL Studio, Python scripts dir) may need adjustment on this machine — run one
+# FL Studio, Python scripts dir) may need adjustment on this machine - run one
 # local task after provisioning and verify tool resolution.
 
 param(
@@ -97,7 +100,7 @@ if (Test-Path $devVars) {
   $fLine = $existing | Where-Object { $_ -like "FOUNDER_AUTH_TOKEN=*" }
   if ($dLine) { $deepseek = ($dLine -replace "^DEEPSEEK_API_KEY=", "") }
   if ($fLine) { $founder = ($fLine -replace "^FOUNDER_AUTH_TOKEN=", "") }
-  Write-Host ".dev.vars already present — reusing stored values."
+  Write-Host ".dev.vars already present - reusing stored values."
 }
 if (-not $deepseek) {
   $deepseek = Read-Host "Paste DEEPSEEK_API_KEY"
@@ -115,13 +118,13 @@ Set-Content -Path $devVars -Value @("DEEPSEEK_API_KEY=$deepseek", "FOUNDER_AUTH_
 Step "4/7 Installing npm dependencies"
 Push-Location $OsDir
 # FULL install (do NOT use --omit=dev): the daemon runs through tsx, which is a
-# devDependency — an omit=dev install leaves `agent:daemon:loop` unable to start.
+# devDependency - an omit=dev install leaves `agent:daemon:loop` unable to start.
 npm ci
 if ($LASTEXITCODE -ne 0) { npm install }
 # Sanity: the daemon cannot start without tsx.
 npx --no-install tsx --version *> "$null"
 if ($LASTEXITCODE -ne 0) {
-  Write-Error "tsx missing after install — the daemon (npm run agent:daemon:loop) would fail. Fix the install and re-run."
+  Write-Error "tsx missing after install - the daemon (npm run agent:daemon:loop) would fail. Fix the install and re-run."
   Pop-Location
   exit 1
 }
@@ -158,7 +161,7 @@ try {
   $reg = Invoke-RestMethod -Uri "$execUrl/api/org/agents" -Method Post -Headers $headers -Body $body
   Write-Host "Registered: $($reg.agent.id) ($($reg.agent.status))"
 } catch {
-  Write-Host "WARNING: registration failed ($($_.Exception.Message)) — the daemon heartbeat will register it anyway."
+  Write-Host "WARNING: registration failed ($($_.Exception.Message)) - the daemon heartbeat will register it anyway."
 }
 
 # -- 7. startup launcher ------------------------------------------------------

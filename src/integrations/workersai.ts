@@ -1,10 +1,10 @@
 /**
  * Executive-tier model calls on Cloudflare Workers AI ("neurons").
  *
- * The org's executive layer (CEO agent decisions, summaries, light reasoning)
- * runs on Workers AI — consuming the account's daily neuron allowance
- * (default budget: 10,000 neurons/day) — while heavy workers (long-horizon
- * agent runs, coding loops, chat with tools) stay on DeepSeek.
+ * The org's executive layer (CEO agent decisions, summaries, founder voice)
+ * runs on the HIGH tier of Workers AI — consuming the account's daily neuron
+ * allowance (default budget: 10,000 neurons/day) — while heavy workers
+ * (long-horizon agent runs, coding loops, chat with tools) stay on DeepSeek.
  *
  * Budget accounting is approximate and honest: neuron estimates are recorded
  * per UTC day in the settings table; when the budget is spent this module
@@ -24,7 +24,12 @@ export interface AiEnv {
   AI_NEURON_DAILY_BUDGET?: string;
 }
 
-export const DEFAULT_EXEC_MODEL = "@cf/meta/llama-3.1-8b-instruct-fp8";
+/**
+ * Default executive-tier model: the high tier (Llama 3.3 70B) — every
+ * executive agent consumes the neuron budget on this tier. Override with
+ * EXEC_AI_MODEL; heavy workers stay on DeepSeek.
+ */
+export const DEFAULT_EXEC_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 
 /** Neuron rates per 1M tokens (Cloudflare published rates, approximate). */
 const NEURON_RATES: Record<string, { inPerM: number; outPerM: number }> = {

@@ -24,6 +24,7 @@ import P from "pino";
 import fs from "node:fs";
 import path from "node:path";
 import http from "node:http";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -136,6 +137,7 @@ http
 // ---- WhatsApp connection ---------------------------------------------------
 let sock = null;
 let drainTimer = null;
+let heartbeatTimer = null;
 
 async function connect() {
   const { state, saveCreds } = await useMultiFileAuthState(path.join(DIR, "auth"));
@@ -172,13 +174,20 @@ async function connect() {
       log(`LINKED as ${linkedAs}`);
       if (drainTimer) clearInterval(drainTimer);
       drainTimer = setInterval(() => void drainOutbox(), POLL_MS);
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      heartbeatTimer = setInterval(() => void postHeartbeat(), 60_000);
       void drainOutbox();
+      void postHeartbeat();
     }
     if (u.connection === "close") {
       const code = u.lastDisconnect?.error?.output?.statusCode ?? u.lastDisconnect?.error?.message;
       if (drainTimer) {
         clearInterval(drainTimer);
         drainTimer = null;
+      }
+      if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
       }
       if (code === DisconnectReason.loggedOut || code === 401) {
         status = "logged out — delete auth/ and restart to re-link";
@@ -251,6 +260,30 @@ async function connect() {
       }
     }
   });
+}
+
+// ---- Liveness heartbeat -----------------------------------------------------
+/**
+ * Tells the OS which machine currently hosts the founder channel (settings
+ * key whatsapp_bridge_last_seen). The doctor turns that into a real check, so
+ * "the bridge died with the old laptop" is visible in the cloud instead of
+ * silently queueing messages.
+ */
+async function postHeartbeat() {
+  if (status !== "linked") return;
+  try {
+    await osFetch(
+      "/api/whatsapp/bridge/heartbeat",
+      {
+        method: "POST",
+        headers: headers(),
+        body: JSON.stringify({ host: os.hostname(), linkedAs }),
+      },
+      2,
+    );
+  } catch {
+    /* best-effort; message delivery is the priority */
+  }
 }
 
 // ---- Outbox drain (founder escalations) ------------------------------------

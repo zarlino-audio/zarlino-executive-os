@@ -374,6 +374,78 @@ export const DOCTOR_CHECKS: DoctorCheck[] = [
     },
   },
   {
+    id: "whatsapp.bridge",
+    label: "Founder WhatsApp channel has a live bridge (or nothing waiting)",
+    severity: "MEDIUM",
+    run: (ctx, _autoFix) => {
+      const raw = ctx.store.getSetting("whatsapp_bridge_last_seen");
+      const queued = ctx.store.listQueuedNotifications(50).length;
+      type BridgeSeen = { at?: string; host?: string | null; linkedAs?: string | null };
+      let seen: BridgeSeen | null = null;
+      if (raw) {
+        try {
+          seen = JSON.parse(raw) as BridgeSeen;
+        } catch {
+          seen = null;
+        }
+      }
+      const ageMs = seen?.at ? Date.now() - Date.parse(seen.at) : null;
+      const where = seen?.host ? ` on ${seen.host}${seen.linkedAs ? ` (${seen.linkedAs})` : ""}` : "";
+      const mins = ageMs === null || Number.isNaN(ageMs) ? null : Math.round(ageMs / 60_000);
+      if (ageMs === null || Number.isNaN(ageMs)) {
+        if (queued > 0) {
+          return failResult(
+            "whatsapp.bridge",
+            "Founder WhatsApp channel has a live bridge (or nothing waiting)",
+            "MEDIUM",
+            `${queued} founder message(s) are queued and no bridge has ever reported in — the founder channel has no host machine.`,
+            "Run ZarlinoInstanceSetup.exe on any always-on machine (it installs the bridge), or start the local bridge. Delivery resumes automatically.",
+          );
+        }
+        return warnResult(
+          "whatsapp.bridge",
+          "Founder WhatsApp channel has a live bridge (or nothing waiting)",
+          "MEDIUM",
+          "No WhatsApp bridge heartbeat recorded yet — the founder channel is offline until a bridge runs somewhere.",
+          "Run ZarlinoInstanceSetup.exe on the machine that should host the founder channel.",
+        );
+      }
+      if (ageMs <= 5 * 60_000) {
+        return okResult(
+          "whatsapp.bridge",
+          "Founder WhatsApp channel has a live bridge (or nothing waiting)",
+          "MEDIUM",
+          `Bridge alive${where} — last heartbeat ${Math.round(ageMs / 1000)}s ago.`,
+        );
+      }
+      if (ageMs <= 30 * 60_000) {
+        return warnResult(
+          "whatsapp.bridge",
+          "Founder WhatsApp channel has a live bridge (or nothing waiting)",
+          "MEDIUM",
+          `Bridge last seen ${mins} min ago${where} — it may be restarting.`,
+          "If it stays silent, start the bridge on another machine (ZarlinoInstanceSetup.exe).",
+        );
+      }
+      if (queued > 0) {
+        return failResult(
+          "whatsapp.bridge",
+          "Founder WhatsApp channel has a live bridge (or nothing waiting)",
+          "MEDIUM",
+          `Bridge offline ${mins} min${where} with ${queued} message(s) queued for the founder.`,
+          "Start the bridge on an always-on machine — queued messages deliver themselves once it links.",
+        );
+      }
+      return warnResult(
+        "whatsapp.bridge",
+        "Founder WhatsApp channel has a live bridge (or nothing waiting)",
+        "MEDIUM",
+        `Bridge offline ${mins} min${where}; nothing is queued right now.`,
+        "Start the bridge on an always-on machine.",
+      );
+    },
+  },
+  {
     id: "org.registry",
     label: "AOrgI registry is coherent (roles, departments, agent instances)",
     severity: "HIGH",

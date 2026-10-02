@@ -79,3 +79,15 @@ Notes:
   FL Studio, Python scripts dir) may need adjusting on this machine — after
   provisioning, run one small local task and verify tool resolution.
 - Deregister a dead instance with `DELETE /api/org/agents/:id`.
+
+## Bridge host + retirement (2026-10-02)
+
+- The canonical provisioner is now `scripts/instance-provision.ps1` (daemon +
+  WhatsApp bridge + session import + verification) — this is what the
+  downloadable ZarlinoInstanceSetup.exe runs. `remote-provision.ps1` is legacy
+  (daemon-only).
+- Moving the founder channel without a QR: `scripts/export-bridge-session.ps1`
+  on the current host → import with `-BridgeSessionZip` on the new host.
+- Retiring a host: `scripts/retire-this-machine.ps1` (dry run by default;
+  `-Execute -Deregister` to stop services + clean the registry).
+- Full runbook: `docs/INSTANCE_AND_RETIREMENT.md`.

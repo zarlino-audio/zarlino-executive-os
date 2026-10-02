@@ -30,6 +30,45 @@ describe("System Doctor", () => {
     expect(logs[0]!.trigger).toBe("test");
   });
 
+  it("flags the WhatsApp bridge when it is offline with queued founder messages", async () => {
+    store.setSetting(
+      "whatsapp_bridge_last_seen",
+      JSON.stringify({ at: new Date(Date.now() - 3_600_000).toISOString(), host: "ghost-machine" }),
+    );
+    store.insertNotification({
+      id: "ntf_bridge_test",
+      channel: "whatsapp",
+      provider: "bridge",
+      recipient: "+233546778438",
+      subject: "1 item awaiting the founder",
+      body: "• Something important",
+      status: "QUEUED_UNCONFIGURED",
+      error: null,
+      source: "test",
+      created_at: new Date().toISOString(),
+    });
+
+    const stale = await runDoctor(
+      { store, env: {}, now: () => new Date().toISOString() },
+      { autoFix: false, trigger: "test" },
+    );
+    expect(stale.checks.find((c) => c.id === "whatsapp.bridge")!.status).toBe("FAIL");
+
+    // A fresh heartbeat on whatever machine hosts the channel clears it.
+    store.setSetting(
+      "whatsapp_bridge_last_seen",
+      JSON.stringify({ at: new Date().toISOString(), host: "always-on-pc", linkedAs: "233597987855:2" }),
+    );
+    const fresh = await runDoctor(
+      { store, env: {}, now: () => new Date().toISOString() },
+      { autoFix: false, trigger: "test" },
+    );
+    expect(fresh.checks.find((c) => c.id === "whatsapp.bridge")!.status).toBe("OK");
+
+    // Clean up so later tests in this shared store see no pending queue.
+    store.updateNotification("ntf_bridge_test", { status: "SENT", error: null, provider: "bridge" });
+  });
+
   it("auto-fixes a stale RUNNING agent run", async () => {
     const now = new Date().toISOString();
     store.createAgentRun({

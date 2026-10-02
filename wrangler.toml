@@ -73,6 +73,10 @@ run_worker_first = true
 # ---------------------------------------------------------------------------
 [vars]
 WEBSITE_URL = "https://zarlinoaudio.com"
+# Executive tier (Workers AI): the HIGH tier model every executive agent uses
+# (CEO cycles, founder digests/replies) inside the 10k neurons/day budget.
+# Heavy workers stay on DeepSeek.
+EXEC_AI_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
 AI_DAILY_BUDGET = "5"
 AI_MONTHLY_BUDGET = "80"
 AI_PER_TASK_BUDGET = "2"

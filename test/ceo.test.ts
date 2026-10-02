@@ -4,7 +4,7 @@ import { createNodeSql } from "../src/db/sql";
 import { ExecutiveStore } from "../src/db/store";
 import { createApprovalRequest } from "../src/core/approvals/queue";
 import { runCeoCycle } from "../src/core/org/ceo";
-import { estimateNeurons } from "../src/integrations/workersai";
+import { DEFAULT_EXEC_MODEL, estimateNeurons } from "../src/integrations/workersai";
 
 describe("CEO agent — autonomous decisions, founder-only escalation", () => {
   let db: DatabaseSync;
@@ -27,18 +27,28 @@ describe("CEO agent — autonomous decisions, founder-only escalation", () => {
     expect(estimateNeurons("@cf/unknown/model", 0, 0)).toBe(0);
   });
 
-  it("registers itself, auto-approves policy-safe items, escalates the rest, records everything", async () => {
+  it("the executive tier defaults to the Workers AI high tier", () => {
+    expect(DEFAULT_EXEC_MODEL).toBe("@cf/meta/llama-3.3-70b-instruct-fp8-fast");
+  });
+
+  it("registers itself, decides everything autonomously except the hard line, records everything", async () => {
     const benign = createApprovalRequest({
       action_label: "Update the internal docs index",
       reason: "Routine housekeeping",
       requested_by: "executive",
     });
-    const sensitive = createApprovalRequest({
+    const deploy = createApprovalRequest({
       action_label: "Deploy ZTame 1.2 to production",
       reason: "Release the versioned build",
       requested_by: "executive",
     });
+    const sensitive = createApprovalRequest({
+      action_label: "Transfer the contractor payout from the business account",
+      reason: "Monthly mastering invoice",
+      requested_by: "executive",
+    });
     store.insertApproval(benign);
+    store.insertApproval(deploy);
     store.insertApproval(sensitive);
 
     // No AI binding and no WhatsApp config — both must degrade honestly.
@@ -48,11 +58,14 @@ describe("CEO agent — autonomous decisions, founder-only escalation", () => {
     const ceo = store.getOrgAgent("ceo_agent_01");
     expect(ceo?.role_id).toBe("role_ceo");
 
-    // Policy: benign → APPROVED by ceo_agent; deploy → ESCALATED, still PENDING.
+    // The founder's replacement mandate: deploys/releases are decided
+    // autonomously; only money/legal/credential/irreversible reach the founder.
     expect(result.decided.map((d) => d.id)).toContain(benign.id);
+    expect(result.decided.map((d) => d.id)).toContain(deploy.id);
     expect(result.escalated.map((e) => e.id)).toContain(sensitive.id);
     expect(store.getApproval(benign.id)?.status).toBe("APPROVED");
     expect(store.getApproval(benign.id)?.decided_by).toBe("ceo_agent");
+    expect(store.getApproval(deploy.id)?.status).toBe("APPROVED");
     expect(store.getApproval(sensitive.id)?.status).toBe("PENDING");
 
     // The escalation was recorded even though WhatsApp is unconfigured —

@@ -25,7 +25,8 @@ class Program
         ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072; // TLS 1.2 for older frameworks
         Console.Title = "Zarlino Instance Setup";
         Console.WriteLine("Zarlino Instance Setup");
-        Console.WriteLine("Turns this Windows machine into a Zarlino runtime instance.");
+        Console.WriteLine("Turns this Windows machine into a Zarlino runtime instance");
+        Console.WriteLine("(task daemon + WhatsApp bridge, with auto-start and verification).");
         Console.WriteLine("(Fetches the current provisioner from " + ScriptUrl + ")");
         Console.WriteLine();
 
