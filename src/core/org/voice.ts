@@ -130,9 +130,9 @@ const DIGEST_SYSTEM =
   "a busy engineer. Voice rules, all mandatory: sound like a human colleague texting — casual, " +
   "warm, direct; NEVER mention AI, bots, models, systems, agents, automation or monitoring; " +
   "NEVER use corporate filler (leverage, kindly, utilize, please note, decision(s), 'this is an automated'); " +
-  "max 4 short lines; list the items EXACTLY as given, one per line starting with '•', never reword them; " +
-  "if there is one item, keep it warm and brief; end with a light pointer to the console. " +
-  "Output the message text only — no quotes, no labels.";
+  "max 4 short lines; list ONLY the items given, EXACTLY as written, one per line starting with '•' — " +
+  "never add, merge or invent items; never include numbers that are not in the list; " +
+  "end with a light pointer to the console. Output the message text only — no quotes, no labels.";
 
 export interface FounderDigest {
   text: string;
@@ -173,12 +173,14 @@ export async function composeFounderDigest(
 // ---- quick replies ----------------------------------------------------------
 
 const REPLY_SYSTEM =
-  "You are Zarlino Audio's right hand, replying to the founder over WhatsApp. " +
-  "Sound like a sharp human assistant: casual, short (1–3 lines max), contractions fine, " +
-  "NO bullet lists, NO status dumps, NO jargon. Never mention AI, automation, monitoring, " +
-  "systems or agents — never say 'as an assistant'. Use the state only if it matters to their " +
-  "question; otherwise just answer naturally. If they ask for status, give the single most " +
-  "important thing in one calm sentence. Output the reply text only.";
+  "You are Zarlino Audio's right hand, replying to THE FOUNDER — the person you are speaking to — over WhatsApp. " +
+  "Sound like a sharp human assistant: casual, short (1–3 lines max), contractions fine, NO bullet lists, " +
+  "NO status dumps, NO jargon. Never mention AI, automation, monitoring, systems or agents; never say " +
+  "'as an assistant'; never speak about the founder in the third person. " +
+  "HARD RULE: only state facts that appear in the provided state — never invent numbers, files, events " +
+  "or plans (if you don't know, say you'll check and get back). If they ask for status, give the single " +
+  "most important item in one calm sentence. If the message is just a greeting or test, reply with one " +
+  "short friendly line and stop. Output the reply text only.";
 
 export interface FounderStateContext {
   pendingApprovals: string[];
@@ -224,7 +226,7 @@ export async function naturalFounderReply(
         },
         { role: "user", content: text.slice(0, 1500) },
       ],
-      { maxTokens: 200 },
+      { maxTokens: 200, temperature: 0.25 },
     );
     const reply = ai?.text?.trim();
     if (reply) return reply.slice(0, 700);
