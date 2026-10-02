@@ -96,6 +96,7 @@ export interface Env {
   META_WHATSAPP_TOKEN?: string;
   META_PHONE_NUMBER_ID?: string;
   WHATSAPP_FOUNDER_NUMBER?: string;
+  WHATSAPP_FOUNDER_LIDS?: string;
   CEO_AUTO_APPROVE?: string;
 }
 

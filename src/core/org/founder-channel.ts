@@ -46,16 +46,30 @@ export function founderDigits(env: FounderChannelEnv): string {
 }
 
 /**
+ * Extra founder identifiers (WhatsApp LIDs). LIDs are NOT phone numbers —
+ * WhatsApp's linked-ID addressing can hide the real number entirely, so the
+ * founder's own LID must be accepted explicitly (comma list).
+ */
+export function founderLids(env: FounderChannelEnv): string[] {
+  return (env.WHATSAPP_FOUNDER_LIDS ?? "")
+    .split(",")
+    .map((s) => normalizePhone(s))
+    .filter(Boolean);
+}
+
+/**
  * Same-person check with national-format tolerance: exact digit match, or
- * the last 9 digits match (covers +233 / 0-prefixed local forms). Anything
- * else is NOT the founder — fail closed.
+ * the last 9 digits match (covers +233 / 0-prefixed local forms), or the id
+ * is an explicitly configured founder LID. Anything else is NOT the founder —
+ * fail closed.
  */
 export function isFounderNumber(env: FounderChannelEnv, raw: string): boolean {
   const a = normalizePhone(raw);
   const b = founderDigits(env);
   if (!a || !b) return false;
   if (a === b) return true;
-  return a.length >= 9 && b.length >= 9 && a.slice(-9) === b.slice(-9);
+  if (a.length >= 9 && b.length >= 9 && a.slice(-9) === b.slice(-9)) return true;
+  return founderLids(env).includes(a);
 }
 
 export interface InboundWhatsAppInput {

@@ -72,6 +72,25 @@ if (!TOKEN) {
 
 const headers = () => ({ Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" });
 
+/**
+ * Every OS call goes through here: explicit 20s timeout + retries with
+ * backoff. This machine's uplink is flaky (transient 408s, multi-second
+ * stalls) — one dropped fetch must never mean a dropped founder message.
+ */
+async function osFetch(pathname, options = {}, tries = 3) {
+  let lastErr;
+  for (let i = 1; i <= tries; i++) {
+    try {
+      return await fetch(`${EXEC_URL}${pathname}`, { ...options, signal: AbortSignal.timeout(20_000) });
+    } catch (err) {
+      lastErr = err;
+      log(`OS fetch ${pathname} attempt ${i}/${tries} failed: ${err?.message ?? err}`);
+      if (i < tries) await new Promise((r) => setTimeout(r, 2500 * i));
+    }
+  }
+  throw lastErr;
+}
+
 // ---- QR web page -----------------------------------------------------------
 let qrDataUrl = null;
 let status = "starting";
@@ -200,9 +219,14 @@ async function connect() {
           log(`skip: no text content (${jid})`);
           continue;
         }
-        const from = jid.split("@")[0].split(":")[0];
-        log(`inbound text from ${from} (${text.length} chars) — asking the OS`);
-        const res = await fetch(`${EXEC_URL}/api/whatsapp/inbound`, {
+        // WhatsApp's LID migration: remoteJid may be a <lid>@lid identifier
+        // that is NOT the phone number. Prefer the phone-number JID
+        // (remoteJidAlt/senderPn) for classification; reply to the original.
+        const alt = m.key?.remoteJidAlt || m.key?.senderPn || "";
+        const pnJid = jid.endsWith("@s.whatsapp.net") ? jid : String(alt).endsWith("@s.whatsapp.net") ? String(alt) : "";
+        const from = (pnJid || jid).split("@")[0].split(":")[0];
+        log(`inbound text from ${from}${pnJid ? "" : " (no phone-number JID — LID only)"} (${text.length} chars) — asking the OS`);
+        const res = await osFetch("/api/whatsapp/inbound", {
           method: "POST",
           headers: headers(),
           body: JSON.stringify({ from, name: m.pushName ?? undefined, text, messageId: m.key.id ?? undefined }),
@@ -234,7 +258,7 @@ async function drainOutbox() {
   if (!sock || status !== "linked") return;
   let data;
   try {
-    const res = await fetch(`${EXEC_URL}/api/whatsapp/outbox`, { headers: headers() });
+    const res = await osFetch("/api/whatsapp/outbox", { headers: headers() }, 2);
     if (!res.ok) return;
     data = await res.json();
   } catch {
@@ -249,22 +273,22 @@ async function drainOutbox() {
     if (!digits) continue;
     const jid = `${digits}@s.whatsapp.net`;
     const ids = Array.isArray(msg.ids) && msg.ids.length ? msg.ids : [msg.id].filter(Boolean);
-    const ackUrl = `${EXEC_URL}/api/whatsapp/outbox/${encodeURIComponent(ids[0] ?? "unknown")}/ack`;
+    const ackPath = `/api/whatsapp/outbox/${encodeURIComponent(ids[0] ?? "unknown")}/ack`;
     try {
       await sock.sendMessage(jid, { text: msg.text });
-      await fetch(ackUrl, {
+      await osFetch(ackPath, {
         method: "POST",
         headers: headers(),
         body: JSON.stringify({ status: "SENT", ids }),
-      });
+      }, 3);
       log(`delivered (${msg.itemCount ?? "?"} item(s), ${ids.length} queued) → ${digits}`);
     } catch (err) {
       const errText = String(err?.message ?? err).slice(0, 200);
-      await fetch(ackUrl, {
+      await osFetch(ackPath, {
         method: "POST",
         headers: headers(),
         body: JSON.stringify({ status: "FAILED", error: errText, ids }),
-      }).catch(() => {});
+      }, 2).catch(() => {});
       log(`delivery FAILED → ${digits}: ${errText}`);
     }
   }

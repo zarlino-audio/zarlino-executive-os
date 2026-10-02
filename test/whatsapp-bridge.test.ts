@@ -48,6 +48,12 @@ describe("WhatsApp founder channel — FR-1 founder vs stranger", () => {
 
     // Env override respected.
     expect(isFounderNumber({ WHATSAPP_FOUNDER_NUMBER: "+15550001111" }, "15550001111")).toBe(true);
+
+    // Founder LIDs: WhatsApp's linked-ID addressing can hide the phone number,
+    // so explicitly configured founder LIDs count as the founder too.
+    expect(isFounderNumber({ WHATSAPP_FOUNDER_LIDS: "23790595616867" }, "23790595616867")).toBe(true);
+    expect(isFounderNumber({ WHATSAPP_FOUNDER_LIDS: "237 9059 5616867" }, "23790595616867")).toBe(true);
+    expect(isFounderNumber({ WHATSAPP_FOUNDER_LIDS: "11111111111" }, "23790595616867")).toBe(false);
     expect(FOUNDER_WHATSAPP_DEFAULT).toBe("+233546778438");
   });
 

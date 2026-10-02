@@ -23,6 +23,7 @@ import { executiveGenerate, type AiEnv } from "../../integrations/workersai";
 export interface VoiceEnv extends AiEnv {
   WHATSAPP_MIN_GAP_MINUTES?: string;
   WHATSAPP_FOUNDER_NUMBER?: string;
+  WHATSAPP_FOUNDER_LIDS?: string;
 }
 
 /** settings key holding the last successful founder delivery (ISO time). */
