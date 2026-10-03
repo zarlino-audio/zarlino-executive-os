@@ -86,7 +86,9 @@ AI_BALANCE_WARN_USD = "10"
 # EMAIL_API_KEY is a SECRET (`wrangler secret put EMAIL_API_KEY`); the rest are
 # plain vars. Sends are hard-capped per day across manual + automatic paths.
 OUTREACH_DAILY_CAP = "20"
-EMAIL_PROVIDER = "brevo"
+# Cloudflare Email Sending is the primary provider (binding below - no API key);
+# brevo/mailjet stay available as fallbacks (set EMAIL_PROVIDER + EMAIL_API_KEY).
+EMAIL_PROVIDER = "cloudflare"
 EMAIL_FROM = "support@zarlinoaudio.com"
 EMAIL_FROM_NAME = "Zarlino Audio"
 EMAIL_REPLY_TO = "support@zarlinoaudio.com"
@@ -103,6 +105,14 @@ AI_PER_RUN_BUDGET = "8"
 # line (WhatsApp linked-ID privacy mode hides the phone number entirely), so
 # messages must be recognized as founder, not stranger.
 WHATSAPP_FOUNDER_LIDS = "23790595616867"
+
+# ---------------------------------------------------------------------------
+# Email sending (growth outreach): Cloudflare Email Service binding.
+# The zone (zarlinoaudio.com) already carries the Email Service MX/DKIM/SPF
+# records; outreach sends as EMAIL_FROM through this binding on the account.
+# ---------------------------------------------------------------------------
+[[send_email]]
+name = "SEND_EMAIL"
 
 # ---------------------------------------------------------------------------
 # Constant maintenance: the System Doctor auto-runs on this schedule (and on

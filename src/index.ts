@@ -28,7 +28,7 @@ import { composeFounderDigest, cooldown, markFounderMessageSent } from "./core/o
 import { artifactKey, normalizeArtifactPath, MAX_ARTIFACT_BYTES } from "./core/artifacts";
 import { escalateToFounder, sendWhatsApp } from "./integrations/whatsapp";
 import { OUTREACH_TEMPLATES, outreachDailyCap, runOutreachCycle, sendOutreachNow } from "./core/outreach";
-import { emailConfigured } from "./integrations/email";
+import { emailConfigured, type SendEmailBinding } from "./integrations/email";
 import { DEFAULT_EXEC_MODEL, executiveGenerate, neuronBudget, neuronsUsedToday } from "./integrations/workersai";
 import { handleMcpMessage, MCP_PROTOCOL_VERSION, type McpEnv } from "./mcp/server";
 import { createTask } from "./core/tasks/model";
@@ -90,6 +90,8 @@ export interface Env {
   EMAIL_FROM?: string;
   EMAIL_FROM_NAME?: string;
   EMAIL_REPLY_TO?: string;
+  /** Cloudflare Email Sending binding ([[send_email]] in wrangler.toml). */
+  SEND_EMAIL?: SendEmailBinding;
   /** Hard cap on outreach emails per day across manual + automatic paths. */
   OUTREACH_DAILY_CAP?: string;
   AI_DAILY_BUDGET?: string;
