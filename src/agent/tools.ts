@@ -33,6 +33,9 @@ import {
   recommendAssignment,
 } from "../core/productivity/manager";
 import { newId, nowIso } from "../ids";
+import { outreachDailyCap, sendOutreachNow } from "../core/outreach";
+import { emailConfigured, type EmailEnv } from "../integrations/email";
+import type { Prospect } from "../types-outreach";
 import type { Decision, ProductValidation } from "../types";
 import {
   aggregateTestResults,
@@ -2031,6 +2034,113 @@ function perceptualTools(): Tool[] {
   ];
 }
 
+/** Growth/outreach tools (Phase 1): the marketing team's hands. */
+function outreachTools(env: EmailEnv & { OUTREACH_DAILY_CAP?: string }): Tool[] {
+  const addSchema = z.object({
+    name: z.string().min(1).max(120),
+    email: z.string().min(3).max(200),
+    platform: z.string().max(40).optional(),
+    handle: z.string().max(120).optional(),
+    url: z.string().max(300).optional(),
+    notes: z.string().max(2000).optional(),
+  });
+  const listSchema = z.object({
+    status: z.string().max(20).optional(),
+    limit: z.number().int().min(1).max(500).optional(),
+  });
+  const sendSchema = z.object({
+    prospectId: z.string().min(1),
+    template: z.string().max(60).optional(),
+  });
+  return [
+    {
+      name: "outreach.list_prospects",
+      description: "List outreach prospects (affiliate pipeline) with funnel counts",
+      inputSchema: listSchema,
+      requiredPermission: "read",
+      riskLevel: "LOW",
+      reversible: true,
+      auditRequired: false,
+      run: async (ctx: ToolContext, input: z.infer<typeof listSchema>) => {
+        const store = ctx.store;
+        if (!store) throw new Error("store unavailable");
+        return {
+          prospects: store.listProspects({ status: input.status, limit: input.limit }),
+          counts: store.countProspectsByStatus(),
+        };
+      },
+    },
+    {
+      name: "outreach.add_prospect",
+      description: "Add a prospect (producer/creator) to the affiliate outreach pipeline",
+      inputSchema: addSchema,
+      requiredPermission: "modify",
+      riskLevel: "LOW",
+      reversible: true,
+      auditRequired: true,
+      run: async (ctx: ToolContext, input: z.infer<typeof addSchema>) => {
+        const store = ctx.store;
+        if (!store) throw new Error("store unavailable");
+        const email = input.email.trim().toLowerCase();
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) throw new Error("invalid email");
+        if (store.findProspectByEmail(email)) throw new Error("prospect with this email already exists");
+        const at = nowIso();
+        const prospect: Prospect = {
+          id: newId("pr"),
+          name: input.name.trim(),
+          platform: (input.platform ?? "other").trim().toLowerCase() || "other",
+          handle: input.handle ? input.handle.trim() : null,
+          email,
+          url: input.url ? input.url.trim() : null,
+          status: "NEW",
+          notes: input.notes ?? null,
+          source: "agent",
+          last_touch_at: null,
+          created_at: at,
+          updated_at: at,
+        };
+        store.createProspect(prospect);
+        return { ok: true, prospect };
+      },
+    },
+    {
+      name: "outreach.send",
+      description: "Send the outreach email to one prospect via the configured provider (daily-capped, audited)",
+      inputSchema: sendSchema,
+      requiredPermission: "modify",
+      riskLevel: "MEDIUM",
+      reversible: false,
+      auditRequired: true,
+      run: async (ctx: ToolContext, input: z.infer<typeof sendSchema>) => {
+        const store = ctx.store;
+        if (!store) throw new Error("store unavailable");
+        return sendOutreachNow(store, env, input.prospectId, input.template);
+      },
+    },
+    {
+      name: "outreach.report",
+      description: "Outreach funnel report: counts by status, sends today, daily cap, provider state",
+      inputSchema: z.object({}),
+      requiredPermission: "read",
+      riskLevel: "LOW",
+      reversible: true,
+      auditRequired: false,
+      run: async (ctx: ToolContext) => {
+        const store = ctx.store;
+        if (!store) throw new Error("store unavailable");
+        const today = nowIso().slice(0, 10);
+        return {
+          enabled: store.getSetting("outreach_enabled") === "1",
+          providerConfigured: emailConfigured(env),
+          dailyCap: outreachDailyCap(env.OUTREACH_DAILY_CAP),
+          sentToday: store.outreachSentCount(today),
+          counts: store.countProspectsByStatus(),
+        };
+      },
+    },
+  ];
+}
+
 export function buildToolRegistry(deps: {
   env: Record<string, string | undefined>;
   sink: { recordExecution(record: unknown): void };
@@ -2049,6 +2159,7 @@ export function buildToolRegistry(deps: {
     ...doctorTools(),
     ...productivityTools(),
     ...perceptualTools(),
+    ...outreachTools(env),
     ...internalTools(),
   ]) {
     registry.register(tool);

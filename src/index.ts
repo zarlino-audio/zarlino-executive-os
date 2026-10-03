@@ -27,6 +27,8 @@ import { handleInboundWhatsApp, DIGEST_APPROVALS_SETTING } from "./core/org/foun
 import { composeFounderDigest, cooldown, markFounderMessageSent } from "./core/org/voice";
 import { artifactKey, normalizeArtifactPath, MAX_ARTIFACT_BYTES } from "./core/artifacts";
 import { escalateToFounder, sendWhatsApp } from "./integrations/whatsapp";
+import { OUTREACH_TEMPLATES, outreachDailyCap, runOutreachCycle, sendOutreachNow } from "./core/outreach";
+import { emailConfigured } from "./integrations/email";
 import { DEFAULT_EXEC_MODEL, executiveGenerate, neuronBudget, neuronsUsedToday } from "./integrations/workersai";
 import { handleMcpMessage, MCP_PROTOCOL_VERSION, type McpEnv } from "./mcp/server";
 import { createTask } from "./core/tasks/model";
@@ -82,6 +84,14 @@ export interface Env {
   ALERT_NTFY_URL?: string;
   /** USD threshold under which the OS alerts to top up DeepSeek (default $10). */
   AI_BALANCE_WARN_USD?: string;
+  /** Outbound email (growth outreach): provider + verified sender identity. */
+  EMAIL_PROVIDER?: string;
+  EMAIL_API_KEY?: string;
+  EMAIL_FROM?: string;
+  EMAIL_FROM_NAME?: string;
+  EMAIL_REPLY_TO?: string;
+  /** Hard cap on outreach emails per day across manual + automatic paths. */
+  OUTREACH_DAILY_CAP?: string;
   AI_DAILY_BUDGET?: string;
   AI_MONTHLY_BUDGET?: string;
   AI_PER_TASK_BUDGET?: string;
@@ -994,6 +1004,16 @@ export class ExecutiveAgent {
       await runCeoCycle(this.store, this.env, trigger);
     } catch {
       /* the CEO cycle must never break wake */
+    }
+    // Growth outreach cycle (Phase 1): runs only when the founder explicitly
+    // enabled it (settings.outreach_enabled) AND an email provider is wired;
+    // hard-capped per day; never blocks or breaks the sweep.
+    try {
+      if (this.store.getSetting("outreach_enabled") === "1") {
+        await runOutreachCycle(this.store, this.env, trigger);
+      }
+    } catch {
+      /* outreach must never break wake */
     }
     // Start + resume long-horizon runs (bounded, "automate fixing"). Runs are
     // executed on EVERY maintenance sweep — on wake via state.waitUntil (keeps
@@ -2993,6 +3013,75 @@ export class ExecutiveAgent {
 
     // Contacts
     if (path === "/api/contacts" && method === "GET") return json({ contacts: this.store.listContacts() });
+
+    // Outreach pipeline (growth — migration v35). Founder-authenticated API.
+    if (path === "/api/outreach/prospects" && method === "GET") {
+      const status = url.searchParams.get("status") ?? undefined;
+      return json({ prospects: this.store.listProspects({ status: status ?? undefined }), counts: this.store.countProspectsByStatus() });
+    }
+    if (path === "/api/outreach/prospects" && method === "POST") {
+      const body = (await readBody<{ name?: string; platform?: string; handle?: string; email?: string; url?: string; notes?: string; source?: string }>(request).catch(() => ({}))) as { name?: string; platform?: string; handle?: string; email?: string; url?: string; notes?: string; source?: string };
+      const name = String(body.name ?? "").trim().slice(0, 120);
+      const email = String(body.email ?? "").trim().toLowerCase().slice(0, 200);
+      if (!name || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) return json({ error: "name and a valid email are required" }, 400);
+      if (this.store.findProspectByEmail(email)) return json({ error: "prospect with this email already exists" }, 409);
+      const at = nowIso();
+      const prospect = {
+        id: newId("pr"),
+        name,
+        platform: (String(body.platform ?? "other").trim().toLowerCase() || "other").slice(0, 40),
+        handle: body.handle ? String(body.handle).trim().slice(0, 120) : null,
+        email,
+        url: body.url ? String(body.url).trim().slice(0, 300) : null,
+        status: "NEW",
+        notes: body.notes ? String(body.notes).slice(0, 2000) : null,
+        source: String(body.source ?? "api").slice(0, 40),
+        last_touch_at: null,
+        created_at: at,
+        updated_at: at,
+      };
+      this.store.createProspect(prospect);
+      this.store.insertAudit({ id: newId("aud"), actor: "founder", action: "outreach.prospect_added", entity_type: "prospects", entity_id: prospect.id, detail_json: JSON.stringify({ platform: prospect.platform, source: prospect.source }), source: "api", created_at: at, updated_at: at });
+      return json({ ok: true, prospect });
+    }
+    if (path.startsWith("/api/outreach/prospects/") && method === "PATCH") {
+      const id = path.split("/")[4] ?? "";
+      const body = (await readBody<{ status?: string; notes?: string }>(request).catch(() => ({}))) as { status?: string; notes?: string };
+      const updated = this.store.updateProspect(id, {
+        ...(body.status ? { status: String(body.status).toUpperCase().slice(0, 20) } : {}),
+        ...(body.notes !== undefined ? { notes: body.notes ? String(body.notes).slice(0, 2000) : null } : {}),
+      });
+      if (!updated) return json({ error: "Prospect not found" }, 404);
+      return json({ ok: true, prospect: updated });
+    }
+    if (path === "/api/outreach/send" && method === "POST") {
+      const body = (await readBody<{ prospectId?: string; template?: string }>(request).catch(() => ({}))) as { prospectId?: string; template?: string };
+      if (!body.prospectId) return json({ error: "prospectId required" }, 400);
+      const r = await sendOutreachNow(this.store, this.env, String(body.prospectId), body.template ? String(body.template) : undefined);
+      return json(r, r.ok ? 200 : 400);
+    }
+    if (path === "/api/outreach/cycle" && method === "POST") {
+      return json(await runOutreachCycle(this.store, this.env, "api"));
+    }
+    if (path === "/api/outreach/config" && method === "POST") {
+      const body = (await readBody<{ enabled?: boolean }>(request).catch(() => ({}))) as { enabled?: boolean };
+      this.store.setSetting("outreach_enabled", body.enabled ? "1" : "0");
+      const at = nowIso();
+      this.store.insertAudit({ id: newId("aud"), actor: "founder", action: "outreach.config", entity_type: "settings", entity_id: "outreach_enabled", detail_json: JSON.stringify({ enabled: Boolean(body.enabled) }), source: "api", created_at: at, updated_at: at });
+      return json({ ok: true, enabled: Boolean(body.enabled) });
+    }
+    if (path === "/api/outreach/report" && method === "GET") {
+      const today = nowIso().slice(0, 10);
+      return json({
+        enabled: this.store.getSetting("outreach_enabled") === "1",
+        providerConfigured: emailConfigured(this.env),
+        dailyCap: outreachDailyCap(this.env.OUTREACH_DAILY_CAP),
+        sentToday: this.store.outreachSentCount(today),
+        counts: this.store.countProspectsByStatus(),
+        recentTouches: this.store.listOutreachTouches(20),
+        templates: OUTREACH_TEMPLATES.map((t) => ({ id: t.id, subject: t.subject })),
+      });
+    }
     if (path === "/api/contacts" && method === "POST") {
       const body = (await readBody<{ name?: string; role?: string; company?: string; email?: string; phone?: string }>(request).catch(() => ({}))) as { name?: string; role?: string; company?: string; email?: string; phone?: string };
       if (!body.name) return json({ error: "name required" }, 400);

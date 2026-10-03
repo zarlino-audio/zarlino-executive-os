@@ -82,6 +82,14 @@ ALERT_NTFY_URL = "https://ntfy.sh/zarlino-alerts-h7k2mq4x"
 # DeepSeek has no auto-recharge API, so the sentinel + saved card is the
 # closest thing to "the OS manages its own top-ups".
 AI_BALANCE_WARN_USD = "10"
+# Outreach (Phase 1 growth): outbound email for the affiliate pipeline.
+# EMAIL_API_KEY is a SECRET (`wrangler secret put EMAIL_API_KEY`); the rest are
+# plain vars. Sends are hard-capped per day across manual + automatic paths.
+OUTREACH_DAILY_CAP = "20"
+EMAIL_PROVIDER = "brevo"
+EMAIL_FROM = "support@zarlinoaudio.com"
+EMAIL_FROM_NAME = "Zarlino Audio"
+EMAIL_REPLY_TO = "support@zarlinoaudio.com"
 # Executive tier (Workers AI): the HIGH tier model every executive agent uses
 # (CEO cycles, founder digests/replies) inside the 10k neurons/day budget.
 # Heavy workers stay on DeepSeek.

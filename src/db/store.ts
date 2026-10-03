@@ -11,6 +11,7 @@
  */
 
 import { migrate } from "./migrations";
+import type { Prospect, OutreachTouch } from "../types-outreach";
 import {
   assertCanTransitionTask,
   GovernanceError,
@@ -2073,6 +2074,59 @@ export class ExecutiveStore implements CostStorage {
     if (!existing) return false;
     this.sql.run("DELETE FROM contacts WHERE id = ?", id);
     return true;
+  }
+
+  // -- outreach pipeline (migration v35) ----------------------------------
+  listProspects(opts: { status?: string; limit?: number } = {}): Prospect[] {
+    const limit = Math.max(1, Math.min(opts.limit ?? 200, 500));
+    if (opts.status) {
+      return this.sql
+        .all<Row>("SELECT * FROM prospects WHERE status = ? ORDER BY updated_at DESC LIMIT ?", opts.status, limit)
+        .map((r) => rowTo<Prospect>(r));
+    }
+    return this.sql
+      .all<Row>("SELECT * FROM prospects ORDER BY updated_at DESC LIMIT ?", limit)
+      .map((r) => rowTo<Prospect>(r));
+  }
+  getProspect(id: string): Prospect | null {
+    const rows = this.sql.all<Row>("SELECT * FROM prospects WHERE id = ?", id);
+    return rows[0] ? rowTo<Prospect>(rows[0]) : null;
+  }
+  findProspectByEmail(email: string): Prospect | null {
+    const rows = this.sql.all<Row>("SELECT * FROM prospects WHERE lower(email) = lower(?) LIMIT 1", email);
+    return rows[0] ? rowTo<Prospect>(rows[0]) : null;
+  }
+  createProspect(p: Prospect): void {
+    this.insert("prospects", p);
+  }
+  updateProspect(id: string, patch: Partial<Prospect>): Prospect | null {
+    const existing = this.getProspect(id);
+    if (!existing) return null;
+    const next = { ...existing, ...patch, id, updated_at: new Date().toISOString() };
+    this.update("prospects", id, next);
+    return this.getProspect(id);
+  }
+  countProspectsByStatus(): Record<string, number> {
+    const rows = this.sql.all<{ status: string; c: number }>("SELECT status, COUNT(*) AS c FROM prospects GROUP BY status");
+    const out: Record<string, number> = {};
+    for (const r of rows) out[String(r.status)] = Number(r.c);
+    return out;
+  }
+  recordOutreachTouch(t: OutreachTouch): void {
+    this.insert("outreach_touches", t);
+  }
+  listOutreachTouches(limit = 100): OutreachTouch[] {
+    return this.sql
+      .all<Row>("SELECT * FROM outreach_touches ORDER BY sent_at DESC LIMIT ?", limit)
+      .map((r) => rowTo<OutreachTouch>(r));
+  }
+  /** Touches actually SENT on a given UTC date (YYYY-MM-DD) — the cap counter. */
+  outreachSentCount(datePrefix: string): number {
+    const rows = this.sql.all<{ c: number }>(
+      "SELECT COUNT(*) AS c FROM outreach_touches WHERE status = 'SENT' AND substr(sent_at, 1, 10) = ?",
+      datePrefix,
+    );
+    return Number(rows[0]?.c ?? 0);
   }
 
   // -- tool executions ----------------------------------------------------
