@@ -11,6 +11,7 @@ import { ToolRegistry } from "../core/tools/registry";
 import type { Tool, ToolContext } from "../core/tools/types";
 import { githubTools } from "../integrations/github";
 import { cloudflareTools } from "../integrations/cloudflare";
+import { youtubeTools } from "../integrations/youtube";
 import { websiteTools } from "../integrations/website";
 import { webTools } from "../integrations/web";
 import { visionTools } from "../integrations/vision";
@@ -2152,6 +2153,7 @@ export function buildToolRegistry(deps: {
   for (const tool of [
     ...githubTools(env),
     ...cloudflareTools(env),
+    ...youtubeTools(env),
     ...websiteTools(env),
     ...webTools(env),
     ...visionTools(env),

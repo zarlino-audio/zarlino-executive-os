@@ -75,6 +75,8 @@ export interface Env {
   INTERNAL_SECRET?: string;
   GITHUB_TOKEN?: string;
   CF_API_TOKEN?: string;
+  /** YouTube Data API v3 key for prospect sourcing (youtube.* tools). */
+  YOUTUBE_API_KEY?: string;
   PAYSTACK_SECRET_KEY?: string;
   PAYSTACK_PUBLIC_KEY?: string;
   PAYSTACK_CURRENCY?: string;
