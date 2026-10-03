@@ -53,6 +53,7 @@ import {
   scoreProduct,
 } from "./core/perceptual/manager";
 import { newId, nowIso } from "./ids";
+import { evaluateChecks, planBackupPrune, parseDeepSeekBalance, MONITOR_TARGETS, type CheckResult, type MonitorState } from "./core/monitor";
 import { isTerminalTaskStatus, GovernanceError } from "./core/tasks/evidence";
 import type { AgentRun, DoctorLog, Task } from "./types";
 import type { ModelCallRecord as _M } from "./core/model/types";
@@ -69,6 +70,7 @@ export interface Env {
   ASSETS?: Fetcher;
   DEEPSEEK_API_KEY?: string;
   FOUNDER_AUTH_TOKEN?: string;
+  INTERNAL_SECRET?: string;
   GITHUB_TOKEN?: string;
   CF_API_TOKEN?: string;
   PAYSTACK_SECRET_KEY?: string;
@@ -76,6 +78,10 @@ export interface Env {
   PAYSTACK_CURRENCY?: string;
   ZARLINO_LICENSE_PRIVATE_KEY?: string;
   WEBSITE_URL?: string;
+  /** Second alert channel (ntfy topic URL) for external uptime alerts. */
+  ALERT_NTFY_URL?: string;
+  /** USD threshold under which the OS alerts to top up DeepSeek (default $10). */
+  AI_BALANCE_WARN_USD?: string;
   AI_DAILY_BUDGET?: string;
   AI_MONTHLY_BUDGET?: string;
   AI_PER_TASK_BUDGET?: string;
@@ -101,7 +107,14 @@ export interface Env {
 }
 
 const INTERNAL_HEADER = "x-exec-internal";
+// Fallback only: production sets the INTERNAL_SECRET worker secret and both
+// the worker and the DO prefer it (keep in sync via internalSecret()).
 const INTERNAL_SECRET = "zarlino-internal-scheduled";
+
+function internalSecret(env?: Env): string {
+  const v = env?.INTERNAL_SECRET;
+  return v && String(v).trim() ? String(v).trim() : INTERNAL_SECRET;
+}
 const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
 
 // ---------------------------------------------------------------------------
@@ -165,8 +178,8 @@ function authorized(request: Request, env: Env, store: ExecutiveStore): boolean 
   return false;
 }
 
-function internal(request: Request): boolean {
-  return request.headers.get(INTERNAL_HEADER) === INTERNAL_SECRET;
+function internal(request: Request, secret: string): boolean {
+  return request.headers.get(INTERNAL_HEADER) === secret;
 }
 
 // ---------------------------------------------------------------------------
@@ -1193,9 +1206,21 @@ export class ExecutiveAgent {
     if (method === "OPTIONS") return json({ ok: true });
 
     // Internal scheduled kick (from the Worker scheduled handler).
-    if (internal(request) && path === "/api/_scheduled") {
+    if (internal(request, internalSecret(this.env)) && path === "/api/_scheduled") {
       await this.runWakeMaintenance("cron", { runAutoJobs: true });
       return json({ ok: true, trigger: "cron" });
+    }
+
+    // Continuity ops (internal only): full database snapshot export for the
+    // daily R2 backup, and targeted alert delivery via the founder channel.
+    if (internal(request, internalSecret(this.env)) && method === "POST" && path === "/api/_backup-export") {
+      return json({ ok: true, exportedAt: nowIso(), snapshot: this.store.exportSnapshot() });
+    }
+    if (internal(request, internalSecret(this.env)) && method === "POST" && path === "/api/_alert") {
+      const alertBody = (await readBody<{ subject?: string; body?: string; priority?: string }>(request).catch(() => ({}))) as { subject?: string; body?: string; priority?: string };
+      if (!alertBody.body || !String(alertBody.body).trim()) return json({ error: "body required" }, 400);
+      const r = await escalateToFounder(this.store, this.env, { subject: alertBody.subject ?? "External monitor alert", body: String(alertBody.body), source: "monitor", priority: alertBody.priority });
+      return json(r);
     }
 
     // Public health (no auth) — minimal info for uptime monitors.
@@ -1803,14 +1828,19 @@ export class ExecutiveAgent {
     if (path === "/api/whatsapp/bridge/heartbeat" && method === "POST") {
       const body = (await readBody<{ host?: string; linkedAs?: string }>(request).catch(() => ({}))) as { host?: string; linkedAs?: string };
       const at = nowIso();
-      this.store.setSetting(
-        "whatsapp_bridge_last_seen",
-        JSON.stringify({
-          at,
-          host: body.host ? String(body.host).slice(0, 80) : null,
-          linkedAs: body.linkedAs ? String(body.linkedAs).slice(0, 80) : null,
-        }),
-      );
+      const seenPayload = JSON.stringify({
+        at,
+        host: body.host ? String(body.host).slice(0, 80) : null,
+        linkedAs: body.linkedAs ? String(body.linkedAs).slice(0, 80) : null,
+      });
+      this.store.setSetting("whatsapp_bridge_last_seen", seenPayload);
+      // KV mirror so the worker-side monitor can read bridge liveness WITHOUT
+      // waking the DO every 15 minutes (best-effort; the setting stays canonical).
+      try {
+        await this.env.ZARLINO_KV?.put("bridge:last_seen", seenPayload);
+      } catch {
+        /* mirror is best-effort */
+      }
       return json({ ok: true, at });
     }
     if (path === "/api/whatsapp/bridge" && method === "GET") {
@@ -3486,6 +3516,198 @@ function numOrUndef(v: unknown): number | undefined {
 }
 
 // ---------------------------------------------------------------------------
+// Continuity ops (Phase 0, 2026-10-02): cloud backup + external monitoring
+// ---------------------------------------------------------------------------
+
+/** Founder-token gate for the on-demand ops routes (worker-side). */
+function opsAuthorized(request: Request, env: Env): boolean {
+  const expected = env.FOUNDER_AUTH_TOKEN;
+  if (!expected) return false;
+  return request.headers.get("Authorization") === `Bearer ${expected}`;
+}
+
+interface BackupResult {
+  ok: boolean;
+  key?: string;
+  bytes?: number;
+  pruned?: number;
+  error?: string;
+}
+
+/** Export the full OS snapshot from the DO and land it in R2 (kept 30 deep). */
+async function runDailyBackup(env: Env, stub: DurableObjectStub): Promise<BackupResult> {
+  if (!env.ARTIFACTS) return { ok: false, error: "R2 binding ARTIFACTS is not configured" };
+  const res = await stub.fetch(
+    new Request("https://executive.internal/api/_backup-export", {
+      method: "POST",
+      headers: { [INTERNAL_HEADER]: internalSecret(env) },
+    }),
+  );
+  if (!res.ok) return { ok: false, error: `snapshot export failed (HTTP ${res.status})` };
+  const body = await res.text();
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const key = `backups/db/${stamp}.json`;
+  await env.ARTIFACTS.put(key, body, { httpMetadata: { contentType: "application/json" } });
+  const listed = await env.ARTIFACTS.list({ prefix: "backups/db/" });
+  const prune = planBackupPrune(listed.objects.map((o) => o.key), 30);
+  for (const k of prune) await env.ARTIFACTS.delete(k);
+  if (env.ZARLINO_KV) {
+    await env.ZARLINO_KV.put(
+      "backup:last",
+      JSON.stringify({ at: stamp, key, bytes: body.length, pruned: prune.length }),
+    );
+  }
+  return { ok: true, key, bytes: body.length, pruned: prune.length };
+}
+
+/** Check the external surfaces + bridge liveness; alert on transitions only. */
+async function runExternalChecks(
+  env: Env,
+  stub: DurableObjectStub,
+): Promise<{ checks: CheckResult[]; transitions: Array<{ id: string; to: string }>; balance?: number | null }> {
+  const checks: CheckResult[] = [];
+  for (const t of MONITOR_TARGETS) {
+    try {
+      const r = await fetch(t.url, {
+        method: t.method,
+        redirect: "follow",
+        headers: { "user-agent": "ZarlinoOS-Monitor/1.0" },
+      });
+      checks.push({ id: t.id, ok: r.status === t.expect, status: r.status });
+    } catch (e) {
+      checks.push({ id: t.id, ok: false, status: 0, error: String(e) });
+    }
+  }
+  // Founder-channel (WhatsApp bridge) liveness from the KV heartbeat mirror.
+  // Never-seen counts as OK (no false alarm right after a deploy); stale beyond
+  // 20 minutes fails, so two consecutive 15-min checks (~30 min of silence)
+  // raise the alert.
+  const kv = env.ZARLINO_KV;
+  let bridgeOk = true;
+  if (kv) {
+    const raw = await kv.get("bridge:last_seen");
+    if (raw) {
+      const seen = safeJson(raw, null) as { at?: string } | null;
+      const age = seen?.at ? Date.now() - Date.parse(seen.at) : Infinity;
+      bridgeOk = age <= 20 * 60 * 1000;
+    }
+  }
+  checks.push({ id: "whatsapp-bridge", ok: bridgeOk, status: bridgeOk ? 200 : 0 });
+
+  // DeepSeek balance sentinel (the "top up without me" piece): reads the live
+  // balance, keeps it in KV for /api/ops/monitor, and alerts through BOTH
+  // channels when it falls below AI_BALANCE_WARN_USD — at most once per 24h.
+  let deepseekBalance: number | null = null;
+  if (env.DEEPSEEK_API_KEY) {
+    try {
+      const r = await fetch("https://api.deepseek.com/user/balance", {
+        headers: { Authorization: `Bearer ${env.DEEPSEEK_API_KEY}` },
+      });
+      if (r.ok) deepseekBalance = parseDeepSeekBalance(await r.json());
+    } catch {
+      /* balance check is best-effort */
+    }
+  }
+  if (kv && deepseekBalance !== null) {
+    const warnAt = Number(env.AI_BALANCE_WARN_USD) > 0 ? Number(env.AI_BALANCE_WARN_USD) : 10;
+    await kv.put("balance:deepseek", JSON.stringify({ at: new Date().toISOString(), usd: deepseekBalance, warnAt }));
+    if (deepseekBalance < warnAt) {
+      const last = await kv.get("balance:deepseek:notified");
+      const age = last ? Date.now() - Date.parse(last) : Infinity;
+      if (age > 24 * 3600 * 1000) {
+        await notifyBoth(
+          env,
+          stub,
+          `\u26A0\uFE0F DeepSeek balance low ($${deepseekBalance.toFixed(2)})`,
+          `Below the $${warnAt} warning line. Top up at https://platform.deepseek.com/top_up (card form, ~2 minutes). Heavy agent work pauses automatically at $0.`,
+          "NORMAL",
+        );
+        await kv.put("balance:deepseek:notified", new Date().toISOString());
+      }
+    }
+  }
+
+  const prev: Record<string, MonitorState | undefined> = {};
+  if (kv) {
+    for (const t of [...MONITOR_TARGETS.map((m) => m.id), "whatsapp-bridge"]) {
+      const raw = await kv.get(`monitor:${t}`);
+      if (raw) prev[t] = safeJson(raw, undefined) as MonitorState | undefined;
+    }
+  }
+  const now = new Date().toISOString();
+  const { next, transitions } = evaluateChecks(prev, checks, now);
+  if (kv) for (const s of next) await kv.put(`monitor:${s.id}`, JSON.stringify(s));
+
+  const out: Array<{ id: string; to: string }> = [];
+  for (const tr of transitions) {
+    const state = next.find((s) => s.id === tr.id);
+    const target = MONITOR_TARGETS.find((t) => t.id === tr.id);
+    const subject = tr.to === "DOWN" ? `\uD83D\uDD34 ${tr.id} is DOWN` : `\u2705 ${tr.id} recovered`;
+    const body =
+      tr.to === "DOWN"
+        ? `External check failed twice in a row (last HTTP ${state?.lastStatus ?? 0}).${target ? ` URL: ${target.url}.` : ""} The OS keeps running; this is an availability alert.`
+        : `${tr.id} is responding again (HTTP ${state?.lastStatus ?? 0}).`;
+    await notifyBoth(env, stub, subject, body, tr.to === "DOWN" ? "HIGH" : "NORMAL");
+    if (kv) await kv.put(`monitor:notified:${tr.id}`, now);
+    out.push({ id: tr.id, to: tr.to });
+  }
+  // Sustained-DOWN reminder: at most one every 6h per target.
+  if (kv) {
+    for (const s of next) {
+      if (s.state !== "DOWN") continue;
+      const last = await kv.get(`monitor:notified:${s.id}`);
+      const age = last ? Date.now() - Date.parse(last) : Infinity;
+      if (age > 6 * 3600 * 1000) {
+        await notifyBoth(
+          env,
+          stub,
+          `\u26A0\uFE0F still DOWN: ${s.id}`,
+          `Still failing after repeated checks (last HTTP ${s.lastStatus}).`,
+          "NORMAL",
+        );
+        await kv.put(`monitor:notified:${s.id}`, new Date().toISOString());
+        out.push({ id: s.id, to: "DOWN_REMINDER" });
+      }
+    }
+  }
+  return { checks, transitions: out, balance: deepseekBalance };
+}
+
+/**
+ * Alert through BOTH channels: the founder queue (WhatsApp bridge) and the
+ * second, independent channel (ntfy) when ALERT_NTFY_URL is configured.
+ */
+async function notifyBoth(env: Env, stub: DurableObjectStub, subject: string, body: string, priority: string): Promise<void> {
+  try {
+    await stub.fetch(
+      new Request("https://executive.internal/api/_alert", {
+        method: "POST",
+        headers: { [INTERNAL_HEADER]: internalSecret(env), "content-type": "application/json" },
+        body: JSON.stringify({ subject, body, priority }),
+      }),
+    );
+  } catch {
+    /* founder channel is best-effort; ntfy still fires */
+  }
+  const ntfy = env.ALERT_NTFY_URL;
+  if (ntfy) {
+    try {
+      await fetch(ntfy, {
+        method: "POST",
+        headers: {
+          Title: subject,
+          Priority: priority === "HIGH" ? "urgent" : "default",
+          Tags: priority === "HIGH" ? "rotating_light" : "white_check_mark",
+        },
+        body,
+      });
+    } catch {
+      /* second channel is best-effort */
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Worker entry
 // ---------------------------------------------------------------------------
 
@@ -3493,6 +3715,29 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
+    // Continuity ops (founder-token authenticated): run/observe the cloud
+    // backup and the external uptime monitor on demand. Worker-side (R2 + KV)
+    // so the Durable Object is never woken just to answer monitoring.
+    if (path === "/api/ops/backup" || path === "/api/ops/monitor") {
+      if (!opsAuthorized(request, env)) return json({ error: "Unauthorized" }, 401);
+      const opsId = env.EXECUTIVE_AGENT.idFromName("zarlino");
+      const opsStub = env.EXECUTIVE_AGENT.get(opsId);
+      if (path === "/api/ops/backup" && request.method === "POST") return json(await runDailyBackup(env, opsStub));
+      if (path === "/api/ops/monitor" && request.method === "POST") return json(await runExternalChecks(env, opsStub));
+      if (path === "/api/ops/monitor" && request.method === "GET") {
+        const states: unknown[] = [];
+        if (env.ZARLINO_KV) {
+          for (const t of MONITOR_TARGETS) {
+            const raw = await env.ZARLINO_KV.get(`monitor:${t.id}`);
+            states.push(raw ? safeJson(raw, { id: t.id, state: "UNKNOWN" }) : { id: t.id, state: "UNKNOWN" });
+          }
+        }
+        const last = env.ZARLINO_KV ? await env.ZARLINO_KV.get("backup:last") : null;
+        const bal = env.ZARLINO_KV ? await env.ZARLINO_KV.get("balance:deepseek") : null;
+        return json({ states, backup: last ? safeJson(last, null) : null, balance: bal ? safeJson(bal, null) : null });
+      }
+      return json({ error: "Method not allowed" }, 405);
+    }
     // NOTE: /mcp must stay in this forward condition — the read-only MCP
     // plane lives on the DO, and dropping it 404s the whole plane (regression
     // guard in test/mcp.test.ts asserts this line).
@@ -3516,11 +3761,33 @@ export default {
   async scheduled(controller: ScheduledController, env: Env): Promise<void> {
     const id = env.EXECUTIVE_AGENT.idFromName("zarlino");
     const stub = env.EXECUTIVE_AGENT.get(id);
-    // Internal, auth-free kick that runs doctor + auto-run + reschedules.
+    // Every 15 min: external uptime checks (website, OS API, downloads, bridge
+    // liveness). Reads KV only; the DO is woken solely on transitions/reminders.
+    if (controller.cron === "*/15 * * * *") {
+      try {
+        await runExternalChecks(env, stub);
+      } catch {
+        /* the monitor must never throw */
+      }
+      controller.noRetry();
+      return;
+    }
+    // Daily: export the whole OS database to R2 (kept 30 deep) — scheduled,
+    // offsite, and independent of any local machine.
+    if (controller.cron === "15 3 * * *") {
+      try {
+        await runDailyBackup(env, stub);
+      } catch {
+        /* retried on the next daily run */
+      }
+      controller.noRetry();
+      return;
+    }
+    // Internal kick that runs doctor + auto-run + reschedules.
     await stub.fetch(
       new Request("https://executive.internal/api/_scheduled", {
         method: "POST",
-        headers: { [INTERNAL_HEADER]: INTERNAL_SECRET },
+        headers: { [INTERNAL_HEADER]: internalSecret(env) },
       }),
     );
     controller.noRetry();

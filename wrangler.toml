@@ -73,6 +73,15 @@ run_worker_first = true
 # ---------------------------------------------------------------------------
 [vars]
 WEBSITE_URL = "https://zarlinoaudio.com"
+# Second alert channel (Phase 0, 2026-10-02): ntfy.sh topic that receives
+# external uptime alerts (website / OS API / downloads / WhatsApp bridge).
+# Treat the topic like a shared secret — anyone who knows it can read or post.
+# Swap for a private ntfy server (or an email provider) in a later phase.
+ALERT_NTFY_URL = "https://ntfy.sh/zarlino-alerts-h7k2mq4x"
+# USD line under which the OS alerts (both channels, 24h throttle) to top up:
+# DeepSeek has no auto-recharge API, so the sentinel + saved card is the
+# closest thing to "the OS manages its own top-ups".
+AI_BALANCE_WARN_USD = "10"
 # Executive tier (Workers AI): the HIGH tier model every executive agent uses
 # (CEO cycles, founder digests/replies) inside the 10k neurons/day budget.
 # Heavy workers stay on DeepSeek.
@@ -93,7 +102,9 @@ WHATSAPP_FOUNDER_LIDS = "23790595616867"
 # leases, clears expired sessions, verifies migrations, and logs every run.
 # ---------------------------------------------------------------------------
 [triggers]
-crons = ["0 */6 * * *"]
+# 0 */6 = OS maintenance sweep; */15 = external uptime monitor (worker-side);
+# 15 3    = daily OS-database backup to R2 (kept 30 deep).
+crons = ["0 */6 * * *", "*/15 * * * *", "15 3 * * *"]
 
 [observability]
 enabled = true
