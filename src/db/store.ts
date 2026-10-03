@@ -2128,6 +2128,24 @@ export class ExecutiveStore implements CostStorage {
     );
     return Number(rows[0]?.c ?? 0);
   }
+  /** How many touches used a given template for one prospect (follow-up/reply detection). */
+  countTouchesByTemplate(prospectId: string, template: string): number {
+    const rows = this.sql.all<{ c: number }>(
+      "SELECT COUNT(*) AS c FROM outreach_touches WHERE prospect_id = ? AND template = ?",
+      prospectId,
+      template,
+    );
+    return Number(rows[0]?.c ?? 0);
+  }
+  /** SENT touches with a given template on one UTC date — the auto-reply cap counter. */
+  countTouchesByTemplateToday(template: string, datePrefix: string): number {
+    const rows = this.sql.all<{ c: number }>(
+      "SELECT COUNT(*) AS c FROM outreach_touches WHERE template = ? AND status = 'SENT' AND substr(sent_at, 1, 10) = ?",
+      template,
+      datePrefix,
+    );
+    return Number(rows[0]?.c ?? 0);
+  }
 
   // -- tool executions ----------------------------------------------------
   /**

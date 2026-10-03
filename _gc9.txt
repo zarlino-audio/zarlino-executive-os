@@ -1,0 +1,2 @@
+[main 46b8a3f] feat(whatsapp): register the founder LID - his account addresses the business line by linked-ID (phone hidden), so without this every founder message classified as stranger
+ 1 file changed, 5 insertions(+)

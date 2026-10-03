@@ -27,7 +27,7 @@ import { handleInboundWhatsApp, DIGEST_APPROVALS_SETTING } from "./core/org/foun
 import { composeFounderDigest, cooldown, markFounderMessageSent } from "./core/org/voice";
 import { artifactKey, normalizeArtifactPath, MAX_ARTIFACT_BYTES } from "./core/artifacts";
 import { escalateToFounder, sendWhatsApp } from "./integrations/whatsapp";
-import { OUTREACH_TEMPLATES, outreachDailyCap, recordProspectReply, runOutreachCycle, sendOutreachNow } from "./core/outreach";
+import { OUTREACH_TEMPLATES, outreachDailyCap, maybeAutoReply, recordProspectReply, runFollowUps, runOutreachCycle, sendOutreachNow } from "./core/outreach";
 import { emailConfigured, type SendEmailBinding } from "./integrations/email";
 import { DEFAULT_EXEC_MODEL, executiveGenerate, neuronBudget, neuronsUsedToday } from "./integrations/workersai";
 import { handleMcpMessage, MCP_PROTOCOL_VERSION, type McpEnv } from "./mcp/server";
@@ -96,6 +96,9 @@ export interface Env {
   SEND_EMAIL?: SendEmailBinding;
   /** Hard cap on outreach emails per day across manual + automatic paths. */
   OUTREACH_DAILY_CAP?: string;
+  /** Growth agent: LLM auto-reply cap per day + follow-up delay in days. */
+  GROWTH_REPLY_DAILY_CAP?: string;
+  FOLLOWUP_AFTER_DAYS?: string;
   AI_DAILY_BUDGET?: string;
   AI_MONTHLY_BUDGET?: string;
   AI_PER_TASK_BUDGET?: string;
@@ -1019,6 +1022,15 @@ export class ExecutiveAgent {
     } catch {
       /* outreach must never break wake */
     }
+    // Growth follow-ups (bounded, silent-if-not-due): one polite nudge for
+    // prospects who never replied; never touches REPLIED/UNSUBSCRIBED rows.
+    try {
+      if (this.store.getSetting("outreach_enabled") === "1") {
+        await runFollowUps(this.store, this.env);
+      }
+    } catch {
+      /* follow-ups must never break wake */
+    }
     // Start + resume long-horizon runs (bounded, "automate fixing"). Runs are
     // executed on EVERY maintenance sweep — on wake via state.waitUntil (keeps
     // the DO alive without blocking the request) so a run can never sit as a
@@ -1257,7 +1269,16 @@ export class ExecutiveAgent {
         body: reply.body ? String(reply.body) : undefined,
         messageId: reply.messageId ? String(reply.messageId) : undefined,
       });
-      return json(r);
+      // Autonomous nurturing: the growth agent drafts + sends the answer when
+      // it is safe to do so; otherwise recordProspectReply already notified.
+      const autoReply = await maybeAutoReply(this.store, this.env, {
+        from: String(reply.from),
+        subject: reply.subject ? String(reply.subject) : undefined,
+        body: reply.body ? String(reply.body) : undefined,
+        intent: r.intent,
+        prospectId: r.prospectId,
+      }).catch(() => ({ sent: false, reason: "auto-reply error" }));
+      return json({ ...r, autoReply });
     }
 
     // Public health (no auth) — minimal info for uptime monitors.
@@ -3100,6 +3121,7 @@ export class ExecutiveAgent {
         counts: this.store.countProspectsByStatus(),
         recentTouches: this.store.listOutreachTouches(20),
         recentReplies: this.store.listProspectReplies(10),
+        autoRepliesToday: this.store.countTouchesByTemplateToday("auto_reply", today),
         templates: OUTREACH_TEMPLATES.map((t) => ({ id: t.id, subject: t.subject })),
       });
     }

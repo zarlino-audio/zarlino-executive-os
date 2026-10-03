@@ -17,8 +17,17 @@ import { newId, nowIso } from "../ids";
 import type { ExecutiveStore } from "../db/store";
 import { sendEmail, emailConfigured, type EmailEnv } from "../integrations/email";
 import { escalateToFounder, type NotifyEnv } from "../integrations/whatsapp";
+import { checkReplyPolicy, generateProspectReply } from "../integrations/growth-ai";
 
-export type OutreachEnv = EmailEnv & { OUTREACH_DAILY_CAP?: string };
+export type OutreachEnv = EmailEnv & {
+  OUTREACH_DAILY_CAP?: string;
+  /** Cap on LLM auto-replies per day (growth agent), separate from OUTREACH_DAILY_CAP. */
+  GROWTH_REPLY_DAILY_CAP?: string;
+  /** Days a contacted prospect may stay silent before ONE polite follow-up. */
+  FOLLOWUP_AFTER_DAYS?: string;
+  /** DeepSeek key used by the growth agent to draft replies. */
+  DEEPSEEK_API_KEY?: string;
+};
 
 export const OUTREACH_STATUSES = [
   "NEW",
@@ -317,4 +326,163 @@ export async function recordProspectReply(
   }
 
   return { matched: Boolean(p), intent, prospectId: p ? p.id : undefined, status, notified };
+}
+
+// ---------------------------------------------------------------------------
+// Autonomous nurturing: LLM-drafted replies + scheduled follow-ups.
+// The founder reads what matters; the agent handles the rest.
+// ---------------------------------------------------------------------------
+
+/** Cap for auto-replies per day (default 10); separate from the outreach cap. */
+export function growthReplyCap(envVal: string | undefined): number {
+  const n = Number(envVal);
+  return Number.isFinite(n) && n > 0 ? Math.min(n, 50) : 10;
+}
+
+/** Days before a silent contacted prospect gets one follow-up (default 5, max 30). */
+export function followUpAfterDays(envVal: string | undefined): number {
+  const n = Number(envVal);
+  return Number.isFinite(n) && n >= 1 ? Math.min(n, 30) : 5;
+}
+
+export interface AutoReplyResult {
+  sent: boolean;
+  reason?: string;
+}
+
+export interface AutoReplyDeps {
+  generate?: (
+    env: OutreachEnv,
+    input: { name?: string; subject?: string; replyText: string; intent: string },
+  ) => Promise<string>;
+  send?: typeof sendEmail;
+}
+
+const AUTO_RESPONDER = /out of office|automatic reply|auto-?reply|abwesenheit|vacation responder/i;
+
+/**
+ * Draft + send an autonomous reply to a prospect who wrote back.
+ * Skips opt-outs, self mail, auto-responders, capped days and already-replied
+ * threads; on generation failure or policy violation it ESCALATES instead.
+ */
+export async function maybeAutoReply(
+  store: ExecutiveStore,
+  env: OutreachEnv,
+  input: { from: string; subject?: string; body?: string; intent: ReplyIntent; prospectId?: string },
+  deps: AutoReplyDeps = {},
+): Promise<AutoReplyResult> {
+  if (store.getSetting("growth_auto_reply_enabled") === "0") return { sent: false, reason: "auto-reply disabled" };
+  if (input.intent === "OPT_OUT") return { sent: false, reason: "opt-out: no reply" };
+  if (!input.prospectId) return { sent: false, reason: "unknown sender" };
+  const p = store.getProspect(input.prospectId);
+  if (!p || !p.email) return { sent: false, reason: "prospect missing email" };
+  if (p.email.toLowerCase() === String(env.EMAIL_FROM ?? "").toLowerCase()) return { sent: false, reason: "self" };
+  if (AUTO_RESPONDER.test(String(input.subject ?? ""))) return { sent: false, reason: "auto-responder" };
+  if (store.countTouchesByTemplate(p.id, "auto_reply") > 0) return { sent: false, reason: "already replied" };
+  const cap = growthReplyCap(env.GROWTH_REPLY_DAILY_CAP);
+  if (store.countTouchesByTemplateToday("auto_reply", nowIso().slice(0, 10)) >= cap) {
+    return { sent: false, reason: `daily reply cap (${cap})` };
+  }
+
+  const generate = deps.generate ?? generateProspectReply;
+  let draft = "";
+  try {
+    draft = await generate(env, {
+      name: p.name,
+      subject: input.subject,
+      replyText: String(input.body ?? ""),
+      intent: input.intent,
+    });
+  } catch (e) {
+    await escalateToFounder(store, env as unknown as NotifyEnv, {
+      subject: `Reply needs you (draft failed): ${p.name}`,
+      body: `${input.from}: ${input.body ?? ""}`,
+      source: "outreach",
+    });
+    return { sent: false, reason: `generation failed: ${String(e).slice(0, 120)}` };
+  }
+
+  const policy = checkReplyPolicy(draft);
+  if (!policy.ok) {
+    await escalateToFounder(store, env as unknown as NotifyEnv, {
+      subject: `Reply needs you (policy: ${policy.reason}): ${p.name}`,
+      body: `${input.from}: ${input.body ?? ""}`,
+      source: "outreach",
+    });
+    return { sent: false, reason: `policy: ${policy.reason}` };
+  }
+
+  const rawSubject = String(input.subject ?? "your message");
+  const subject = (/^re:/i.test(rawSubject) ? rawSubject : `Re: ${rawSubject}`).slice(0, 180);
+  const send = deps.send ?? sendEmail;
+  const res = await send(env, { to: p.email, subject, text: draft });
+  const at = nowIso();
+  store.recordOutreachTouch({
+    id: newId("ot"),
+    prospect_id: p.id,
+    template: "auto_reply",
+    channel: "email",
+    status: res.ok ? "SENT" : "FAILED",
+    subject,
+    error: res.error ?? null,
+    sent_at: at,
+    created_at: at,
+  });
+  store.insertAudit({
+    id: newId("aud"),
+    actor: "growth-agent",
+    action: res.ok ? "outreach.auto_replied" : "outreach.auto_reply_failed",
+    entity_type: "prospects",
+    entity_id: p.id,
+    detail_json: JSON.stringify({ intent: input.intent, error: res.error ?? null }),
+    source: "outreach",
+    created_at: at,
+    updated_at: at,
+  });
+  if (res.ok) store.updateProspect(p.id, { last_touch_at: at });
+  return res.ok ? { sent: true } : { sent: false, reason: res.error ?? "send failed" };
+}
+
+export interface FollowUpResult {
+  sent: number;
+  failed: number;
+  skipped: number;
+}
+
+/**
+ * One polite follow-up for prospects who were contacted, never replied, and
+ * never got a follow-up — bounded by the shared daily cap.
+ */
+export async function runFollowUps(store: ExecutiveStore, env: OutreachEnv, now = nowIso()): Promise<FollowUpResult> {
+  const result: FollowUpResult = { sent: 0, failed: 0, skipped: 0 };
+  if (store.getSetting("outreach_enabled") !== "1") return result;
+  if (!emailConfigured(env)) return result;
+  const days = followUpAfterDays(env.FOLLOWUP_AFTER_DAYS);
+  const cutoffMs = Date.parse(now) - days * 24 * 60 * 60 * 1000;
+  let budget = Math.max(0, outreachDailyCap(env.OUTREACH_DAILY_CAP) - store.outreachSentCount(now.slice(0, 10)));
+  if (budget === 0) return result;
+  const candidates = store.listProspects({ status: "CONTACTED", limit: 500 });
+  for (const p of candidates) {
+    if (budget === 0) break;
+    if (!p.email || !p.last_touch_at) {
+      result.skipped++;
+      continue;
+    }
+    if (Date.parse(p.last_touch_at) > cutoffMs) {
+      result.skipped++;
+      continue;
+    }
+    if (store.countTouchesByTemplate(p.id, "follow_up") > 0) {
+      result.skipped++;
+      continue;
+    }
+    const r = await sendOutreachNow(store, env, p.id, "follow_up");
+    if (r.ok) {
+      result.sent++;
+      budget--;
+    } else {
+      result.failed++;
+    }
+  }
+  return result;
 }

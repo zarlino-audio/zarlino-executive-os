@@ -1,0 +1,2 @@
+93:-    if (path.startsWith("/api/") || path === "/mcp") {
+94:+    if (path.startsWith("/api/")) {

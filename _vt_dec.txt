@@ -1,0 +1,11 @@
+
+ RUN  v4.1.11 C:/Users/khrit/Desktop/zarlino-executive-os
+
+(node:7948) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+ Test Files  1 passed (1)
+      Tests  11 passed (11)
+   Start at  23:00:10
+   Duration  7.10s (transform 1.87s, setup 0ms, import 2.23s, tests 843ms, environment 1ms)
+
