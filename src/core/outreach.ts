@@ -84,8 +84,14 @@ export function renderTemplate(template: string, vars: OutreachVars): string {
 }
 
 export function firstNameOf(name: string): string {
-  const first = name.trim().split(/\s+/)[0] ?? "";
-  return first || "there";
+  const clean = name.trim();
+  const tokens = clean.split(/\s+/);
+  const first = (tokens[0] ?? "").toLowerCase();
+  // Organisation-style names read badly when truncated ("Hi The," / "Hi House,"):
+  // drop a leading "The", otherwise keep the org's full name for the greeting.
+  if (tokens.length > 1 && first === "the") return tokens.slice(1).join(" ");
+  if (tokens.length > 1 && first === "house") return clean;
+  return tokens[0] || "there";
 }
 
 export function prettyPlatform(platform: string): string {
