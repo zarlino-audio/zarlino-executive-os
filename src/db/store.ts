@@ -2731,6 +2731,40 @@ export class ExecutiveStore implements CostStorage {
     this.sql.run(`UPDATE whatsapp_messages SET ${sets.join(", ")} WHERE id = ?`, ...params);
   }
 
+  // -- prospect replies (migration v36) -------------------------------------
+  insertProspectReply(input: {
+    id: string; prospect_id: string | null; from_email: string; subject: string | null;
+    snippet: string | null; intent: string; message_id: string | null; created_at: string;
+  }): void {
+    this.insert("prospect_replies", {
+      id: input.id,
+      prospect_id: input.prospect_id,
+      from_email: input.from_email,
+      subject: input.subject,
+      snippet: input.snippet,
+      intent: input.intent,
+      message_id: input.message_id,
+      created_at: input.created_at,
+    });
+  }
+  listProspectReplies(limit = 50): Array<{
+    id: string; prospect_id?: string; from_email: string; subject?: string;
+    snippet?: string; intent: string; message_id?: string; created_at: string;
+  }> {
+    return this.sql
+      .all<Row>("SELECT * FROM prospect_replies ORDER BY created_at DESC LIMIT ?", limit)
+      .map((r) => ({
+        id: String(r.id),
+        prospect_id: r.prospect_id ? String(r.prospect_id) : undefined,
+        from_email: String(r.from_email),
+        subject: r.subject ? String(r.subject) : undefined,
+        snippet: r.snippet ? String(r.snippet) : undefined,
+        intent: String(r.intent),
+        message_id: r.message_id ? String(r.message_id) : undefined,
+        created_at: String(r.created_at),
+      }));
+  }
+
   /** Count PENDING local tasks older than the given age (ms). */
   countAgingPendingLocalTasks(olderThanMs: number): number {
     const cutoff = new Date(Date.now() - olderThanMs).toISOString();

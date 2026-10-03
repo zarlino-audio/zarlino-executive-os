@@ -36,3 +36,23 @@ CREATE TABLE IF NOT EXISTS outreach_touches (
 CREATE INDEX IF NOT EXISTS idx_touches_prospect ON outreach_touches(prospect_id);
 CREATE INDEX IF NOT EXISTS idx_touches_sent ON outreach_touches(sent_at);
 `;
+
+/**
+ * Prospect replies (migration v36). The inbound-mail email worker posts every
+ * reply here; the OS classifies the intent, enforces opt-outs immediately and
+ * notifies the founder — so reply routing is autonomous, not manual.
+ */
+export const PROSPECT_REPLIES_SQL = `
+CREATE TABLE IF NOT EXISTS prospect_replies (
+  id TEXT PRIMARY KEY,
+  prospect_id TEXT,
+  from_email TEXT NOT NULL,
+  subject TEXT,
+  snippet TEXT,
+  intent TEXT NOT NULL DEFAULT 'OTHER',
+  message_id TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_replies_prospect ON prospect_replies(prospect_id);
+CREATE INDEX IF NOT EXISTS idx_replies_created ON prospect_replies(created_at);
+`;

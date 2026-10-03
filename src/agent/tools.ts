@@ -2136,6 +2136,7 @@ function outreachTools(env: EmailEnv & { OUTREACH_DAILY_CAP?: string }): Tool[] 
           dailyCap: outreachDailyCap(env.OUTREACH_DAILY_CAP),
           sentToday: store.outreachSentCount(today),
           counts: store.countProspectsByStatus(),
+          recentReplies: store.listProspectReplies(10),
         };
       },
     },

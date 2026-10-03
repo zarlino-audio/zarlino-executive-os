@@ -1,0 +1,13 @@
+name = "zarlino-inbound-mail"
+main = "index.js"
+compatibility_date = "2025-03-04"
+
+# Routed from Cloudflare Email Routing: support@zarlinoaudio.com -> this worker
+# -> POST os /api/outreach/reply (classified + stored, opt-outs enforced)
+# -> forward to the founder's real inbox (never dropped).
+#
+# Required secret: EXEC_INTERNAL_SECRET (same value as exec-os INTERNAL_SECRET)
+
+[vars]
+OS_URL = "https://os.zarlinoaudio.com"
+FORWARD_TO = "zarlino001@gmail.com"

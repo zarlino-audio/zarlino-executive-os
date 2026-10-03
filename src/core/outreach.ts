@@ -16,6 +16,7 @@
 import { newId, nowIso } from "../ids";
 import type { ExecutiveStore } from "../db/store";
 import { sendEmail, emailConfigured, type EmailEnv } from "../integrations/email";
+import { escalateToFounder, type NotifyEnv } from "../integrations/whatsapp";
 
 export type OutreachEnv = EmailEnv & { OUTREACH_DAILY_CAP?: string };
 
@@ -132,6 +133,9 @@ export async function sendOutreachNow(
   const p = store.getProspect(prospectId);
   if (!p) return { ok: false, error: "prospect not found" };
   if (!p.email) return { ok: false, error: "prospect has no email" };
+  if (p.status === "UNSUBSCRIBED" || p.status === "REJECTED") {
+    return { ok: false, error: `prospect is ${p.status.toLowerCase()} — won't contact again` };
+  }
   if (!emailConfigured(env)) return { ok: false, error: "email provider not configured" };
   const tpl = OUTREACH_TEMPLATES.find((t) => t.id === templateId);
   if (!tpl) return { ok: false, error: `unknown template '${templateId}'` };
@@ -217,4 +221,100 @@ export async function runOutreachCycle(
     updated_at: at,
   });
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// Reply handling (autonomous): inbound replies arrive via the inbound-mail
+// worker -> /api/outreach/reply -> here. Opt-outs are enforced immediately;
+// the founder only reads what matters.
+// ---------------------------------------------------------------------------
+
+export type ReplyIntent = "OPT_OUT" | "INTERESTED" | "QUESTION" | "OTHER";
+
+/** Deterministic intent classifier (opt-out always wins). */
+export function classifyReply(text: string): ReplyIntent {
+  const t = String(text ?? "").toLowerCase().replace(/\s+/g, " ").trim();
+  if (!t) return "OTHER";
+  const optOut =
+    /\b(unsubscribe|opt[\s-]?out|remove me|stop (?:emailing|contacting|messaging)|don'?t (?:email|contact|message)|not interested|no thanks|no thank you|leave me alone)\b/.test(t) ||
+    /^no[.! ]*$/.test(t);
+  if (optOut) return "OPT_OUT";
+  const interested =
+    /\b(yes|sure|interested|sounds good|sign me up|send (?:it|me|the license|the key)|happy to|(?:i'?d|would) love|let'?s do it|count me in)\b/.test(t) ||
+    /\b(how (?:do|can|does)|tell me more|more info|what'?s the catch)\b/.test(t);
+  if (interested) return "INTERESTED";
+  if (t.includes("?")) return "QUESTION";
+  return "OTHER";
+}
+
+export interface ReplyRecordResult {
+  matched: boolean;
+  intent: ReplyIntent;
+  prospectId?: string;
+  status?: string;
+  notified: boolean;
+}
+
+/**
+ * Record an inbound reply. Classifies intent, enforces opt-outs immediately
+ * (status UNSUBSCRIBED — never contacted again), otherwise marks REPLIED, and
+ * notifies the founder through the existing channel.
+ */
+export async function recordProspectReply(
+  store: ExecutiveStore,
+  env: OutreachEnv,
+  input: { from: string; subject?: string; body?: string; messageId?: string },
+): Promise<ReplyRecordResult> {
+  const from = String(input.from ?? "").toLowerCase().trim();
+  const subject = input.subject ? String(input.subject).slice(0, 300) : null;
+  const bodyText = String(input.body ?? "");
+  const snippet = bodyText.replace(/\s+/g, " ").trim().slice(0, 500) || null;
+  const intent = classifyReply(`${subject ?? ""}\n${bodyText}`);
+  const at = nowIso();
+  const p = from ? store.findProspectByEmail(from) : null;
+
+  store.insertProspectReply({
+    id: newId("rply"),
+    prospect_id: p ? p.id : null,
+    from_email: from || "unknown",
+    subject,
+    snippet,
+    intent,
+    message_id: input.messageId ? String(input.messageId).slice(0, 300) : null,
+    created_at: at,
+  });
+
+  let status: string | undefined;
+  if (p) {
+    status = intent === "OPT_OUT" ? "UNSUBSCRIBED" : "REPLIED";
+    store.updateProspect(p.id, { status, last_touch_at: at });
+  }
+  store.insertAudit({
+    id: newId("aud"),
+    actor: "outreach",
+    action: "outreach.reply",
+    entity_type: "prospects",
+    entity_id: p ? p.id : from || "unknown",
+    detail_json: JSON.stringify({ intent, matched: Boolean(p), subject }),
+    source: "email",
+    created_at: at,
+    updated_at: at,
+  });
+
+  let notified = false;
+  try {
+    const who = p ? p.name : from || "unknown sender";
+    const headline =
+      intent === "OPT_OUT" ? `Opt-out: ${who}` : intent === "INTERESTED" ? `Interested: ${who}` : `Reply (${intent}): ${who}`;
+    await escalateToFounder(store, env as unknown as NotifyEnv, {
+      subject: headline,
+      body: `Reply from ${who} (${from}).\nIntent: ${intent}\nSubject: ${subject ?? "-"}\n\n${snippet ?? "(no text extracted)"}`,
+      source: "outreach",
+    });
+    notified = true;
+  } catch {
+    /* notification best-effort; the reply row is the durable record */
+  }
+
+  return { matched: Boolean(p), intent, prospectId: p ? p.id : undefined, status, notified };
 }

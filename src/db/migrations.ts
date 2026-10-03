@@ -48,6 +48,7 @@ import {
   CEO_WHATSAPP_SQL,
   WHATSAPP_BRIDGE_SQL,
   OUTREACH_SQL,
+  PROSPECT_REPLIES_SQL,
 } from "./schema";
 import type { Sql } from "./sql";
 
@@ -162,6 +163,7 @@ export const MIGRATIONS: Migration[] = [
   { version: 33, name: "ceo_whatsapp", sql: [CEO_WHATSAPP_SQL] },
   { version: 34, name: "whatsapp_bridge", sql: [WHATSAPP_BRIDGE_SQL] },
   { version: 35, name: "outreach", sql: [OUTREACH_SQL] },
+  { version: 36, name: "prospect_replies", sql: [PROSPECT_REPLIES_SQL] },
 
 ];
 

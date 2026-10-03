@@ -27,7 +27,7 @@ import { handleInboundWhatsApp, DIGEST_APPROVALS_SETTING } from "./core/org/foun
 import { composeFounderDigest, cooldown, markFounderMessageSent } from "./core/org/voice";
 import { artifactKey, normalizeArtifactPath, MAX_ARTIFACT_BYTES } from "./core/artifacts";
 import { escalateToFounder, sendWhatsApp } from "./integrations/whatsapp";
-import { OUTREACH_TEMPLATES, outreachDailyCap, runOutreachCycle, sendOutreachNow } from "./core/outreach";
+import { OUTREACH_TEMPLATES, outreachDailyCap, recordProspectReply, runOutreachCycle, sendOutreachNow } from "./core/outreach";
 import { emailConfigured, type SendEmailBinding } from "./integrations/email";
 import { DEFAULT_EXEC_MODEL, executiveGenerate, neuronBudget, neuronsUsedToday } from "./integrations/workersai";
 import { handleMcpMessage, MCP_PROTOCOL_VERSION, type McpEnv } from "./mcp/server";
@@ -1244,6 +1244,19 @@ export class ExecutiveAgent {
       const alertBody = (await readBody<{ subject?: string; body?: string; priority?: string }>(request).catch(() => ({}))) as { subject?: string; body?: string; priority?: string };
       if (!alertBody.body || !String(alertBody.body).trim()) return json({ error: "body required" }, 400);
       const r = await escalateToFounder(this.store, this.env, { subject: alertBody.subject ?? "External monitor alert", body: String(alertBody.body), source: "monitor", priority: alertBody.priority });
+      return json(r);
+    }
+    // Inbound growth replies (internal only): the inbound-mail email worker
+    // posts every support@ message here; the OS classifies + enforces opt-outs.
+    if (internal(request, internalSecret(this.env)) && method === "POST" && path === "/api/outreach/reply") {
+      const reply = (await readBody<{ from?: string; subject?: string; body?: string; messageId?: string }>(request).catch(() => ({}))) as { from?: string; subject?: string; body?: string; messageId?: string };
+      if (!reply.from || !String(reply.from).trim()) return json({ error: "from required" }, 400);
+      const r = await recordProspectReply(this.store, this.env, {
+        from: String(reply.from),
+        subject: reply.subject ? String(reply.subject) : undefined,
+        body: reply.body ? String(reply.body) : undefined,
+        messageId: reply.messageId ? String(reply.messageId) : undefined,
+      });
       return json(r);
     }
 
@@ -3067,6 +3080,9 @@ export class ExecutiveAgent {
     if (path === "/api/outreach/cycle" && method === "POST") {
       return json(await runOutreachCycle(this.store, this.env, "api"));
     }
+    if (path === "/api/outreach/replies" && method === "GET") {
+      return json({ replies: this.store.listProspectReplies(50) });
+    }
     if (path === "/api/outreach/config" && method === "POST") {
       const body = (await readBody<{ enabled?: boolean }>(request).catch(() => ({}))) as { enabled?: boolean };
       this.store.setSetting("outreach_enabled", body.enabled ? "1" : "0");
@@ -3083,6 +3099,7 @@ export class ExecutiveAgent {
         sentToday: this.store.outreachSentCount(today),
         counts: this.store.countProspectsByStatus(),
         recentTouches: this.store.listOutreachTouches(20),
+        recentReplies: this.store.listProspectReplies(10),
         templates: OUTREACH_TEMPLATES.map((t) => ({ id: t.id, subject: t.subject })),
       });
     }
