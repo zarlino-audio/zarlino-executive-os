@@ -1,16 +1,16 @@
 /**
- * The founder WhatsApp channel — inbound half of the linked-device bridge.
+ * The founder WhatsApp channel - inbound half of the linked-device bridge.
  *
  * One business number receives everything; the OS decides WHO is talking:
  *
  *   - The founder's own number (WHATSAPP_FOUNDER_NUMBER, default
- *     +233546778438) is the FOUNDER channel: replies are composed on the
- *     Workers AI executive tier with a compact state context (pending
- *     approvals, open tasks, last CEO report, doctor counts). Deterministic
- *     digest fallback when the tier is unavailable.
+ *     +233546778438) is the FOUNDER channel: instructions are turned into
+ *     assigned tasks by the CAO (see intake.ts), and everything else is
+ *     answered in the CAO voice on the strongest available model, with a
+ *     deterministic fallback when no model tier is reachable.
  *
  *   - EVERY other number is a STRANGER: they get a polite canned reply with
- *     no internal information whatsoever — never founder treatment, never
+ *     no internal information whatsoever - never founder treatment, never
  *     privileged status, never AI context about the business. Their message
  *     is logged for review.
  *
@@ -20,6 +20,7 @@
  */
 import type { ExecutiveStore } from "../../db/store";
 import { newId, nowIso } from "../../ids";
+import { intakeFounderDirective } from "./intake";
 import {
   naturalFounderReply,
   naturalReplyFallback,
@@ -222,10 +223,17 @@ export async function handleInboundWhatsApp(
     if (outcome.intent && outcome.labels.length) {
       reply = decisionConfirmation(outcome.intent, outcome.labels);
     } else {
-      try {
-        reply = await founderReply(store, env, text);
-      } catch {
-        reply = naturalReplyFallback(buildFounderContext(store));
+      // An instruction must land on the task board (with an owner), not just
+      // sit in the chat log. If intake does not claim the message, answer it.
+      const intake = await intakeFounderDirective(store, env, text, from).catch(() => null);
+      if (intake) {
+        reply = intake.reply;
+      } else {
+        try {
+          reply = await founderReply(store, env, text);
+        } catch {
+          reply = naturalReplyFallback(buildFounderContext(store));
+        }
       }
     }
   } else {
