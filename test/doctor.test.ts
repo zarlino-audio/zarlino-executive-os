@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import { createNodeSql } from "../src/db/sql";
 import { ExecutiveStore } from "../src/db/store";
+import { createTask } from "../src/core/tasks/model";
 import { runDoctor, DOCTOR_CHECKS, doctorTools } from "../src/core/doctor";
 
 describe("System Doctor", () => {
@@ -246,6 +247,41 @@ describe("System Doctor", () => {
     };
     return out.checks.find((c) => c.id === "features.agent_ready")!;
   };
+
+  it("warns on an AI budget override the deployed env knob never authorised", async () => {
+    const run = (autoFix: boolean) =>
+      runDoctor(
+        { store, env: { AI_DAILY_BUDGET: "5", AI_MONTHLY_BUDGET: "80" }, now: () => new Date().toISOString() },
+        { autoFix, trigger: "test" },
+      );
+    store.setSetting("ai_daily_budget", "100");
+    const warn = (await run(false)).checks.find((c) => c.id === "settings.budget_fundability")!;
+    expect(warn.status).toBe("WARN"); // $100/day override vs $5/day deploy = unfunded belief
+    expect(warn.detail).toContain("ai_daily_budget=$100");
+
+    const fixed = (await run(true)).checks.find((c) => c.id === "settings.budget_fundability")!;
+    expect(fixed.status).toBe("FAIL"); // autoFix clamped it — reported, not hidden
+    expect(store.getSetting("ai_daily_budget")).toBe("5");
+
+    const ok = (await run(false)).checks.find((c) => c.id === "settings.budget_fundability")!;
+    expect(ok.status).toBe("OK");
+  });
+
+  it("cancelled tasks no longer keep the task-contract register noisy", async () => {
+    const task = createTask({ title: "Stale blocked item already disposed of", priority: "P0", source: "test" });
+    task.status = "CANCELLED";
+    store.insertTask(task);
+    const report = await runDoctor(
+      { store, env: {}, now: () => new Date().toISOString() },
+      { autoFix: false, trigger: "test" },
+    );
+    const check = report.checks.find((c) => c.id === "org.task_contracts")!;
+    if (check.status !== "OK") {
+      // Other legacy BLOCKED tasks may exist in this database — the cancelled
+      // one must never be the reason.
+      expect(check.detail).not.toContain(task.id);
+    }
+  });
 
   it("system.doctor verifies real tool names when the caller passes a registry", async () => {
     // Regression: the tool path used to drop the registry, so the agent's own

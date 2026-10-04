@@ -75,6 +75,10 @@ const taskUpdateSchema = z.object({
   status: z.enum(["OPEN", "IN_PROGRESS", "BLOCKED", "DONE", "CANCELLED"]).optional(),
   priority: z.enum(["P0", "P1", "P2", "P3"]).optional(),
   dueDate: z.string().optional(),
+  // A deliberately parked task (e.g. waiting on a human decision) must be able
+  // to say so: auto_run=1 + BLOCKED is the "phantom autonomous work" pattern
+  // the productivity detector flags every cycle.
+  autoRun: z.boolean().optional(),
   // Closed-loop governance: the ONLY way to reach DONE/CANCELLED without
   // evidence. Requires a written reason (>= 10 chars), stored as the task's
   // close_reason so an override is visible, never disguised as verification.
@@ -266,6 +270,7 @@ function internalTools(): Tool[] {
         if (input.status && !isTerminalTaskStatus(input.status)) patch.status = input.status;
         if (input.priority) patch.priority = input.priority;
         if (input.dueDate) patch.due_date = input.dueDate;
+        if (typeof input.autoRun === "boolean") patch.auto_run = input.autoRun ? "1" : "0";
         store.updateTask(input.taskId, patch as never);
         const evidence = store.listTaskEvidence(input.taskId);
         return {
@@ -414,6 +419,43 @@ function internalTools(): Tool[] {
             spent: c.spent,
             objective: c.objective,
           })),
+        };
+      },
+    },
+    {
+      name: "marketing.waitlist_stats",
+      description:
+        "Count the website waitlist captured in KV (keys `waitlist:<topic>:<email>`) grouped by topic. Read-only: gives Marketing real list sizes so campaigns are planned on numbers, never on guesses.",
+      inputSchema: z.object({}),
+      requiredPermission: "read",
+      riskLevel: "LOW",
+      reversible: true,
+      auditRequired: false,
+      run: async (ctx: ToolContext) => {
+        const kv = (ctx.env as Record<string, unknown> | undefined)?.ZARLINO_KV as
+          | { list?: (opts: { prefix?: string; limit?: number; cursor?: string }) => Promise<{ keys: Array<{ name: string }>; list_complete?: boolean; cursor?: string }> }
+          | undefined;
+        if (!kv?.list) return { configured: false, note: "ZARLINO_KV is not bound in this context — waitlist data is unavailable here." };
+        const byTopic: Record<string, number> = {};
+        let cursor: string | undefined;
+        let total = 0;
+        let pages = 0;
+        do {
+          const page = await kv.list({ prefix: "waitlist:", limit: 1000, cursor });
+          for (const k of page.keys) {
+            const topic = String(k.name).split(":")[1] ?? "unknown";
+            byTopic[topic] = (byTopic[topic] ?? 0) + 1;
+            total++;
+          }
+          cursor = page.list_complete === false ? page.cursor : undefined;
+          pages++;
+        } while (cursor && pages < 20);
+        return {
+          configured: true,
+          total,
+          byTopic,
+          truncated: Boolean(cursor),
+          note: "These people asked to be emailed. Any send still requires recorded consent at capture time and an unsubscribe path — see the marketing-ops skill.",
         };
       },
     },
@@ -635,6 +677,33 @@ function internalTools(): Tool[] {
         });
         store.insertTask(task);
         return { id: task.id, title: task.title };
+      },
+    },
+    {
+      name: "executive.cancel_task",
+      description:
+        "Cancel an org task that is obsolete, superseded or no longer serves the business (marks it CANCELLED with an explicit reason and disarms auto-run so maintenance never resurrects it). Use it for stale blockers, never to hide unfinished work — attaching honest evidence is the way to close real work.",
+      inputSchema: z.object({
+        taskId: z.string().min(3).max(80),
+        reason: z.string().min(12).max(400),
+      }),
+      requiredPermission: "modify",
+      riskLevel: "LOW",
+      reversible: true,
+      auditRequired: true,
+      run: async (ctx: ToolContext, input: { taskId: string; reason: string }) => {
+        const store = ctx.store;
+        if (!store) throw new Error("store unavailable");
+        const task = store.getTask(input.taskId);
+        if (!task) throw new Error(`Task ${input.taskId} not found`);
+        if (task.status === "CANCELLED") return { ok: true, id: task.id, status: task.status, note: "Already cancelled." };
+        const cancelled = store.setTaskStatus(input.taskId, "CANCELLED", {
+          mode: "founder_override",
+          overrideReason: input.reason,
+        });
+        // Disarm auto-run: a cancelled task must never be claimable again.
+        store.updateTask(input.taskId, { auto_run: 0 });
+        return { ok: true, id: cancelled.id, title: cancelled.title, status: cancelled.status, reason: input.reason };
       },
     },
     {

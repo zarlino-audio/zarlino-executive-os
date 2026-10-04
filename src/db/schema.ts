@@ -11,7 +11,7 @@
  *   - tests (node:sqlite).
  */
 
-export const SCHEMA_VERSION = 36;
+export const SCHEMA_VERSION = 37;
 
 /**
  * System Doctor (migration v17): persistent log of every Doctor run — what
@@ -1414,6 +1414,48 @@ UPDATE tasks SET
   escalation_path = 'founder (Khritical) via review_items',
   updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
 WHERE id = 'tsk_ztame_p8';
+`;
+
+/**
+ * AOrgI Phase 2b (migration v37) — the two commercial roles the five-group
+ * audit found missing: Marketing/Content Operations (channels, campaigns, site
+ * copy, brand voice) and Support Operations (first-line inbound support,
+ * complaints, refund intake). Growth Intelligence decides; Marketing executes.
+ * Finance/Governance keeps veto on anything touching money.
+ */
+export const ORG_ROLES_V37_SQL = `
+INSERT OR IGNORE INTO org_roles
+ (id, name, department_id, lineage_id, model, scope, responsibilities_json, obligations_json,
+  capabilities_json, default_autonomy, critic_role_id, escalation_threshold, version, status,
+  source, created_at, updated_at) VALUES
+ ('role_marketing_content', 'Marketing / Content Agent', 'dept_commercial', 'lineage_marketing_content', 'deepseek-v4',
+  'Channels, content and campaigns: site copy, consented email/waitlist campaigns, channel analytics, brand voice. Executes what the growth intelligence role decides.',
+  '["Own the content calendar","Draft and schedule email campaigns to consented lists","Maintain site copy and the honesty of claims","Run channel analytics","Guard brand voice"]',
+  '["Emit RESULT for every campaign sent","Emit ESCALATION before contacting any list without recorded consent","Never fabricate performance numbers"]',
+  '["content_calendar","email_campaigns","site_copy","channel_analytics","brand_voice"]',
+  'L1', 'role_growth_intelligence', 'Campaign sent to a list without recorded consent', 1, 'ACTIVE',
+  'seed', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+
+ ('role_support_operations', 'Support Operations Agent', 'dept_commercial', 'lineage_support_operations', 'deepseek-v4',
+  'First-line customer support: inbound mail, complaints, FAQ, refund and dispute intake, escalation to the founder for anything touching money or legal.',
+  '["Answer inbound support mail within SLA","Log and classify complaints","First-line refund/dispute intake","Maintain the FAQ and known-issues list","Escalate anything touching money or legal"]',
+  '["Never promise a refund, discount or delivery date it cannot verify","Emit ESCALATION for money or legal actions","Emit RESULT after every support batch"]',
+  '["support_replies","complaint_handling","refund_intake","faq_maintenance","sla_monitoring"]',
+  'L1', 'role_finance_governance', 'Any refund, chargeback or legal thread', 1, 'ACTIVE',
+  'seed', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+
+INSERT OR IGNORE INTO org_capability_grants
+ (id, role_id, capability, allowed_actions_json, autonomy_level, requires_review,
+  rate_limit_per_hour, data_scope, source, created_at, updated_at) VALUES
+ ('gr_mkt_wild', 'role_marketing_content', '*', '["*"]', 'L1', 0, NULL, 'commercial', 'seed', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+ ('gr_mkt_spend', 'role_marketing_content', 'spend', '["*"]', 'L0', 1, NULL, '', 'seed', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+ ('gr_mkt_external', 'role_marketing_content', 'external', '["*"]', 'L1', 0, NULL, '', 'seed', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+ ('gr_sup_wild', 'role_support_operations', '*', '["*"]', 'L1', 0, NULL, 'commercial', 'seed', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+ ('gr_sup_external', 'role_support_operations', 'external', '["*"]', 'L1', 0, NULL, '', 'seed', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+
+-- Prompt lineage mirrors lineage (v26 pattern) — new roles are no exception.
+UPDATE org_roles SET prompt_lineage_id = lineage_id
+ WHERE id IN ('role_marketing_content','role_support_operations') AND prompt_lineage_id IS NULL;
 `;
 
 /**

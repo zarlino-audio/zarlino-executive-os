@@ -249,6 +249,64 @@ export const DOCTOR_CHECKS: DoctorCheck[] = [
     },
   },
   {
+    id: "settings.budget_fundability",
+    label: "AI budget overrides are fundable (override vs deployed env knobs)",
+    severity: "MEDIUM",
+    run: (ctx, autoFix) => {
+      // A store override far above the deployed env knobs is an unfunded belief:
+      // the gate would happily authorise spend the balance cannot cover, and the
+      // founder never approved the change in the deploy. Repair direction is
+      // always DOWN (clamp to the env default) — never up.
+      const pairs: Array<[string, string]> = [
+        ["ai_daily_budget", "AI_DAILY_BUDGET"],
+        ["ai_monthly_budget", "AI_MONTHLY_BUDGET"],
+      ];
+      const unfunded: string[] = [];
+      for (const [key, envKey] of pairs) {
+        const raw = ctx.store.getSetting(key);
+        if (raw === null || raw === "") continue;
+        const override = Number(raw);
+        const envValue = Number(ctx.env[envKey] ?? "") || 0;
+        if (!Number.isFinite(override) || override <= 0) continue; // handled by settings.budget
+        if (envValue > 0 && override > envValue * 2) {
+          unfunded.push(`${key}=$${override} vs ${envKey}=$${envValue}`);
+        }
+      }
+      if (unfunded.length > 0) {
+        if (autoFix) {
+          for (const [key, envKey] of pairs) {
+            const override = Number(ctx.store.getSetting(key) ?? "");
+            const envValue = Number(ctx.env[envKey] ?? "") || 0;
+            if (Number.isFinite(override) && envValue > 0 && override > envValue * 2) {
+              ctx.store.setSetting(key, String(envValue));
+            }
+          }
+          return failResult(
+            "settings.budget_fundability",
+            "AI budget overrides are fundable (override vs deployed env knobs)",
+            "MEDIUM",
+            `Unfunded override(s) clamped DOWN to the deployed default: ${unfunded.join(", ")}.`,
+            "Re-raise deliberately by changing the env knob in wrangler.toml first, then the override.",
+            `clamped ${unfunded.join(", ")}`,
+          );
+        }
+        return warnResult(
+          "settings.budget_fundability",
+          "AI budget overrides are fundable (override vs deployed env knobs)",
+          "MEDIUM",
+          `Override(s) more than 2x the deployed env knob: ${unfunded.join(", ")} — the spend gate believes money exists that the deploy never authorised.`,
+          "Run the Doctor with autoFix to clamp down, or change the env knob deliberately in wrangler.toml.",
+        );
+      }
+      return okResult(
+        "settings.budget_fundability",
+        "AI budget overrides are fundable (override vs deployed env knobs)",
+        "MEDIUM",
+        "Overrides are within 2x of the deployed env knobs.",
+      );
+    },
+  },
+  {
     id: "metrics.seed",
     label: "Headline product metrics seeded",
     severity: "LOW",
@@ -575,10 +633,11 @@ export const DOCTOR_CHECKS: DoctorCheck[] = [
       // §18: no substantial task should live as informal conversation. P0/P1
       // or BLOCKED tasks without acceptance criteria or a verification owner
       // are exactly that — surface them; the fix is a founder/COA decision,
-      // not an auto-write.
+      // not an auto-write. CANCELLED work is a closed decision, not an
+      // informal one — it must not keep the register noisy forever.
       const substantial = ctx.store
         .listTasks({ limit: 500 })
-        .filter((t) => t.status !== "DONE" && (t.status === "BLOCKED" || t.priority === "P0" || t.priority === "P1"));
+        .filter((t) => t.status !== "DONE" && t.status !== "CANCELLED" && (t.status === "BLOCKED" || t.priority === "P0" || t.priority === "P1"));
       const uncovered = substantial.filter((t) => !t.acceptance_criteria || !t.verification_role_id);
       if (uncovered.length > 0) {
         return warnResult(

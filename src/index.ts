@@ -1499,12 +1499,73 @@ export class ExecutiveAgent {
       this.store.clearChat(body.sessionId ?? "default");
       return json({ ok: true });
     }
+    // Session deletion (housekeeping): a stale test/debug session must not linger
+    // and pollute the context an agent or the founder sees. The `default`
+    // session cannot be deleted here — clear it instead.
+    if (path === "/api/chat/delete" && method === "POST") {
+      const body = (await readBody<{ sessionId?: string; sessionIds?: string[] }>(request).catch(() => ({}))) as { sessionId?: string; sessionIds?: string[] };
+      const ids = (body.sessionIds?.length ? body.sessionIds : body.sessionId ? [body.sessionId] : []).filter((s) => Boolean(s) && s !== "default");
+      if (ids.length === 0) {
+        return json({ error: "sessionId or sessionIds required (the 'default' session cannot be deleted — clear it instead)" }, 400);
+      }
+      for (const id of ids) this.store.deleteChatSession(id);
+      this.store.insertAudit({
+        id: newId("aud"),
+        actor: "founder",
+        action: "chat.session_deleted",
+        entity_type: "chat_session",
+        entity_id: ids.join(","),
+        detail_json: JSON.stringify({ deleted: ids.length }),
+        source: "api",
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      });
+      return json({ ok: true, deleted: ids.length, sessionIds: ids });
+    }
     // Chat enhancements (audit gaps 4, 5, 6, 12, 16, 26)
     if (path === "/api/chat/stop" && method === "POST") {
       const body = (await readBody<{ streamId?: string }>(request).catch(() => ({}))) as { streamId?: string };
       const ctrl = body.streamId ? this.chatAborts.get(body.streamId) : undefined;
       if (ctrl) ctrl.abort();
       return json({ ok: true, stopped: Boolean(ctrl) });
+    }
+    // Context hygiene (repeatable): prune stale chat sessions so agents and the
+    // founder stop seeing resolved-incident debris. Dry-run unless dryRun:false.
+    // `default` is never touched; the store helper guarantees that too.
+    if (path === "/api/chat/prune" && method === "POST") {
+      const body = (await readBody<{ olderThanDays?: number; onlyUntitled?: boolean; dryRun?: boolean; sessionIds?: string[] }>(request).catch(() => ({}))) as {
+        olderThanDays?: number;
+        onlyUntitled?: boolean;
+        dryRun?: boolean;
+        sessionIds?: string[];
+      };
+      const days = Math.max(1, Math.min(365, Number(body.olderThanDays) || 14));
+      const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+      const dryRun = body.dryRun !== false;
+      let candidates = this.store.listChatSessionsToPrune(cutoff, body.onlyUntitled !== false);
+      if (body.sessionIds?.length) {
+        candidates = [...new Set([...candidates, ...body.sessionIds.filter((s) => Boolean(s) && s !== "default")])];
+      }
+      if (!dryRun) for (const id of candidates) this.store.deleteChatSession(id);
+      this.store.insertAudit({
+        id: newId("aud"),
+        actor: "founder",
+        action: dryRun ? "chat.prune_preview" : "chat.sessions_pruned",
+        entity_type: "chat_session",
+        entity_id: candidates.slice(0, 40).join(","),
+        detail_json: JSON.stringify({ olderThanDays: days, onlyUntitled: body.onlyUntitled !== false, deleted: dryRun ? 0 : candidates.length }),
+        source: "api",
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      });
+      return json({
+        dryRun,
+        olderThanDays: days,
+        cutoff,
+        deleted: dryRun ? 0 : candidates.length,
+        candidates,
+        sessionsRemaining: this.store.countChatSessions(),
+      });
     }
     if (path === "/api/chat/rate" && method === "POST") {
       const body = (await readBody<{ messageId?: string; rating?: number }>(request).catch(() => ({}))) as { messageId?: string; rating?: number };
@@ -3119,6 +3180,8 @@ export class ExecutiveAgent {
         dailyCap: outreachDailyCap(this.env.OUTREACH_DAILY_CAP),
         sentToday: this.store.outreachSentCount(today),
         counts: this.store.countProspectsByStatus(),
+        testProspects: this.store.countTestProspects(),
+        countsAll: this.store.countProspectsByStatus(true),
         recentTouches: this.store.listOutreachTouches(20),
         recentReplies: this.store.listProspectReplies(10),
         autoRepliesToday: this.store.countTouchesByTemplateToday("auto_reply", today),

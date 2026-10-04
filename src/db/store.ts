@@ -1712,6 +1712,24 @@ export class ExecutiveStore implements CostStorage {
     const rows = this.sql.all<Row>("SELECT COUNT(DISTINCT session_id) AS c FROM chat_messages");
     return Number(rows[0]?.c ?? 0);
   }
+  /**
+   * Context hygiene: session ids untouched since `cutoffIso`, optionally only
+   * the ones the founder never named (untitled = scratch/debug threads). The
+   * `default` session is never returned — it is the founder's main thread.
+   */
+  listChatSessionsToPrune(cutoffIso: string, onlyUntitled = true): string[] {
+    const rows = this.sql.all<Row>(
+      `SELECT session_id, MAX(created_at) AS last_at,
+         (SELECT title FROM chat_session_titles AS t
+           WHERE t.session_id = outer_m.session_id LIMIT 1) AS title
+       FROM chat_messages AS outer_m
+       GROUP BY session_id
+       HAVING last_at < ? ${onlyUntitled ? "AND (title IS NULL OR title = '')" : ""}
+       ORDER BY last_at ASC`,
+      cutoffIso,
+    );
+    return rows.map((r) => String(r.session_id)).filter((id) => id !== "default");
+  }
 
   // -- chat session titles (migration v30) --------------------------------
   setChatSessionTitle(sessionId: string, title: string, source = "founder"): void {
@@ -1731,6 +1749,17 @@ export class ExecutiveStore implements CostStorage {
   clearChat(sessionId: string): void {
     this.sql.run("DELETE FROM chat_messages WHERE session_id = ?", sessionId);
     this.sql.run("DELETE FROM chat_session_titles WHERE session_id = ?", sessionId);
+  }
+
+  /**
+   * Delete a whole chat session: messages, its title, and any buffered stream
+   * rows. Used for housekeeping — stale test/debug sessions must not linger and
+   * pollute the context an agent or the founder sees.
+   */
+  deleteChatSession(sessionId: string): void {
+    this.sql.run("DELETE FROM chat_messages WHERE session_id = ?", sessionId);
+    this.sql.run("DELETE FROM chat_session_titles WHERE session_id = ?", sessionId);
+    this.sql.run("DELETE FROM chat_streams WHERE session_id = ?", sessionId);
   }
 
   // -- chat streams (migration v6 — buffered SSE deltas) ------------------
@@ -2106,11 +2135,27 @@ export class ExecutiveStore implements CostStorage {
     this.update("prospects", id, next);
     return this.getProspect(id);
   }
-  countProspectsByStatus(): Record<string, number> {
-    const rows = this.sql.all<{ status: string; c: number }>("SELECT status, COUNT(*) AS c FROM prospects GROUP BY status");
+  /**
+   * Prospect funnel counts. Smoke/self-test rows are excluded by default so a
+   * report can never inflate itself from a test send — pass includeTest to see
+   * the raw table.
+   */
+  countProspectsByStatus(includeTest = false): Record<string, number> {
+    const rows = includeTest
+      ? this.sql.all<{ status: string; c: number }>("SELECT status, COUNT(*) AS c FROM prospects GROUP BY status")
+      : this.sql.all<{ status: string; c: number }>(
+          "SELECT status, COUNT(*) AS c FROM prospects WHERE COALESCE(source,'') NOT LIKE 'self-test%' AND COALESCE(source,'') != 'smoke-test' GROUP BY status",
+        );
     const out: Record<string, number> = {};
     for (const r of rows) out[String(r.status)] = Number(r.c);
     return out;
+  }
+  /** Rows excluded from the funnel because they are our own test sends. */
+  countTestProspects(): number {
+    const rows = this.sql.all<{ c: number }>(
+      "SELECT COUNT(*) AS c FROM prospects WHERE COALESCE(source,'') LIKE 'self-test%' OR COALESCE(source,'') = 'smoke-test'",
+    );
+    return Number(rows[0]?.c ?? 0);
   }
   recordOutreachTouch(t: OutreachTouch): void {
     this.insert("outreach_touches", t);
