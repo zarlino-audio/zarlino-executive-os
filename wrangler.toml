@@ -101,12 +101,15 @@ EMAIL_REPLY_TO = "support@zarlinoaudio.com"
 # Heavy workers stay on DeepSeek.
 EXEC_AI_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
 # Daily allowance for the executive layer, and the slice of it that ONLY the
-# founder channel may spend. The 15-minute CEO cron used to drain the whole
-# 10k before the founder ever asked anything, which left his WhatsApp agent
-# answering from a canned line - so background work now stops 2,500 neurons
-# short and the founder's channel always has room to think.
+# founder channel may spend. Every DO wake runs a maintenance sweep (the
+# console polls every 60s), so the CEO cycle was regenerating its summary
+# dozens of times an hour and had drained the whole 10k allowance by the time
+# the founder asked anything - his WhatsApp agent then answered from a canned
+# line. Background work now stops 2,500 neurons short, and the CEO cycle
+# reuses a summary younger than CEO_SUMMARY_REUSE_MINUTES (default 30).
 AI_NEURON_DAILY_BUDGET = "10000"
 AI_NEURON_CAO_RESERVE = "2500"
+CEO_SUMMARY_REUSE_MINUTES = "30"
 # CAO tier: the agent that runs the task board and answers the founder on
 # WhatsApp. DeepSeek V4 Pro is the strongest model in the Workers AI catalog
 # (1M context, reasoning none/low/high/max); measured reachable on this account

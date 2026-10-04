@@ -124,6 +124,8 @@ export interface Env {
   WHATSAPP_FOUNDER_NUMBER?: string;
   WHATSAPP_FOUNDER_LIDS?: string;
   CEO_AUTO_APPROVE?: string;
+  /** Minutes a previous CEO AI summary may be reused (default 30). */
+  CEO_SUMMARY_REUSE_MINUTES?: string;
 }
 
 const INTERNAL_HEADER = "x-exec-internal";

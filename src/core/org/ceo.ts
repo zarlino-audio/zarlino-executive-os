@@ -25,6 +25,8 @@ import { escalateToFounder, type NotifyEnv } from "../../integrations/whatsapp";
 
 export interface CeoEnv extends AiEnv, NotifyEnv {
   CEO_AUTO_APPROVE?: string;
+  /** Minutes a previous AI summary stays valid for reuse (default 30). */
+  CEO_SUMMARY_REUSE_MINUTES?: string;
 }
 
 /**
@@ -143,7 +145,18 @@ export async function runCeoCycle(store: ExecutiveStore, env: CeoEnv, trigger: s
   let summary = `decided=${decided.length} escalated=${escalated.length} pending=${pending.length}`;
   let summaryModel = "none";
   let neurons = 0;
-  const ai = await executiveGenerate(
+  // Wake storms re-run this cycle dozens of times an hour (the console polls
+  // every 60s). The summary is the only expensive part, so a recent one is
+  // reused instead of re-bought - on 2026-10-04 this cycle pattern drained the
+  // whole daily neuron allowance and starved the founder's WhatsApp channel.
+  const reuseMinutes = Number(env.CEO_SUMMARY_REUSE_MINUTES ?? 30);
+  const previous = store.latestCeoReport();
+  let reuse = false;
+  if (previous && Number.isFinite(reuseMinutes) && reuseMinutes > 0) {
+    const age = Date.now() - Date.parse(previous.created_at);
+    if (Number.isFinite(age) && age < reuseMinutes * 60_000) reuse = true;
+  }
+  const ai = reuse ? null : await executiveGenerate(
     env,
     store,
     [
@@ -160,6 +173,8 @@ export async function runCeoCycle(store: ExecutiveStore, env: CeoEnv, trigger: s
     summary = ai.text.trim();
     summaryModel = `workers-ai:${ai.model}`;
     neurons = ai.neurons;
+  } else if (reuse) {
+    summaryModel = "reused";
   }
 
   const reportId = newId("ceo");
