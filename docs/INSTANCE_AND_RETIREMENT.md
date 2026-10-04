@@ -14,18 +14,17 @@ can become that host in ~5 minutes with the instance kit below.
 
 ## One-click instance from any machine
 
-1. Download **ZarlinoInstanceSetup.exe** from <https://zarlinoaudio.com/instance/>
-   (or copy `tools/instance-setup/ZarlinoInstanceSetup.exe`).
-2. Run it. It fetches the current provisioner and runs it:
-   - installs git/node if missing (winget)
-   - clones `zarlino-executive-os` into `C:\Zarlino\zarlino-executive-os`
-   - asks for `DEEPSEEK_API_KEY` + `FOUNDER_AUTH_TOKEN` (typed on that machine,
-     stored in gitignored `.dev.vars`)
-   - installs the daemon launcher (restart-loop + auto-start at login)
-   - installs the WhatsApp bridge (restart-loop + auto-start), optionally with
-     an imported session (see below)
-   - registers the machine as its own instance id (`remote_daemon_01` default)
-   - verifies the daemon + bridge heartbeats against the cloud
+**Current path (2026-10-04):** download **ZarlinoVM-Setup-<ver>.exe** from the OS console
+(`os.zarlinoaudio.com` -> Ops -> Files -> "Machine setup (VM)"), or fetch it from the
+artifact API (`GET /api/artifacts?prefix=artifacts/vm-setup/`). Run it as Administrator
+inside the new host and paste the founder token. Source + build:
+`company-readiness/vm-setup/` in the plugin repo (`build-vm-setup.ps1 -Version X -Publish`).
+It installs Node, pulls the executor + bridge payload from the OS, writes config, registers
+auto-start and verifies the heartbeat.
+
+*Legacy path (kept for reference):* `ZarlinoInstanceSetup.exe` from
+<https://zarlinoaudio.com/instance/> ran `instance-provision.ps1`, which cloned the repo with
+git instead of pulling a payload from the OS. Superseded by the VM kit above.
 
 Options: `-CheckOnly` (preview, changes nothing), `-AgentId ws_studio_02`,
 `-CloneWorkspace` (plugins repo for builds), `-NoBridge`, `-NoStart`,
@@ -78,8 +77,29 @@ escalations queue in the cloud and deliver the moment any bridge host links.
 
 ## Notes
 
-- The Azure VM (`Zarlino1.rdp` → 102.37.153.164) is the intended always-on
-  host; as of 2026-10-02 it is deallocated — **start it in the Azure portal
-  before running the EXE on it**.
-- `remote-provision.ps1` is legacy (daemon-only); `instance-provision.ps1` is
-  the canonical kit and what the EXE runs.
+- The Azure VM (`Zarlino1.rdp` -> 102.37.153.164) is the always-on host as of 2026-10-04.
+- `remote-provision.ps1` is legacy (daemon-only); `instance-provision.ps1` is the legacy kit
+  behind the old EXE.
+
+## 2026-10-04 - retirement executed (DESKTOP-CO8JM8O -> Zarlino1)
+
+Sequence actually run, with evidence:
+
+1. **Replacement verified first.** Doctor showed `whatsapp.bridge: Bridge alive on Zarlino1
+   (...) last heartbeat 7s ago` - the VM had already been provisioned and paired.
+2. **Channel moved, proven by draining with the old host dark.** This machine's bridge was
+   stopped (port 3037 no longer listening), then a founder notification was queued via
+   `POST /api/notify/founder`. It flipped `QUEUED_UNCONFIGURED -> SENT` inside 50s, which only
+   the VM bridge could have done. (The founder receives that message on WhatsApp.)
+3. **This machine retired.** `scripts/retire-this-machine.ps1 -Execute -Deregister` stopped the
+   daemon, removed both startup entries and deregistered `local_daemon_01`. No node processes
+   remain; only `Ollama.lnk` is left in Startup.
+
+Leftover items (human, all optional):
+
+| Item | Action |
+|---|---|
+| Stale WhatsApp linked device from the laptop | On the business phone: WhatsApp -> Linked devices -> remove the old entry |
+| `Zarlino Nightly Backup` task (02:30) still exists on the laptop | Keep it while the machine is in use (protects the worktree); delete it if the machine is wiped |
+| Local `.dev.vars` + `tools/whatsapp-bridge/auth/` on the laptop | Live credentials. Keep, or wipe if the machine leaves the founder's control |
+| Build/rendering capability | Still laptop-only (no VS/Ninja toolchain on the VM); the VM executor handles non-build tasks |
