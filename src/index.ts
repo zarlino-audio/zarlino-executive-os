@@ -24,12 +24,12 @@ import { collectiveMetrics, runChaosTest, runOrgAnalyst } from "./core/org/intel
 import { runCeoCycle } from "./core/org/ceo";
 import { resolveDaemonAgentId } from "./core/org/agents";
 import { handleInboundWhatsApp, DIGEST_APPROVALS_SETTING } from "./core/org/founder-channel";
-import { composeFounderDigest, cooldown, markFounderMessageSent } from "./core/org/voice";
+import { composeFounderDigest, cooldown, markFounderMessageSent, voiceStatus } from "./core/org/voice";
 import { artifactKey, normalizeArtifactPath, MAX_ARTIFACT_BYTES } from "./core/artifacts";
 import { escalateToFounder, sendWhatsApp } from "./integrations/whatsapp";
 import { OUTREACH_TEMPLATES, outreachDailyCap, maybeAutoReply, recordProspectReply, runFollowUps, runOutreachCycle, sendOutreachNow } from "./core/outreach";
 import { emailConfigured, type SendEmailBinding } from "./integrations/email";
-import { DEFAULT_EXEC_MODEL, executiveGenerate, neuronBudget, neuronsUsedToday } from "./integrations/workersai";
+import { chargeNeurons, DEFAULT_EXEC_MODEL, executiveGenerate, neuronBudget, neuronLedger, neuronsUsedToday } from "./integrations/workersai";
 import { handleMcpMessage, MCP_PROTOCOL_VERSION, type McpEnv } from "./mcp/server";
 import { createTask } from "./core/tasks/model";
 import { hashPassword, timingSafeEqual, verifyPassword } from "./core/auth/passwords";
@@ -104,12 +104,15 @@ export interface Env {
   AI_PER_TASK_BUDGET?: string;
   AI_PER_RUN_BUDGET?: string;
   DOCTOR_AUTOFIX?: string;
+  /** CAO tier model (task board + founder WhatsApp channel). */
+  CAO_AI_MODEL?: string;
+  AI_NEURON_DAILY_BUDGET?: string;
+  AI_NEURON_CAO_RESERVE?: string;
   MAX_AUTO_JOBS?: string;
   MAX_RUN_ITERATIONS?: string;
   // Executive tier (Workers AI neurons) + founder WhatsApp channel + CEO policy.
   AI?: unknown;
   EXEC_AI_MODEL?: string;
-  AI_NEURON_DAILY_BUDGET?: string;
   WHATSAPP_PROVIDER?: string;
   WHATSAPP_TO?: string;
   WHATSAPP_APIKEY?: string;
@@ -963,6 +966,18 @@ export class ExecutiveAgent {
         host: "cloudflare-do",
         version: SCHEMA_VERSION.toString(),
         capabilitiesJson: JSON.stringify(["planning", "task_assignment", "bottleneck_detection", "executive_reporting"]),
+      });
+      // The CAO is the operating seat: it owns the task board and is the agent
+      // the founder talks to. Registered like the other live instances so the
+      // registry shows who is actually on duty.
+      this.store.upsertOrgAgent({
+        id: "cao_agent_01",
+        roleId: "role_cao",
+        kind: "cloud",
+        model: this.env.CAO_AI_MODEL ?? "@cf/deepseek-ai/deepseek-v4-pro-0813",
+        host: "cloudflare-do",
+        version: SCHEMA_VERSION.toString(),
+        capabilitiesJson: JSON.stringify(["task_board", "task_contracts", "delegation", "founder_channel", "weekly_reporting"]),
       });
       // Fast local maintenance on wake: doctor + productivity + start/resume
       // auto-runnable jobs (executed non-blocking via state.waitUntil) +
@@ -1998,7 +2013,76 @@ export class ExecutiveAgent {
           rawError = err instanceof Error ? err.message : String(err);
         }
       }
-      return json({ bound: !!this.env.AI, result: probe, rawError, neuronsToday: neuronsUsedToday(this.store), dailyBudget: neuronBudget(this.env) });
+      return json({ bound: !!this.env.AI, result: probe, rawError, neuronsToday: neuronsUsedToday(this.store), dailyBudget: neuronBudget(this.env), ledger: neuronLedger(this.store, this.env) });
+    }
+
+    // Founder channel health: who answered last, why the CAO tier is down (if
+    // it is), and how much allowance the channel has left. This is how "are you
+    // talking to the smart model?" becomes a fact instead of a hope.
+    if (path === "/api/ai/voice-status" && method === "GET") {
+      const status = voiceStatus(this.store, this.env);
+      return json({
+        ...status,
+        caoModel: this.env.CAO_AI_MODEL ?? "@cf/deepseek-ai/deepseek-v4-pro-0813",
+        execModel: this.env.EXEC_AI_MODEL ?? DEFAULT_EXEC_MODEL,
+      });
+    }
+
+    // One-shot probe of the CAO model: proves reachability now (paid plan vs
+    // free), and charges the ledger when it does answer.
+    //
+    // V4 Pro is a REASONING model (default effort: high), so a small token
+    // budget is spent entirely on reasoning and the answer comes back empty.
+    // The probe therefore tries the parameter shapes we might ship and reports
+    // which one actually produces words - measured, not assumed.
+    if (path === "/api/ai/cao-probe" && method === "GET") {
+      const model = this.env.CAO_AI_MODEL ?? "@cf/deepseek-ai/deepseek-v4-pro-0813";
+      if (!this.env.AI) return json({ model, ok: false, error: "AI binding missing" });
+      const ai = this.env.AI as { run: (m: string, i: unknown) => Promise<unknown> };
+      const extract = (out: unknown): string => {
+        const o = out as {
+          response?: string;
+          choices?: Array<{ message?: { content?: string; reasoning_content?: string } }>;
+          result?: { response?: string };
+        };
+        const text = o?.choices?.[0]?.message?.content ?? o?.response ?? o?.result?.response;
+        return typeof text === "string" ? text.trim() : "";
+      };
+      const attempt = async (label: string, input: Record<string, unknown>) => {
+        const started = Date.now();
+        try {
+          const out = await ai.run(model, input);
+          const text = extract(out);
+          return {
+            variant: label,
+            ok: text.length > 0,
+            ms: Date.now() - started,
+            text: text.slice(0, 120),
+            shape: Object.keys((out ?? {}) as Record<string, unknown>).slice(0, 8),
+          };
+        } catch (err) {
+          return {
+            variant: label,
+            ok: false,
+            ms: Date.now() - started,
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
+      };
+      const ask = "Reply with exactly one word: ALIVE";
+      const messages = [{ role: "user", content: ask }];
+      const variants = [
+        await attempt("none/32", { messages, reasoning_effort: "none", max_completion_tokens: 32 }),
+        await attempt("low/200", { messages, reasoning_effort: "low", max_completion_tokens: 200 }),
+        await attempt("default/400", { messages, max_completion_tokens: 400 }),
+      ];
+      const winner = variants.find((v) => v.ok) ?? null;
+      // Charge the ledger for the tokens the winning shape actually used.
+      if (winner) {
+        const outTok = Math.ceil((winner.text?.length ?? 0) / 4);
+        chargeNeurons(this.store, model, Math.ceil((ask.length + 16) / 4), Math.max(outTok, 1));
+      }
+      return json({ model, ok: !!winner, winner, variants, ledger: neuronLedger(this.store, this.env) });
     }
 
     // Review queue — remote operator vetting of produced work (sound / UI / artifacts)

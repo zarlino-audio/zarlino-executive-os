@@ -41,7 +41,7 @@ describe("AOrgI org registry (migration v23)", () => {
 
   it("seeds the role manifests (14 org roles + the CEO agent) with valid department and critic references", () => {
     const roles = store.listOrgRoles();
-    expect(roles.length).toBe(15);
+    expect(roles.length).toBe(16);
     const deptIds = new Set(store.listDepartments().map((d) => d.id));
     for (const role of roles) {
       expect(deptIds.has(role.department_id), `role ${role.id} references missing department ${role.department_id}`).toBe(true);
@@ -114,7 +114,7 @@ describe("AOrgI org registry (migration v23)", () => {
     );
     const check = report.checks.find((c) => c.id === "org.registry")!;
     expect(check.status).toBe("OK");
-    expect(check.detail).toContain("15 role manifests");
+    expect(check.detail).toContain("16 role manifests");
   });
 
   it("Doctor org.registry check warns when a registered instance stops heartbeating", async () => {

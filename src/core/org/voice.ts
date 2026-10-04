@@ -18,7 +18,16 @@
  * nothing else.
  */
 import type { ExecutiveStore } from "../../db/store";
-import { executiveGenerate, type AiEnv } from "../../integrations/workersai";
+import { chargeNeurons, executiveGenerate, neuronLedger, type AiEnv } from "../../integrations/workersai";
+
+/** Which engine produced the founder's last message (observability). */
+export const LAST_ENGINE_SETTING = "voice_last_engine";
+/** First failure text from the CAO tier, kept so we can explain a downgrade. */
+export const CAO_ERROR_SETTING = "voice_cao_error";
+/** When the CAO tier last refused (ISO), used to back off retries. */
+export const CAO_BLOCKED_SETTING = "voice_cao_blocked_at";
+/** Minutes to skip re-probing a refusing CAO model before trying it again. */
+export const CAO_RETRY_MINUTES = 30;
 
 export interface VoiceEnv extends AiEnv {
   WHATSAPP_MIN_GAP_MINUTES?: string;
@@ -160,10 +169,12 @@ export async function composeFounderDigest(
         { role: "system", content: DIGEST_SYSTEM },
         { role: "user", content: JSON.stringify({ items }) },
       ],
-      { maxTokens: 240 },
+      { maxTokens: 240, class: "founder" },
     );
     const text = ai?.text?.trim();
-    if (text) return { text: text.slice(0, 900), ids, items, model: ai?.model ?? null };
+    if (text) {
+      return { text: markEngine(store, `exec:${ai?.model ?? "unknown"}`, text.slice(0, 900)), ids, items, model: ai?.model ?? null };
+    }
   } catch {
     /* fall through to the deterministic voice */
   }
@@ -173,14 +184,112 @@ export async function composeFounderDigest(
 // ---- quick replies ----------------------------------------------------------
 
 const REPLY_SYSTEM =
-  "You are Zarlino Audio's right hand, replying to THE FOUNDER — the person you are speaking to — over WhatsApp. " +
-  "Sound like a sharp human assistant: casual, short (1–3 lines max), contractions fine, NO bullet lists, " +
+  "You are Zarlino Audio's Chief Administrative Officer (CAO) - replying to THE FOUNDER over WhatsApp. " +
+  "You own the task board: what is in flight, what is blocked, what needs a decision. " +
+  "Sound like a sharp human chief of staff: casual, short (1-3 lines max), contractions fine, NO bullet lists, " +
   "NO status dumps, NO jargon. Never mention AI, automation, monitoring, systems or agents; never say " +
   "'as an assistant'; never speak about the founder in the third person. " +
-  "HARD RULE: only state facts that appear in the provided state — never invent numbers, files, events " +
+  "HARD RULE: only state facts that appear in the provided state - never invent numbers, files, events " +
   "or plans (if you don't know, say you'll check and get back). If they ask for status, give the single " +
   "most important item in one calm sentence. If the message is just a greeting or test, reply with one " +
   "short friendly line and stop. Output the reply text only.";
+
+/**
+ * The CAO tier: DeepSeek V4 Pro - the strongest model in the Workers AI
+ * catalog (1M context, reasoning none/low/high/max) - answers the founder.
+ *
+ * Measured on this account (2026-10, /api/ai/cao-probe): the model answers in
+ * ~1.2-1.9s. It is a REASONING model, so the first attempt with a 16-token
+ * budget came back with empty content - the reasoning pass had eaten the whole
+ * allowance. Reply calls therefore run with reasoning_effort "none" and a
+ * generous token budget: short, factual WhatsApp answers do not need a hidden
+ * reasoning pass, and the reasoning tokens are billed as output.
+ *
+ * If the deployment ever refuses the model (plan change, model retirement),
+ * the refusal is recorded, the tier is skipped for CAO_RETRY_MINUTES, and the
+ * executive tier answers instead - the channel never goes dark.
+ */
+async function caoGenerate(
+  env: VoiceEnv,
+  store: ExecutiveStore,
+  messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
+  maxTokens: number,
+): Promise<{ text: string; model: string } | null> {
+  const anyEnv = env as unknown as {
+    AI?: { run: (model: string, input: Record<string, unknown>) => Promise<unknown> };
+    CAO_AI_MODEL?: string;
+  };
+  if (!anyEnv.AI) return null;
+  const model = anyEnv.CAO_AI_MODEL || "@cf/deepseek-ai/deepseek-v4-pro-0813";
+
+  // A refusing tier is skipped for a while, not retried on every message.
+  try {
+    const blockedAt = store.getSetting(CAO_BLOCKED_SETTING);
+    if (blockedAt) {
+      const age = Date.now() - Date.parse(blockedAt);
+      if (Number.isFinite(age) && age < CAO_RETRY_MINUTES * 60_000) return null;
+    }
+  } catch {
+    /* settings miss is not fatal */
+  }
+
+  const inputs = messages.reduce((n, m) => n + m.content.length, 0);
+  const ask = async (input: Record<string, unknown>) => {
+    const out = (await anyEnv.AI!.run(model, input)) as {
+      response?: string;
+      choices?: Array<{ message?: { content?: string } }>;
+      result?: { response?: string };
+      usage?: { prompt_tokens?: number; completion_tokens?: number };
+    };
+    const text = out?.choices?.[0]?.message?.content ?? out?.response ?? out?.result?.response;
+    return { text: typeof text === "string" ? text.trim() : "", usage: out?.usage };
+  };
+
+  try {
+    let result = await ask({
+      messages,
+      reasoning_effort: "none",
+      max_completion_tokens: Math.max(maxTokens, 400),
+      temperature: 0.25,
+    });
+    // Empty content means the token budget was consumed before any answer
+    // (reasoning pass, or a truncated completion). Retry once with room.
+    if (!result.text) {
+      result = await ask({ messages, max_completion_tokens: 900, temperature: 0.25 });
+    }
+    if (!result.text) {
+      recordCaoFailure(store, "empty response");
+      return null;
+    }
+    try {
+      store.setSetting(CAO_ERROR_SETTING, "");
+      store.setSetting(CAO_BLOCKED_SETTING, "");
+      chargeNeurons(
+        store,
+        model,
+        result.usage?.prompt_tokens ?? Math.ceil(inputs / 4),
+        result.usage?.completion_tokens ?? Math.ceil(result.text.length / 4),
+      );
+    } catch {
+      /* accounting must never break a reply */
+    }
+    return { text: result.text.slice(0, 700), model };
+  } catch (err) {
+    // Model unavailable on this plan, budget refused, transient failure:
+    // remember why, then fall back rather than leave the founder hanging.
+    recordCaoFailure(store, err instanceof Error ? err.message : String(err));
+    return null;
+  }
+}
+
+function recordCaoFailure(store: ExecutiveStore, message: string): void {
+  try {
+    store.setSetting(CAO_ERROR_SETTING, message.slice(0, 300));
+    store.setSetting(CAO_BLOCKED_SETTING, new Date().toISOString());
+  } catch {
+    /* never fatal */
+  }
+}
 
 export interface FounderStateContext {
   pendingApprovals: string[];
@@ -208,32 +317,81 @@ export async function naturalFounderReply(
   ctx: FounderStateContext,
 ): Promise<string> {
   try {
+    const prompts = [
+      {
+        role: "system" as const,
+        content:
+          REPLY_SYSTEM +
+          " Current state (only if relevant): " +
+          JSON.stringify({
+            pending_approvals: ctx.pendingApprovals,
+            open_tasks: ctx.openTasks,
+            doctor: ctx.doctor,
+            latest_note: ctx.ceoSummary?.slice(0, 300) ?? null,
+          }),
+      },
+      { role: "user" as const, content: text.slice(0, 1500) },
+    ];
+    // CAO tier first (strongest model), executive tier as the fallback.
+    const cao = await caoGenerate(env, store, prompts, 200);
+    if (cao) return markEngine(store, `cao:${cao.model}`, cao.text);
     const ai = await executiveGenerate(
       env,
       store,
-      [
-        {
-          role: "system",
-          content:
-            REPLY_SYSTEM +
-            " Current state (only if relevant): " +
-            JSON.stringify({
-              pending_approvals: ctx.pendingApprovals,
-              open_tasks: ctx.openTasks,
-              doctor: ctx.doctor,
-              latest_note: ctx.ceoSummary?.slice(0, 300) ?? null,
-            }),
-        },
-        { role: "user", content: text.slice(0, 1500) },
-      ],
-      { maxTokens: 200, temperature: 0.25 },
+      prompts,
+      { maxTokens: 200, temperature: 0.25, class: "founder" },
     );
     const reply = ai?.text?.trim();
-    if (reply) return reply.slice(0, 700);
+    if (reply) return markEngine(store, `exec:${ai?.model ?? "unknown"}`, reply.slice(0, 700));
   } catch {
     /* fall through */
   }
-  return naturalReplyFallback(ctx);
+  return markEngine(store, "fallback:canned", naturalReplyFallback(ctx));
+}
+
+/** Record which engine answered so a downgrade is visible, never guessed. */
+function markEngine(store: ExecutiveStore, engine: string, text: string): string {
+  try {
+    store.setSetting(LAST_ENGINE_SETTING, engine);
+  } catch {
+    /* never blocks a reply */
+  }
+  return text;
+}
+
+/** 
+ * Status of the founder channel: who answered last, why the CAO tier is down
+ * (if it is), and how much allowance is left. Read by the console + doctor so
+ * "is the founder getting the smart model?" is a fact, not a hope.
+ */
+export function voiceStatus(
+  store: ExecutiveStore,
+  env: VoiceEnv,
+): {
+  lastEngine: string | null;
+  caoError: string | null;
+  caoBlockedAt: string | null;
+  caoRetrying: boolean;
+  ledger: { budget: number; reserve: number; used: number; left: number; backgroundLeft: number };
+} {
+  let caoError: string | null = null;
+  let caoBlockedAt: string | null = null;
+  let lastEngine: string | null = null;
+  try {
+    caoError = store.getSetting(CAO_ERROR_SETTING) || null;
+    caoBlockedAt = store.getSetting(CAO_BLOCKED_SETTING) || null;
+    lastEngine = store.getSetting(LAST_ENGINE_SETTING) || null;
+  } catch {
+    /* fresh store */
+  }
+  const age = caoBlockedAt ? Date.now() - Date.parse(caoBlockedAt) : Number.POSITIVE_INFINITY;
+  return {
+    lastEngine,
+    caoError,
+    caoBlockedAt,
+    caoRetrying: age >= CAO_RETRY_MINUTES * 60_000,
+    ledger: neuronLedger(store, env),
+  };
 }
 
 /** Strangers get exactly this — warm, public, zero internal information. */

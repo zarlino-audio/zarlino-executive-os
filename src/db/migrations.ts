@@ -29,6 +29,7 @@ import {
   PLANNER_SQL,
   AUTO_RUN_SQL,
   ORG_ROLES_V37_SQL,
+  ORG_ROLES_V38_SQL,
   PRODUCT_METRICS_SQL,
   DOCTOR_LOG_SQL,
   PRODUCTIVITY_SQL,
@@ -166,6 +167,7 @@ export const MIGRATIONS: Migration[] = [
   { version: 35, name: "outreach", sql: [OUTREACH_SQL] },
   { version: 36, name: "prospect_replies", sql: [PROSPECT_REPLIES_SQL] },
   { version: 37, name: "commercial_roles", sql: [ORG_ROLES_V37_SQL] },
+  { version: 38, name: "cao_role", sql: [ORG_ROLES_V38_SQL] },
 
 ];
 

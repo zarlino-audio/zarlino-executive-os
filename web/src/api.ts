@@ -179,7 +179,7 @@ export const api = {
   /**
    * Download an artifact and save it with its real filename. The fetch carries
    * the founder bearer, so a plain <a href> cannot be used (the header would be
-   * missing) â€” hence blob + temporary anchor.
+   * missing) - hence blob + temporary anchor.
    */
   downloadArtifact: async (key: string, filename: string): Promise<void> => {
     const token = getToken();

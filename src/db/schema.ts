@@ -11,7 +11,7 @@
  *   - tests (node:sqlite).
  */
 
-export const SCHEMA_VERSION = 37;
+export const SCHEMA_VERSION = 38;
 
 /**
  * System Doctor (migration v17): persistent log of every Doctor run — what
@@ -1456,6 +1456,53 @@ INSERT OR IGNORE INTO org_capability_grants
 -- Prompt lineage mirrors lineage (v26 pattern) — new roles are no exception.
 UPDATE org_roles SET prompt_lineage_id = lineage_id
  WHERE id IN ('role_marketing_content','role_support_operations') AND prompt_lineage_id IS NULL;
+`;
+
+/**
+ * Migration v38 - the CAO (Chief Administrative Officer).
+ *
+ * The founder's directive: the OS itself owns the operating seat. The CAO
+ * runs the task board (intake -> contract -> assignment -> follow-up ->
+ * weekly report) and is the agent that answers the founder on WhatsApp.
+ *
+ * It is deliberately NOT a second planner. The COA decides *what* should
+ * happen; the CAO decides *who is doing it, by when, and what is stuck*.
+ *
+ * Model tier: CAO_AI_MODEL (a wrangler var) - the strongest model the account
+ * can reach. The voice layer (src/core/org/voice.ts) falls back to the
+ * executive model when that deployment cannot reach the top tier, so the
+ * founder channel never goes dark because of a plan limit.
+ */
+export const ORG_ROLES_V38_SQL = `
+INSERT OR IGNORE INTO org_roles
+ (id, name, department_id, lineage_id, model, scope, responsibilities_json, obligations_json,
+  capabilities_json, default_autonomy, critic_role_id, escalation_threshold, version, status,
+  source, created_at, updated_at) VALUES
+ ('role_cao', 'Chief Administrative Officer', 'dept_executive', 'lineage_cao', 'deepseek-v4-pro',
+  'Task-board ownership and founder communications: intake every directive as a contract-bearing task, assign it to a role instance, chase it, unblock it, and report the board.',
+  '["Own the task board end to end","Turn every founder directive into a task with acceptance criteria","Assign each task to a named role instance","Chase stalled work and record blockers","Escalate only what needs the founder","Report the weekly board and blockers","Answer the founder on the founder channel"]',
+  '["Never report work as done without a verification artifact","Emit ESCALATION the moment a task is blocked on the founder","Emit RESULT after every board sweep"]',
+  '["task_board","task_contracts","delegation","founder_channel","weekly_reporting","blocker_escalation"]',
+  'L2', 'role_coa', 'Blocked on a founder decision, spend or external commitment', 1, 'ACTIVE',
+  'seed', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+
+INSERT OR IGNORE INTO org_capability_grants
+ (id, role_id, capability, allowed_actions_json, autonomy_level, requires_review,
+  rate_limit_per_hour, data_scope, source, created_at, updated_at) VALUES
+ ('gr_cao_wild', 'role_cao', '*', '["*"]', 'L2', 0, NULL, 'organizational', 'seed', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+ ('gr_cao_spend', 'role_cao', 'spend', '["*"]', 'L0', 1, NULL, '', 'seed', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+ ('gr_cao_deploy', 'role_cao', 'deploy', '["*"]', 'L0', 1, NULL, '', 'seed', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+ ('gr_cao_external', 'role_cao', 'external', '["*"]', 'L1', 0, NULL, '', 'seed', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+
+-- Prompt lineage mirrors lineage (v26 pattern).
+UPDATE org_roles SET prompt_lineage_id = lineage_id
+ WHERE id = 'role_cao' AND prompt_lineage_id IS NULL;
+
+-- Administrative disagreements arbitrate through the CAO, falling back to the
+-- COA, so no disagreement class is left unattended.
+INSERT OR IGNORE INTO org_arbiters
+ (id, disagreement_class, arbiter_role_id, fallback_role_id, arbiter_kind, source, created_at, updated_at) VALUES
+ ('arb_administrative', 'administrative', 'role_cao', 'role_coa', 'role', 'seed', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'));
 `;
 
 /**

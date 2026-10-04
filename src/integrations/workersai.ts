@@ -21,7 +21,9 @@ export interface WorkersAiBinding {
 export interface AiEnv {
   AI?: unknown;
   EXEC_AI_MODEL?: string;
+  CAO_AI_MODEL?: string;
   AI_NEURON_DAILY_BUDGET?: string;
+  AI_NEURON_CAO_RESERVE?: string;
 }
 
 /**
@@ -31,12 +33,19 @@ export interface AiEnv {
  */
 export const DEFAULT_EXEC_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 
-/** Neuron rates per 1M tokens (Cloudflare published rates, approximate). */
+/**
+ * Neuron rates per 1M tokens (Cloudflare published rates, approximate).
+ *
+ * The CAO tier is priced in dollars upstream ($1.32/M in, $3.96/M out) and
+ * converted here at Cloudflare's $0.011 / 1,000 neurons so the org keeps ONE
+ * ledger for "what did the executive layer cost us today".
+ */
 const NEURON_RATES: Record<string, { inPerM: number; outPerM: number }> = {
   "@cf/meta/llama-3.1-8b-instruct-fp8": { inPerM: 4119, outPerM: 25300 },
   "@cf/meta/llama-3.2-3b-instruct": { inPerM: 2059, outPerM: 12650 },
   "@cf/meta/llama-3.3-70b-instruct-fp8-fast": { inPerM: 26630, outPerM: 204300 },
   "@cf/meta/llama-4-scout-17b-16e-instruct": { inPerM: 12000, outPerM: 75000 },
+  "@cf/deepseek-ai/deepseek-v4-pro-0813": { inPerM: 120000, outPerM: 360000 },
 };
 
 export function estimateNeurons(model: string, inputTokens: number, outputTokens: number): number {
@@ -47,6 +56,21 @@ export function estimateNeurons(model: string, inputTokens: number, outputTokens
 export function neuronBudget(env: AiEnv): number {
   const n = Number(env.AI_NEURON_DAILY_BUDGET);
   return Number.isFinite(n) && n > 0 ? n : 10_000;
+}
+
+/**
+ * The slice of the daily allowance that only the founder channel may spend.
+ *
+ * Without this the 15-minute CEO cron drains the whole day's neurons before
+ * breakfast and the founder's WhatsApp agent degrades to a canned line. The
+ * founder is the one caller that must never be starved, so background work is
+ * refused while the reserve is the only thing left.
+ */
+export function neuronCaoReserve(env: AiEnv): number {
+  const configured = Number(env.AI_NEURON_CAO_RESERVE);
+  const budget = neuronBudget(env);
+  const reserve = Number.isFinite(configured) && configured >= 0 ? configured : Math.floor(budget * 0.25);
+  return Math.min(reserve, budget);
 }
 
 function dayKey(now: Date): string {
@@ -61,9 +85,42 @@ export function neuronsLeft(store: ExecutiveStore, env: AiEnv, now = new Date())
   return Math.max(0, neuronBudget(env) - neuronsUsedToday(store, now));
 }
 
+/**
+ * The ledger the founder channel and the console both read. `backgroundLeft`
+ * is what cron/agent work may spend without touching the reserve.
+ */
+export function neuronLedger(
+  store: ExecutiveStore,
+  env: AiEnv,
+  now = new Date(),
+): { budget: number; reserve: number; used: number; left: number; backgroundLeft: number } {
+  const budget = neuronBudget(env);
+  const reserve = neuronCaoReserve(env);
+  const used = neuronsUsedToday(store, now);
+  const left = Math.max(0, budget - used);
+  return { budget, reserve, used, left, backgroundLeft: Math.max(0, left - reserve) };
+}
+
 function addNeurons(store: ExecutiveStore, count: number, now = new Date()): void {
   const used = neuronsUsedToday(store, now);
   store.setSetting(dayKey(now), String(used + count));
+}
+
+/**
+ * Charge a completion that ran outside executiveGenerate (the CAO tier talks
+ * to the Workers AI binding directly). Without this the founder's own model
+ * would be the only spend the ledger never saw.
+ */
+export function chargeNeurons(
+  store: ExecutiveStore,
+  model: string,
+  inputTokens: number,
+  outputTokens: number,
+  now = new Date(),
+): number {
+  const neurons = estimateNeurons(model, inputTokens, outputTokens);
+  addNeurons(store, neurons, now);
+  return neurons;
 }
 
 export interface ExecChatMessage {
@@ -85,21 +142,28 @@ function roughTokens(messages: ExecChatMessage[]): number {
   return Math.ceil(chars / 4);
 }
 
+export type AiCallClass = "background" | "founder";
+
 /**
  * One executive-tier completion. Returns null when Workers AI is unbound,
  * the daily neuron budget is spent, or the call fails — callers then fall
  * back to the heavy tier (DeepSeek).
+ *
+ * `opts.class` decides which slice of the allowance the call may spend:
+ * background work stops at `budget - reserve`, the founder channel may spend
+ * the reserve as well.
  */
 export async function executiveGenerate(
   env: AiEnv,
   store: ExecutiveStore,
   messages: ExecChatMessage[],
-  opts: { maxTokens?: number; temperature?: number } = {},
+  opts: { maxTokens?: number; temperature?: number; class?: AiCallClass } = {},
 ): Promise<ExecResult | null> {
   const ai = env.AI as WorkersAiBinding | undefined;
   if (!ai || typeof ai.run !== "function") return null;
   const model = env.EXEC_AI_MODEL || DEFAULT_EXEC_MODEL;
-  if (neuronsUsedToday(store) >= neuronBudget(env)) return null;
+  const allowed = opts.class === "founder" ? neuronBudget(env) : neuronBudget(env) - neuronCaoReserve(env);
+  if (neuronsUsedToday(store) >= allowed) return null;
   try {
     const out = (await ai.run(model, {
       messages,

@@ -20,6 +20,8 @@ import type { DoctorCheckResult, DoctorReport, DoctorSeverity } from "../types";
 import type { Tool, ToolContext } from "./tools/types";
 import { newId } from "../ids";
 import { evaluateProductGates } from "./perceptual/manager";
+import { neuronLedger, DEFAULT_EXEC_MODEL } from "../integrations/workersai";
+import { voiceStatus, type VoiceEnv } from "./org/voice";
 export interface DoctorContext {
   store: ExecutiveStore;
   env: Record<string, string | undefined>;
@@ -500,6 +502,66 @@ export const DOCTOR_CHECKS: DoctorCheck[] = [
         "MEDIUM",
         `Bridge offline ${mins} min${where}; nothing is queued right now.`,
         "Start the bridge on an always-on machine.",
+      );
+    },
+  },
+  {
+    id: "ai.founder_channel",
+    label: "Founder channel is answering with a real model",
+    severity: "MEDIUM",
+    run: (ctx) => {
+      const env = ctx.env as VoiceEnv;
+      const status = voiceStatus(ctx.store, env);
+      const caoModel = String(env.CAO_AI_MODEL || "@cf/deepseek-ai/deepseek-v4-pro-0813");
+      const execModel = String(env.EXEC_AI_MODEL || DEFAULT_EXEC_MODEL);
+      const { left, reserve, backgroundLeft, budget, used } = status.ledger;
+      const ledgerNote = `neurons ${used}/${budget} used, ${left} left (reserve ${reserve}).`;
+      // The CAO tier bills outside the neuron allowance, so a spent allowance
+      // only matters when the CAO tier is ALSO down - then both paths are out.
+      const caoHealthy = !status.caoError && (status.lastEngine?.startsWith("cao:") ?? false);
+
+      if (left <= 0 && !caoHealthy) {
+        return failResult(
+          "ai.founder_channel",
+          "Founder channel is answering with a real model",
+          "MEDIUM",
+          `Daily allowance exhausted and the CAO tier is not answering — the founder would get the canned line. ${ledgerNote}`,
+          "Raise AI_NEURON_DAILY_BUDGET (wrangler.toml), check CAO_AI_MODEL, or wait for the UTC day to roll over.",
+        );
+      }
+      if (status.caoError) {
+        const engine = status.lastEngine || "unknown";
+        return warnResult(
+          "ai.founder_channel",
+          "Founder channel is answering with a real model",
+          "MEDIUM",
+          `CAO tier (${caoModel}) is refusing: ${status.caoError}. Answering via ${engine}; retrying every 30 min. ${ledgerNote}`,
+          "Check the model id and plan (or AI Gateway credits); the executive tier answers meanwhile.",
+        );
+      }
+      if (left <= 0) {
+        return warnResult(
+          "ai.founder_channel",
+          "Founder channel is answering with a real model",
+          "MEDIUM",
+          `Neuron allowance for the day is spent, so the executive fallback is out — the CAO tier (${caoModel}) is carrying the channel. ${ledgerNote}`,
+          "Raise AI_NEURON_DAILY_BUDGET if the fallback matters today; the founder is unaffected.",
+        );
+      }
+      if (backgroundLeft <= 0) {
+        return warnResult(
+          "ai.founder_channel",
+          "Founder channel is answering with a real model",
+          "MEDIUM",
+          `Background work is held off the reserve so the founder keeps ${left} neurons. ${ledgerNote}`,
+          "Normal once the CEO cron has spent its share; the founder channel is unaffected.",
+        );
+      }
+      return okResult(
+        "ai.founder_channel",
+        "Founder channel is answering with a real model",
+        "MEDIUM",
+        `CAO tier ${caoModel} (fallback ${execModel}); last answer from ${status.lastEngine || "no message yet"}. ${ledgerNote}`,
       );
     },
   },
