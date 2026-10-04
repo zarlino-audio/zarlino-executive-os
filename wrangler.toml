@@ -118,6 +118,10 @@ CEO_SUMMARY_REUSE_MINUTES = "30"
 # "none" and a 400-token floor. If the plan ever refuses it, voice.ts records
 # the refusal and falls back to EXEC_AI_MODEL instead of failing.
 CAO_AI_MODEL = "@cf/deepseek-ai/deepseek-v4-pro-0813"
+# Founder-channel fallback: if Workers AI cannot answer (refusal, retirement,
+# outage), the CAO asks the DeepSeek API directly - a separate account, so the
+# one channel that must never go quiet does not depend on one provider.
+DEEPSEEK_CAO_MODEL = "deepseek-chat"
 AI_DAILY_BUDGET = "5"
 AI_MONTHLY_BUDGET = "80"
 AI_PER_TASK_BUDGET = "2"

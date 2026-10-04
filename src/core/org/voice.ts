@@ -9,16 +9,22 @@
  *      backlog that flooded the founder the first time is now one message.
  *
  *   2. NO MACHINE TRACES. Nothing says "system", "agent", "automated",
- *      "decision(s)", "[Zarlino OS | ...]" — it reads like a colleague
- *      texting their boss. The Workers AI executive tier writes it when
- *      available (with strict voice rules); the deterministic fallback below
- *      is written to pass the same voice check.
+ *      "decision(s)", "[Zarlino OS | ...]" - it reads like a colleague
+ *      texting their boss. The CAO tier writes it when available (with strict
+ *      voice rules); the deterministic fallback below is written to pass the
+ *      same voice check.
+ *
+ *   3. THE CHANNEL NEVER DIES. Answering cascades: Workers AI (the strongest
+ *      catalog model) -> the DeepSeek API directly -> the Workers AI executive
+ *      tier -> a deterministic line. Each step records which engine answered,
+ *      so a downgrade is visible instead of silent.
  *
  * Strangers NEVER see any of this: they get one public canned reply and
  * nothing else.
  */
 import type { ExecutiveStore } from "../../db/store";
 import { chargeNeurons, executiveGenerate, neuronLedger, type AiEnv } from "../../integrations/workersai";
+import { deepseekComplete, deepseekConfigured, type DeepSeekEnv } from "../../integrations/deepseek";
 
 /** Which engine produced the founder's last message (observability). */
 export const LAST_ENGINE_SETTING = "voice_last_engine";
@@ -29,7 +35,7 @@ export const CAO_BLOCKED_SETTING = "voice_cao_blocked_at";
 /** Minutes to skip re-probing a refusing CAO model before trying it again. */
 export const CAO_RETRY_MINUTES = 30;
 
-export interface VoiceEnv extends AiEnv {
+export interface VoiceEnv extends AiEnv, DeepSeekEnv {
   WHATSAPP_MIN_GAP_MINUTES?: string;
   WHATSAPP_FOUNDER_NUMBER?: string;
   WHATSAPP_FOUNDER_LIDS?: string;
@@ -332,9 +338,22 @@ export async function naturalFounderReply(
       },
       { role: "user" as const, content: text.slice(0, 1500) },
     ];
-    // CAO tier first (strongest model), executive tier as the fallback.
+    // CAO tier first (strongest model), then the DeepSeek API directly (a
+    // separate account, so a Cloudflare-side refusal cannot silence the
+    // founder), then the free executive tier, then the deterministic line.
     const cao = await caoGenerate(env, store, prompts, 200);
     if (cao) return markEngine(store, `cao:${cao.model}`, cao.text);
+    if (deepseekConfigured(env)) {
+      const ds = await deepseekComplete(env, prompts, { maxTokens: 300, temperature: 0.25 });
+      if (ds) {
+        try {
+          chargeNeurons(store, `deepseek:${ds.model}`, ds.promptTokens, ds.completionTokens);
+        } catch {
+          /* accounting must never break a reply */
+        }
+        return markEngine(store, `deepseek:${ds.model}`, ds.text.slice(0, 700));
+      }
+    }
     const ai = await executiveGenerate(
       env,
       store,
@@ -372,6 +391,7 @@ export function voiceStatus(
   caoError: string | null;
   caoBlockedAt: string | null;
   caoRetrying: boolean;
+  deepseekReady: boolean;
   ledger: { budget: number; reserve: number; used: number; left: number; backgroundLeft: number };
 } {
   let caoError: string | null = null;
@@ -390,6 +410,7 @@ export function voiceStatus(
     caoError,
     caoBlockedAt,
     caoRetrying: age >= CAO_RETRY_MINUTES * 60_000,
+    deepseekReady: deepseekConfigured(env),
     ledger: neuronLedger(store, env),
   };
 }

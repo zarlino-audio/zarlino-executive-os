@@ -17,6 +17,7 @@ import { webTools } from "../integrations/web";
 import { visionTools } from "../integrations/vision";
 import { paystackTools } from "../integrations/paystack";
 import { doctorTools } from "../core/doctor";
+import { prepareDispatch } from "../core/org/dispatch";
 import { assessFinancials } from "../core/finance/calc";
 import { createTask } from "../core/tasks/model";
 import {
@@ -721,6 +722,19 @@ function internalTools(): Tool[] {
       run: async (ctx: ToolContext, input: { prompt: string; taskId?: string }) => {
         const store = ctx.store;
         if (!store) throw new Error("store unavailable");
+        // Dispatch policy: no duplicate prompts, one discovery pass per task,
+        // act-first directive + prior evidence attached (see core/org/dispatch).
+        const decision = prepareDispatch(store, { prompt: input.prompt, taskId: input.taskId });
+        if (!decision.ok) {
+          return {
+            queued: false,
+            refused: true,
+            code: decision.code,
+            existingId: decision.existingId,
+            error: decision.error,
+            note: "Not queued. Read the existing task result and act on it, or send a materially different ACTION request.",
+          };
+        }
         const id = newId("ltk");
         const now = nowIso();
         store.createLocalTask({
@@ -729,12 +743,13 @@ function internalTools(): Tool[] {
           updated_at: now,
           source: "executive",
           task_id: input.taskId,
-          prompt: input.prompt,
+          prompt: decision.prompt,
           status: "PENDING",
         });
         return {
           queued: true,
           taskId: id,
+          discovery: decision.investigation,
           note: "Queued for the local machine. Poll executive.get_local_task (or the web console Local Work card) for the result — the local daemon must be running.",
         };
       },
@@ -777,13 +792,25 @@ function internalTools(): Tool[] {
         ]
           .filter(Boolean)
           .join("\n\n");
+        const decision = prepareDispatch(store, { prompt, taskId: input.taskId });
+        if (!decision.ok) {
+          return {
+            queued: false,
+            refused: true,
+            code: decision.code,
+            existingId: decision.existingId,
+            error: decision.error,
+            brief,
+            note: "Not queued. Extend the existing work instead of restarting it.",
+          };
+        }
         store.createLocalTask({
           id,
           created_at: now,
           updated_at: now,
           source: "executive",
           task_id: input.taskId,
-          prompt,
+          prompt: decision.prompt,
           status: "PENDING",
           meta_json: JSON.stringify(brief),
         });

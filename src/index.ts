@@ -106,6 +106,8 @@ export interface Env {
   DOCTOR_AUTOFIX?: string;
   /** CAO tier model (task board + founder WhatsApp channel). */
   CAO_AI_MODEL?: string;
+  /** DeepSeek fallback for the founder channel when Workers AI cannot answer. */
+  DEEPSEEK_CAO_MODEL?: string;
   AI_NEURON_DAILY_BUDGET?: string;
   AI_NEURON_CAO_RESERVE?: string;
   MAX_AUTO_JOBS?: string;

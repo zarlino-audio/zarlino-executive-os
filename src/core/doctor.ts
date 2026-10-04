@@ -22,6 +22,7 @@ import { newId } from "../ids";
 import { evaluateProductGates } from "./perceptual/manager";
 import { neuronLedger, DEFAULT_EXEC_MODEL } from "../integrations/workersai";
 import { voiceStatus, type VoiceEnv } from "./org/voice";
+import { isInvestigationPrompt } from "./org/dispatch";
 export interface DoctorContext {
   store: ExecutiveStore;
   env: Record<string, string | undefined>;
@@ -503,6 +504,45 @@ export const DOCTOR_CHECKS: DoctorCheck[] = [
         `Bridge offline ${mins} min${where}; nothing is queued right now.`,
         "Start the bridge on an always-on machine.",
       );
+    },
+  },
+  {
+    id: "org.work_output",
+    label: "The machine is doing work, not just research",
+    severity: "HIGH",
+    run: (ctx) => {
+      const since = Date.now() - 7 * 24 * 60 * 60 * 1000;
+      const tasks = ctx.store.listLocalTasks(200).filter((t) => {
+        const at = Date.parse(t.created_at ?? "");
+        return Number.isFinite(at) && at >= since;
+      });
+      const probes = tasks.filter((t) => isInvestigationPrompt(t.prompt));
+      const work = tasks.filter((t) => !isInvestigationPrompt(t.prompt));
+      const done = tasks.filter((t) => t.status === "DONE").length;
+      const failed = tasks.filter((t) => t.status === "FAILED").length;
+      const detail =
+        `Last 7 days on the local machine: ${tasks.length} dispatch(es) — ${work.length} action, ${probes.length} read-only research; ` +
+        `${done} done, ${failed} failed.`;
+      // Discovery has value; a board made of it means nothing is being built.
+      if (tasks.length >= 3 && probes.length > work.length) {
+        return warnResult(
+          "org.work_output",
+          "The machine is doing work, not just research",
+          "HIGH",
+          `${detail} More than half of it is research.`,
+          "Stop dispatching read-only passes: send an ACTION (edit files, run the build/tests, produce the artifact). Duplicate prompts are already refused at dispatch time.",
+        );
+      }
+      if (tasks.length >= 5 && work.length === 0) {
+        return warnResult(
+          "org.work_output",
+          "The machine is doing work, not just research",
+          "HIGH",
+          `${detail} Nothing has been changed on the machine this week.`,
+          "Send real work to the machine — a task with an artifact as its deliverable.",
+        );
+      }
+      return okResult("org.work_output", "The machine is doing work, not just research", "HIGH", detail);
     },
   },
   {
