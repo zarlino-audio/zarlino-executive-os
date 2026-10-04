@@ -67,6 +67,9 @@ export class ToolRegistry {
     const ctx: ToolContext = {
       env: base.env ?? {},
       store: base.store,
+      // Attach the live registry: meta-tools (system.doctor) verify the real
+      // tool names that get sent to the model instead of guessing.
+      registry: this,
       audit,
       recordCost: base.recordCost,
       runId: base.runId,

@@ -921,9 +921,18 @@ export async function runDoctor(ctx: DoctorContext, opts: RunDoctorOptions): Pro
 // ---------------------------------------------------------------------------
 
 function doctorContextFromTool(ctx: ToolContext): DoctorContext {
+  // The env record carries live bindings at runtime even though it is typed as
+  // strings, so detect the KV namespace the same way the wake path does.
+  const rawKv = (ctx.env as Record<string, unknown> | undefined)?.ZARLINO_KV as DoctorContext["kv"] | undefined;
+  const kv = rawKv && typeof (rawKv as { get?: unknown }).get === "function" ? rawKv : undefined;
   return {
     store: ctx.store!,
     env: ctx.env ?? {},
+    kv,
+    // Forward the live registry when the caller has one: without it the
+    // agent_ready check reports a phantom FAIL ("registry not attached") even
+    // though the names are fine — the wake-path doctor has always passed it.
+    registry: ctx.registry,
     now: () => new Date().toISOString(),
   };
 }

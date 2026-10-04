@@ -238,4 +238,53 @@ describe("System Doctor", () => {
     expect(out.ok).toBe(true);
     expect(out.checks.length).toBeGreaterThan(5);
   });
+
+  const agentReady = async (ctx: Record<string, unknown>) => {
+    const tool = doctorTools().find((t) => t.name === "system.doctor")!;
+    const out = (await tool.run(ctx as never, { autoFix: false, trigger: "test" })) as {
+      checks: Array<{ id: string; status: string; detail: string }>;
+    };
+    return out.checks.find((c) => c.id === "features.agent_ready")!;
+  };
+
+  it("system.doctor verifies real tool names when the caller passes a registry", async () => {
+    // Regression: the tool path used to drop the registry, so the agent's own
+    // doctor call reported a phantom FAIL ("Registry not attached").
+    const ok = await agentReady({
+      store,
+      env: { DEEPSEEK_API_KEY: "test" },
+      audit: () => {},
+      registry: { functionSchemas: () => [{ function: { name: "finance_get_snapshot" } }] },
+    });
+    expect(ok.status).toBe("OK");
+  });
+
+  it("system.doctor still flags dotted tool names (or a missing registry)", async () => {
+    const dotted = await agentReady({
+      store,
+      env: { DEEPSEEK_API_KEY: "test" },
+      audit: () => {},
+      registry: { functionSchemas: () => [{ function: { name: "finance.get_snapshot" } }] },
+    });
+    expect(dotted.status).toBe("FAIL");
+    expect(dotted.detail).toContain("finance.get_snapshot");
+
+    const none = await agentReady({ store, env: { DEEPSEEK_API_KEY: "test" }, audit: () => {} });
+    expect(none.status).toBe("FAIL");
+    expect(none.detail).toContain("Registry not attached");
+  });
+
+  it("system.doctor sees a bound ZARLINO_KV binding (no phantom KV warning)", async () => {
+    const tool = doctorTools().find((t) => t.name === "system.doctor")!;
+    const out = (await tool.run(
+      {
+        store,
+        env: { DEEPSEEK_API_KEY: "test", ZARLINO_KV: { get: async () => null, list: async () => ({ keys: [] }) } },
+        audit: () => {},
+      } as never,
+      { autoFix: false, trigger: "test" },
+    )) as { checks: Array<{ id: string; status: string; detail: string }> };
+    const check = out.checks.find((c) => c.id === "kv.health")!;
+    expect(check.status).toBe("OK");
+  });
 });

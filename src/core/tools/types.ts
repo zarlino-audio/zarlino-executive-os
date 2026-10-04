@@ -13,6 +13,9 @@ export type RiskLevel = "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
 export interface ToolContext {
   env: Record<string, string | undefined>;
   store?: ExecutiveStore;
+  /** The live registry (set when the worker executes tools) — lets meta-tools
+   *  like system.doctor verify the real tool names sent to the model. */
+  registry?: { functionSchemas(): Array<{ function: { name: string } }> };
   /** Record an audit event (actor/action/entity). Never throws. */
   audit(
     actor: string,
