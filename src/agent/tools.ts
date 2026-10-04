@@ -18,6 +18,7 @@ import { visionTools } from "../integrations/vision";
 import { paystackTools } from "../integrations/paystack";
 import { doctorTools } from "../core/doctor";
 import { prepareDispatch } from "../core/org/dispatch";
+import { findDuplicateTask, duplicateNote } from "../core/tasks/dedupe";
 import { assessFinancials } from "../core/finance/calc";
 import { createTask } from "../core/tasks/model";
 import {
@@ -234,6 +235,9 @@ function internalTools(): Tool[] {
       run: async (ctx: ToolContext, input: z.infer<typeof taskCreateSchema>) => {
         const store = ctx.store;
         if (!store) throw new Error("store unavailable");
+        // Never create a twin of work already on the board.
+        const dup = findDuplicateTask(store, input.title);
+        if (dup) return { ok: false, duplicate: true, existingId: dup.id, existingStatus: dup.status, note: duplicateNote(dup) };
         const task = createTask({
           title: input.title,
           description: input.description,
@@ -745,6 +749,7 @@ function internalTools(): Tool[] {
           task_id: input.taskId,
           prompt: decision.prompt,
           status: "PENDING",
+          meta_json: JSON.stringify({ investigation: decision.investigation, original_prompt: input.prompt }),
         });
         return {
           queued: true,
@@ -812,7 +817,7 @@ function internalTools(): Tool[] {
           task_id: input.taskId,
           prompt: decision.prompt,
           status: "PENDING",
-          meta_json: JSON.stringify(brief),
+          meta_json: JSON.stringify({ ...brief, investigation: decision.investigation, original_prompt: prompt }),
         });
         ctx.audit("executive", "local.task.delegated", "local_task", id, { taskId: input.taskId });
         return {

@@ -60,6 +60,25 @@ export function isInvestigationPrompt(prompt: string): boolean {
   return !ACTION_PATTERN.test(rest);
 }
 
+/**
+ * Clean a dispatch prompt before it is compared, wrapped or stored.
+ *
+ * Found live (2026-10-04): a prompt carrying a UTF-8 BOM as its first
+ * character made the dispatch route return a bare HTTP 500 - the kind of
+ * failure that looks like an OS bug and is actually an invisible byte. Strip
+ * the BOM and control characters, normalise line endings, and cap the size.
+ */
+export function sanitizePrompt(prompt: string): string {
+  return prompt
+    .replace(/\uFEFF/g, "")
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim()
+    .slice(0, 8000);
+}
+
 export interface DispatchDecision {
   ok: boolean;
   code?: "DUPLICATE" | "INVESTIGATION_LIMIT";
@@ -78,9 +97,45 @@ interface LocalTaskLike {
   result?: string | null;
   error?: string | null;
   created_at: string;
+  meta_json?: string | null;
 }
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** The OS preamble is a known block - strip it to get back to the real ask. */
+export function stripDirective(prompt: string): string {
+  const end = prompt.indexOf("[END DIRECTIVE]");
+  return end === -1 ? prompt : prompt.slice(end + "[END DIRECTIVE]".length).trim();
+}
+
+/**
+ * What was actually asked, regardless of the wrapper we added. New dispatches
+ * record it in meta_json; older rows fall back to stripping the preamble.
+ */
+export function originalPromptOf(t: LocalTaskLike): string {
+  try {
+    const meta = JSON.parse(t.meta_json ?? "{}") as { original_prompt?: unknown };
+    if (typeof meta.original_prompt === "string" && meta.original_prompt.trim()) return meta.original_prompt;
+  } catch {
+    /* fall through to the prompt itself */
+  }
+  return stripDirective(t.prompt ?? "");
+}
+
+/**
+ * Classify a queued task as research or work. Recorded intent wins, because the
+ * directive we prepend contains action words and would poison any text scan.
+ */
+export function localTaskIntent(t: LocalTaskLike): "research" | "work" {
+  try {
+    const meta = JSON.parse(t.meta_json ?? "{}") as { investigation?: unknown };
+    if (meta.investigation === true) return "research";
+    if (meta.investigation === false) return "work";
+  } catch {
+    /* fall through */
+  }
+  return isInvestigationPrompt(originalPromptOf(t)) ? "research" : "work";
+}
 
 /** Compare prompts by content, not byte-for-byte formatting. */
 export function promptKey(prompt: string): string {
@@ -113,7 +168,8 @@ export function prepareDispatch(
   input: { taskId?: string; prompt: string; now?: Date },
 ): DispatchDecision {
   const now = input.now ?? new Date();
-  const investigation = isInvestigationPrompt(input.prompt);
+  const prompt = sanitizePrompt(input.prompt);
+  const investigation = isInvestigationPrompt(prompt);
   let history: LocalTaskLike[] = [];
   try {
     history = recent(store, now);
@@ -121,8 +177,8 @@ export function prepareDispatch(
     history = [];
   }
 
-  const key = promptKey(input.prompt);
-  const samePrompt = history.find((t) => promptKey(t.prompt) === key);
+  const key = promptKey(prompt);
+  const samePrompt = history.find((t) => promptKey(originalPromptOf(t)) === key);
   if (samePrompt) {
     return {
       ok: false,
@@ -132,7 +188,7 @@ export function prepareDispatch(
       error:
         `DUPLICATE: this exact request was already dispatched as ${samePrompt.id} (${samePrompt.status}). ` +
         `Do not re-queue it — read that result (executive.get_local_task) and act on it, or change the ask.`,
-      prompt: input.prompt,
+      prompt,
     };
   }
 
@@ -151,7 +207,7 @@ export function prepareDispatch(
           `INVESTIGATION_LIMIT: a read-only pass for this task already completed (${latest.id}). ` +
           `Discovery is done — dispatch an ACTION that changes something (edit files, run the build/tests, produce the artifact). ` +
           `Existing evidence: ${gist || "(no text)"}`,
-        prompt: input.prompt,
+        prompt,
       };
     }
     const pending = forTask.find((t) => ["PENDING", "CLAIMED", "RUNNING"].includes(t.status));
@@ -162,12 +218,12 @@ export function prepareDispatch(
         investigation,
         existingId: pending.id,
         error: `DUPLICATE: a read-only pass for this task is already queued/running (${pending.id}). Wait for it instead of asking again.`,
-        prompt: input.prompt,
+        prompt,
       };
     }
   }
 
-  return { ok: true, investigation, prompt: wrapDispatch(input.prompt, evidenceBlock(store, input.taskId, history), investigation) };
+  return { ok: true, investigation, prompt: wrapDispatch(prompt, evidenceBlock(store, input.taskId, history), investigation) };
 }
 
 /** Prior evidence for the same task — so the machine never re-derives facts. */

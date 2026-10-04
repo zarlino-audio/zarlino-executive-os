@@ -130,4 +130,16 @@ describe("prepareDispatch", () => {
   it("normalises formatting when comparing", () => {
     expect(promptKey("Run   the TESTS!")).toBe(promptKey("run the tests"));
   });
+
+  it("survives a BOM or control bytes instead of crashing the route", () => {
+    // Live failure 2026-10-04: a prompt whose first character was a UTF-8 BOM
+    // returned a bare HTTP 500 from the dispatch route.
+    const bom = "\uFEFF";
+    const nasty = `${bom}Clone the missing repos and report per-repo status\u0007\u0000`;
+    const decision = prepareDispatch(store, { prompt: nasty, taskId: "tsk_bom" });
+    expect(decision.ok).toBe(true);
+    expect(decision.prompt).not.toContain(bom);
+    expect(decision.prompt).not.toContain("\u0007");
+    expect(decision.prompt).toContain("Clone the missing repos");
+  });
 });

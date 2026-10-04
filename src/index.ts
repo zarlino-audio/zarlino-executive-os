@@ -1,5 +1,5 @@
-/**
- * Zarlino Executive OS — Worker entry.
+﻿/**
+ * Zarlino Executive OS â€” Worker entry.
  *
  * A Cloudflare Worker + SQLite-backed Durable Object that runs the business:
  *   - `ExecutiveAgent` Durable Object holds the durable store (ExecutiveStore).
@@ -25,6 +25,8 @@ import { runCeoCycle } from "./core/org/ceo";
 import { resolveDaemonAgentId } from "./core/org/agents";
 import { handleInboundWhatsApp, DIGEST_APPROVALS_SETTING } from "./core/org/founder-channel";
 import { composeFounderDigest, cooldown, markFounderMessageSent, voiceStatus } from "./core/org/voice";
+import { prepareDispatch } from "./core/org/dispatch";
+import { findDuplicateTask, duplicateNote } from "./core/tasks/dedupe";
 import { artifactKey, normalizeArtifactPath, MAX_ARTIFACT_BYTES } from "./core/artifacts";
 import { escalateToFounder, sendWhatsApp } from "./integrations/whatsapp";
 import { OUTREACH_TEMPLATES, outreachDailyCap, maybeAutoReply, recordProspectReply, runFollowUps, runOutreachCycle, sendOutreachNow } from "./core/outreach";
@@ -226,7 +228,7 @@ interface ChatDelta {
 
 /**
  * Build the provider request body. Tool names are sanitized for the wire
- * (DeepSeek forbids dots in names). Transcript hygiene is enforced here too —
+ * (DeepSeek forbids dots in names). Transcript hygiene is enforced here too â€”
  * never put an assistant `tool_calls` message without one `tool` response per
  * id on the wire (instant HTTP 400); single pass, no-op when already valid.
  */
@@ -262,7 +264,7 @@ function recordChatCost(
   //
   // The meter is handed the REAL store on purpose. This function used to pass a
   // shim ({ record: recordCost, addTokenUse: () => {} }) that wrote the
-  // model_costs ledger and THREW AWAY the token_budgets increment — every real
+  // model_costs ledger and THREW AWAY the token_budgets increment â€” every real
   // provider call was therefore invisible to the budget meter, and the two
   // halves of the same feature could never agree. meterModelCall is now the
   // single writer for both tables: there is no path that writes one without
@@ -332,9 +334,9 @@ async function callDeepSeek(
 
 /**
  * Streaming completion (audit gap 1): forwards content + reasoning deltas to
- * `onDelta` as they arrive and assembles the final assistant message —
+ * `onDelta` as they arrive and assembles the final assistant message â€”
  * including `tool_calls`, whose id/name/arguments arrive as fragments spread
- * across deltas — exactly like the non-streaming path. `signal` makes stop
+ * across deltas â€” exactly like the non-streaming path. `signal` makes stop
  * (audit gap 6) actually cancel the in-flight provider request.
  */
 async function callDeepSeekStream(
@@ -431,7 +433,7 @@ async function callDeepSeekStream(
   return message;
 }
 
-/** Models the chat may run on (audit gap 10 — no more hardcoded single model). */
+/** Models the chat may run on (audit gap 10 â€” no more hardcoded single model). */
 const CHAT_MODELS = ["deepseek-chat", "deepseek-reasoner"] as const;
 const DEFAULT_CHAT_MODEL = "deepseek-chat";
 
@@ -457,14 +459,14 @@ function attachmentManifest(list: unknown): string {
     parts.push(`${name} (id=${id}${kind})`);
   }
   if (parts.length === 0) return "";
-  return `[attachments] ${parts.join(", ")} — read them with executive.get_file { id } when relevant.`;
+  return `[attachments] ${parts.join(", ")} â€” read them with executive.get_file { id } when relevant.`;
 }
 
-const SYSTEM_PROMPT = `You are the Zarlino Executive OS — the autonomous operator of Zarlino Audio, a small audio-plugins company (ZTame, ZScorch). You run the business through tools and a durable store.
+const SYSTEM_PROMPT = `You are the Zarlino Executive OS â€” the autonomous operator of Zarlino Audio, a small audio-plugins company (ZTame, ZScorch). You run the business through tools and a durable store.
 
 Working rules:
-1. Use tools to gather facts before asserting them. Never fabricate numbers (doctrine: HONEST_NUMBERS) — say UNKNOWN instead.
-2. HIGH-risk / irreversible actions (spending money, deploys, cache purges) are gated behind Founder approval — never execute them yourself; request an approval or flag the Founder.
+1. Use tools to gather facts before asserting them. Never fabricate numbers (doctrine: HONEST_NUMBERS) â€” say UNKNOWN instead.
+2. HIGH-risk / irreversible actions (spending money, deploys, cache purges) are gated behind Founder approval â€” never execute them yourself; request an approval or flag the Founder.
 3. Audit-worthy actions are recorded automatically by the tool registry.
 4. Keep replies concise and actionable. Use markdown for structure.
 5. When the Founder asks, run the System Doctor (system.doctor) to check and repair the system; run maintenance (system.maintenance) when housekeeping is needed.
@@ -499,7 +501,7 @@ async function agentLoop(opts: {
   onChunk?: (text: string) => void;
   /** When set, the model is called with `stream: true` and every delta is forwarded. */
   onDelta?: (d: ChatDelta) => void;
-  /** Progress narration for the UI ("running web.search", …). */
+  /** Progress narration for the UI ("running web.search", â€¦). */
   onStatus?: (status: { label: string; tool?: string }) => void;
   /** Cancels the in-flight provider call (founder pressed stop). */
   signal?: AbortSignal;
@@ -507,7 +509,7 @@ async function agentLoop(opts: {
   maxIterations?: number;
 }): Promise<{ text: string; iterations: number; toolsCalled: number; limitReached: boolean }> {
   const apiKey = opts.env.DEEPSEEK_API_KEY;
-  if (!apiKey) throw new Error("DEEPSEEK_API_KEY not configured — set it as a Worker secret.");
+  if (!apiKey) throw new Error("DEEPSEEK_API_KEY not configured â€” set it as a Worker secret.");
   const model = opts.model ?? "deepseek-chat";
   const store = opts.store;
   const maxIter = opts.maxIterations ?? 8;
@@ -581,15 +583,15 @@ async function agentLoop(opts: {
         toolsCalled++;
         // Map the provider-sanitized name back to the real tool before running.
         const realName = opts.registry.resolveName(call.function.name);
-        // AOrgI §10 capability governance: agent → capability check →
-        // governance check → autonomy check → tool. This loop is executed by
+        // AOrgI Â§10 capability governance: agent â†’ capability check â†’
+        // governance check â†’ autonomy check â†’ tool. This loop is executed by
         // the registered `executive_do_01` instance (role_coa); DENY/REVIEW
         // blocks the tool and is reported back to the model + governance.
         const toolDef = opts.registry.getTool(realName);
         const capability = toolDef?.requiredPermission ?? "execute";
         const gate = store.capabilityVerdictForAgent("executive_do_01", capability, realName);
         if (gate.verdict !== "ALLOW") {
-          // §11 hard-constraint handling: BLOCK → LOG → ESCALATE. The call is
+          // Â§11 hard-constraint handling: BLOCK â†’ LOG â†’ ESCALATE. The call is
           // blocked here; the audit row is the LOG; the message is the ESCALATE.
           const message =
             gate.verdict === "DENY"
@@ -653,12 +655,12 @@ async function agentLoop(opts: {
       continue;
     }
     const text = String(reply.content ?? "");
-    // With true streaming the text already reached the client delta-by-delta —
+    // With true streaming the text already reached the client delta-by-delta â€”
     // re-sending the whole reply through onChunk would duplicate it.
     if (!opts.onDelta) opts.onChunk?.(text);
     return { text, iterations, toolsCalled, limitReached: false };
   }
-  // Ran out of iterations while still requesting tools — the caller decides
+  // Ran out of iterations while still requesting tools â€” the caller decides
   // whether to mark DONE (chat) or auto-continue (long-horizon runs).
   const text = "Reached the tool-call limit for this turn. Narrow the request or ask to continue.";
   opts.onChunk?.(text);
@@ -675,7 +677,7 @@ function safeParseArgs(raw: string): Record<string, unknown> {
 }
 
 function truncate(s: string, n: number): string {
-  return s.length > n ? s.slice(0, n) + "\n…(truncated)" : s;
+  return s.length > n ? s.slice(0, n) + "\nâ€¦(truncated)" : s;
 }
 
 // ---------------------------------------------------------------------------
@@ -693,13 +695,13 @@ function startAutoRunnable(store: ExecutiveStore, maxJobs: number): { started: s
     if (store.pendingApprovalForTask(t.id)) continue;
     if (store.hasRunningRunForTask(t.id)) continue;
     // Backoff: don't immediately re-spawn a run for a task whose last run just
-    // failed (e.g. DeepSeek 402) — that would churn a run every wake.
+    // failed (e.g. DeepSeek 402) â€” that would churn a run every wake.
     if (store.hasRecentFailedRunForTask(t.id)) continue;
     const now = nowIso();
     store.createAgentRun({
       id: newId("run"),
       task_id: t.id,
-      prompt: `AUTO-RUN task: ${t.title}\n\n${t.description ?? ""}\n\nWork through PLAN → IMPLEMENT → VERIFY → REPORT using your tools, then mark the task DONE if the work is complete, or report what is blocking.`,
+      prompt: `AUTO-RUN task: ${t.title}\n\n${t.description ?? ""}\n\nWork through PLAN â†’ IMPLEMENT â†’ VERIFY â†’ REPORT using your tools, then mark the task DONE if the work is complete, or report what is blocking.`,
       status: "RUNNING",
       iterations: 0,
       tools_called: 0,
@@ -716,7 +718,7 @@ function startAutoRunnable(store: ExecutiveStore, maxJobs: number): { started: s
 }
 
 /**
- * Resume resumable long-horizon runs — restart orphans (FAILED, 0 iterations —
+ * Resume resumable long-horizon runs â€” restart orphans (FAILED, 0 iterations â€”
  * no tool side-effects happened, so re-running is lossless) AND limit-reached
  * runs (STOPPED with an auto-continue note + a durable checkpoint). Bounded by
  * the same concurrency budget as startAutoRunnable; skips tasks that are
@@ -750,7 +752,7 @@ function resumeInterruptedRuns(store: ExecutiveStore, maxJobs: number): { resume
 async function executeAgentRun(store: ExecutiveStore, registry: ToolRegistry, env: Env, run: AgentRun): Promise<void> {
   // Long-horizon runs get a real per-sweep iteration budget; when they hit it
   // they are marked STOPPED and the maintenance sweep AUTO-CONTINUES them from
-  // their checkpoint (see resumeInterruptedRuns) — so a run can work all day,
+  // their checkpoint (see resumeInterruptedRuns) â€” so a run can work all day,
   // bounded only by the AI spend gate, not an arbitrary call count.
   const maxIter = Math.max(1, Math.min(60, Number(env.MAX_RUN_ITERATIONS) || 40));
   try {
@@ -762,12 +764,12 @@ async function executeAgentRun(store: ExecutiveStore, registry: ToolRegistry, en
         const parsed = JSON.parse(run.checkpoint_json) as ChatMsg[];
         if (Array.isArray(parsed) && parsed.length > 0 && parsed[0]?.role === "system") {
           // Heal checkpoints written by builds whose trim could split a
-          // tool-call group — otherwise every resume of this run replays the
+          // tool-call group â€” otherwise every resume of this run replays the
           // same invalid request and fails with HTTP 400 forever.
           initial = repairToolCallSequence(parsed);
         }
       } catch {
-        /* malformed checkpoint — fall back to the prompt */
+        /* malformed checkpoint â€” fall back to the prompt */
       }
     }
     const result = await agentLoop({
@@ -780,9 +782,9 @@ async function executeAgentRun(store: ExecutiveStore, registry: ToolRegistry, en
       maxIterations: maxIter,
     });
     if (result.limitReached) {
-      // Not finished — keep it resumable; the sweep auto-continues it.
+      // Not finished â€” keep it resumable; the sweep auto-continues it.
       // Deliberately NOT marking the task DONE (it isn't).
-      store.finishAgentRun(run.id, "STOPPED", undefined, `Hit the ${maxIter}-iteration per-sweep limit — auto-continue scheduled.`);
+      store.finishAgentRun(run.id, "STOPPED", undefined, `Hit the ${maxIter}-iteration per-sweep limit â€” auto-continue scheduled.`);
       return;
     }
     store.finishAgentRun(run.id, "DONE", result.text);
@@ -850,7 +852,7 @@ function buildOverview(store: ExecutiveStore, env: Env): Record<string, unknown>
           autoFix: doctor.auto_fix === 1,
           summary: safeJson(doctor.summary_json, null),
         }
-      : { lastRunAt: null, note: "Doctor has not run yet — it runs on DO wake." },
+      : { lastRunAt: null, note: "Doctor has not run yet â€” it runs on DO wake." },
     maintenance: { staleAgentRuns: stuck.staleAgentRuns, expiredLocalLeases: stuck.expiredLeases },
     budget: {
       daily: overrides.aiDailyBudget ?? (Number(env.AI_DAILY_BUDGET) || 0),
@@ -960,7 +962,7 @@ export class ExecutiveAgent {
     this.state.blockConcurrencyWhile(async () => {
       this.store.migrate();
       // AOrgI registry: the DO runtime registers itself as the real instance
-      // behind the Chief Operating Agent role (AOrgI §5, §7 — instances exist
+      // behind the Chief Operating Agent role (AOrgI Â§5, Â§7 â€” instances exist
       // only when a runtime actually runs). Refreshed on every wake.
       this.store.upsertOrgAgent({
         id: "executive_do_01",
@@ -1017,7 +1019,7 @@ export class ExecutiveAgent {
     } catch {
       /* productivity maintenance must never break wake */
     }
-    // Organizational analyst (AOrgI §36): self-observation on every sweep —
+    // Organizational analyst (AOrgI Â§36): self-observation on every sweep â€”
     // pure SQL computation, no model calls, cheap and safe.
     try {
       runOrgAnalyst(this.store, trigger);
@@ -1025,7 +1027,7 @@ export class ExecutiveAgent {
       /* analyst must never break wake */
     }
     // CEO agent: decide what policy allows, escalate the rest to the founder
-    // on WhatsApp — one message per cycle, never theater.
+    // on WhatsApp â€” one message per cycle, never theater.
     try {
       await runCeoCycle(this.store, this.env, trigger);
     } catch {
@@ -1051,7 +1053,7 @@ export class ExecutiveAgent {
       /* follow-ups must never break wake */
     }
     // Start + resume long-horizon runs (bounded, "automate fixing"). Runs are
-    // executed on EVERY maintenance sweep — on wake via state.waitUntil (keeps
+    // executed on EVERY maintenance sweep â€” on wake via state.waitUntil (keeps
     // the DO alive without blocking the request) so a run can never sit as a
     // 0-iteration orphan again, and on alarm/cron awaited in order.
     const maxJobs = Math.max(0, Math.min(3, Number(this.env.MAX_AUTO_JOBS) || 2));
@@ -1069,7 +1071,7 @@ export class ExecutiveAgent {
     }
     // Arm the alarm WITHOUT deferring an already-pending one. Frequent cold
     // starts (console polls) used to re-arm it to +5min every wake, starving
-    // the alarm path — the very reason auto-runs piled up un-executed.
+    // the alarm path â€” the very reason auto-runs piled up un-executed.
     try {
       const current = await this.state.storage.getAlarm();
       const next = Date.now() + (trigger === "wake" ? 5 * 60 * 1000 : ALARM_INTERVAL_MS);
@@ -1300,7 +1302,7 @@ export class ExecutiveAgent {
       return json({ ...r, autoReply });
     }
 
-    // Public health (no auth) — minimal info for uptime monitors.
+    // Public health (no auth) â€” minimal info for uptime monitors.
     if (method === "GET" && path === "/api/health") {
       const doctor = this.store.latestDoctorLog();
       return json({
@@ -1323,7 +1325,7 @@ export class ExecutiveAgent {
     if (path === "/api/auth/bootstrap" && method === "POST") return this.handleBootstrap(request);
     if (path === "/api/auth/change-password" && method === "POST") return this.handleChangePassword(request);
 
-    // MCP — the READ-ONLY inspection plane for external AI clients (JSON-RPC
+    // MCP â€” the READ-ONLY inspection plane for external AI clients (JSON-RPC
     // 2.0 over POST). Authenticated like everything else; no mutating tools.
     if (path === "/mcp") {
       if (method === "GET") {
@@ -1355,7 +1357,7 @@ export class ExecutiveAgent {
       return json(buildOverview(this.store, this.env));
     }
 
-    // Executive control — the Founder's kill-switches + autonomy dials.
+    // Executive control â€” the Founder's kill-switches + autonomy dials.
     if (path === "/api/executive/control" && method === "POST") {
       const body = (await readBody<{
         paused?: boolean;
@@ -1421,7 +1423,7 @@ export class ExecutiveAgent {
       return json({ logs: this.store.listDoctorLogs(20) });
     }
 
-    // Production reset — hands the whole company over to a new operator on a
+    // Production reset â€” hands the whole company over to a new operator on a
     // clean slate. Requires the confirmation phrase to fire; nothing is ever
     // deleted. The FULL backup is persisted to KV (one table at a time, so the
     // DO isolate never materialises the whole DB in memory) and the response
@@ -1520,12 +1522,12 @@ export class ExecutiveAgent {
     }
     // Session deletion (housekeeping): a stale test/debug session must not linger
     // and pollute the context an agent or the founder sees. The `default`
-    // session cannot be deleted here — clear it instead.
+    // session cannot be deleted here â€” clear it instead.
     if (path === "/api/chat/delete" && method === "POST") {
       const body = (await readBody<{ sessionId?: string; sessionIds?: string[] }>(request).catch(() => ({}))) as { sessionId?: string; sessionIds?: string[] };
       const ids = (body.sessionIds?.length ? body.sessionIds : body.sessionId ? [body.sessionId] : []).filter((s) => Boolean(s) && s !== "default");
       if (ids.length === 0) {
-        return json({ error: "sessionId or sessionIds required (the 'default' session cannot be deleted — clear it instead)" }, 400);
+        return json({ error: "sessionId or sessionIds required (the 'default' session cannot be deleted â€” clear it instead)" }, 400);
       }
       for (const id of ids) this.store.deleteChatSession(id);
       this.store.insertAudit({
@@ -1632,8 +1634,8 @@ export class ExecutiveAgent {
       }
     }
 
-    // Artifacts (R2): large durable outputs — renders, build packages, shots
-    // and reports live outside the DO (mandate §25). Keys are generated by the
+    // Artifacts (R2): large durable outputs â€” renders, build packages, shots
+    // and reports live outside the DO (mandate Â§25). Keys are generated by the
     // server; reads accept only validated `artifacts/` keys.
     if (path === "/api/artifacts" && method === "POST") {
       if (!this.env.ARTIFACTS) return json({ error: "Artifact storage not configured (R2 binding ARTIFACTS missing)" }, 503);
@@ -1725,6 +1727,8 @@ export class ExecutiveAgent {
     if (path === "/api/tasks" && method === "POST") {
       const body = (await readBody<{ title?: string; description?: string; priority?: string }>(request).catch(() => ({}))) as { title?: string; description?: string; priority?: string };
       if (!body.title || !body.title.trim()) return json({ error: "title required" }, 400);
+      const dup = findDuplicateTask(this.store, body.title);
+      if (dup) return json({ ok: false, duplicate: true, existingId: dup.id, existingStatus: dup.status, note: duplicateNote(dup) }, 409);
       const task = createTask({ title: body.title, description: body.description, priority: body.priority as never, source: "founder" });
       this.store.insertTask(task);
       return json({ ok: true, id: task.id });
@@ -2089,7 +2093,7 @@ export class ExecutiveAgent {
       return json({ model, ok: !!winner, winner, variants, ledger: neuronLedger(this.store, this.env) });
     }
 
-    // Review queue — remote operator vetting of produced work (sound / UI / artifacts)
+    // Review queue â€” remote operator vetting of produced work (sound / UI / artifacts)
     if (path === "/api/reviews" && method === "GET") {
       const status = url.searchParams.get("status") ?? undefined;
       return json({ reviews: this.store.listReviewItems({ status: status as never, limit: 100 }) });
@@ -2178,7 +2182,7 @@ export class ExecutiveAgent {
     }
     const agentDeregister = /^\/api\/org\/agents\/([^/]+)$/.exec(path);
     if (agentDeregister && method === "DELETE") {
-      // Deregister a dead instance (the Doctor's stale-agent action, §31).
+      // Deregister a dead instance (the Doctor's stale-agent action, Â§31).
       const id = decodeURIComponent(agentDeregister[1]!);
       const agent = this.store.getOrgAgent(id);
       if (!agent) return json({ error: "Agent not found" }, 404);
@@ -2265,7 +2269,7 @@ export class ExecutiveAgent {
       const id = decodeURIComponent(memoryPatch[1]!);
       const body = (await readBody<{ value?: unknown; expected_version?: number; author?: string }>(request).catch(() => ({}))) as Record<string, unknown>;
       if (body.value === undefined) return json({ error: "value required" }, 400);
-      if (typeof body.expected_version !== "number") return json({ error: "expected_version (number) required — READ the entry, then WRITE with its version (§14)" }, 400);
+      if (typeof body.expected_version !== "number") return json({ error: "expected_version (number) required â€” READ the entry, then WRITE with its version (Â§14)" }, 400);
       const result = this.store.updateOrgMemory(id, {
         value: body.value,
         expectedVersion: body.expected_version,
@@ -2273,7 +2277,7 @@ export class ExecutiveAgent {
       });
       if (result.status === "not_found") return json({ error: "Memory entry not found" }, 404);
       if (result.status === "conflict") {
-        return json({ error: "ORG_MEMORY_CONFLICT", message: "Version mismatch — someone else wrote first. Re-read, merge, retry (§14: never silently overwrite).", current: result.record }, 409);
+        return json({ error: "ORG_MEMORY_CONFLICT", message: "Version mismatch â€” someone else wrote first. Re-read, merge, retry (Â§14: never silently overwrite).", current: result.record }, 409);
       }
       return json({ ok: true, entry: result.record });
     }
@@ -2663,7 +2667,7 @@ export class ExecutiveAgent {
       return json(perceptualKpi(this.store));
     }
 
-    // Evaluators (external human sensor network — NOT employees, spec §5)
+    // Evaluators (external human sensor network â€” NOT employees, spec Â§5)
     if (path === "/api/perceptual/evaluators" && method === "GET") {
       const actorType = url.searchParams.get("actorType") ?? undefined;
       return json({ evaluators: this.store.listPerceptualEvaluators({ actorType, limit: 200 }) });
@@ -2712,7 +2716,7 @@ export class ExecutiveAgent {
       return json({ deleted: this.store.deletePerceptualEvaluator(decodeURIComponent(evaluatorDelete[1]!)) });
     }
 
-    // Test registry (spec §6)
+    // Test registry (spec Â§6)
     if (path === "/api/perceptual/tests" && method === "GET") {
       const productId = url.searchParams.get("productId") ?? undefined;
       const status = url.searchParams.get("status") ?? undefined;
@@ -2782,7 +2786,7 @@ export class ExecutiveAgent {
       return json({ ok: true, test: this.store.getPerceptualTest(id) });
     }
 
-    // Results — APPEND-ONLY (spec §9): no PATCH/DELETE routes exist.
+    // Results â€” APPEND-ONLY (spec Â§9): no PATCH/DELETE routes exist.
     const testResults = /^\/api\/perceptual\/tests\/([^/]+)\/results$/.exec(path);
     if (testResults && method === "GET") {
       const testId = decodeURIComponent(testResults[1]!);
@@ -2838,7 +2842,7 @@ export class ExecutiveAgent {
       return json({ aggregation: agg, knowledgeDraft: deriveKnowledge(test, agg) });
     }
 
-    // Product validation gates (spec §14)
+    // Product validation gates (spec Â§14)
     if (path === "/api/perceptual/validations" && method === "GET") {
       return json({ validations: this.store.listProductValidations().map((v) => ({ ...v, evaluation: evaluateProductGates(v) })) });
     }
@@ -2885,7 +2889,7 @@ export class ExecutiveAgent {
       return json({ ok: true, validation: { ...row, evaluation: evaluateProductGates(row as never) } });
     }
 
-    // Knowledge base (spec §27-29)
+    // Knowledge base (spec Â§27-29)
     if (path === "/api/perceptual/knowledge" && method === "GET") {
       const productCategory = url.searchParams.get("productCategory") ?? undefined;
       const evidenceTier = url.searchParams.get("evidenceTier") ?? undefined;
@@ -2919,7 +2923,7 @@ export class ExecutiveAgent {
       return json({ deleted: this.store.deletePerceptualKnowledge(decodeURIComponent(knowledgeDelete[1]!)) });
     }
 
-    // Failure taxonomy (spec §39)
+    // Failure taxonomy (spec Â§39)
     if (path === "/api/perceptual/failures" && method === "GET") {
       const productId = url.searchParams.get("productId") ?? undefined;
       return json({ failures: this.store.listFailureAnalyses({ productId, limit: 200 }) });
@@ -2947,7 +2951,7 @@ export class ExecutiveAgent {
       const tool = registry.getTool(body.name ?? "");
       if (!tool) return json({ error: `Unknown tool: ${body.name}` }, 404);
       if ((tool.riskLevel === "HIGH" || tool.riskLevel === "CRITICAL") && body.confirm !== true) {
-        return json({ error: `Tool ${body.name} is ${tool.riskLevel} risk — pass confirm:true to execute.`, riskLevel: tool.riskLevel }, 403);
+        return json({ error: `Tool ${body.name} is ${tool.riskLevel} risk â€” pass confirm:true to execute.`, riskLevel: tool.riskLevel }, 403);
       }
       const result = await registry.run(tool.name, body.input ?? {}, {
         env: this.env as unknown as Record<string, string | undefined>,
@@ -3098,7 +3102,7 @@ export class ExecutiveAgent {
       return json(this.buildDataBundle());
     }
 
-    // Pipeline gates (PATCH) — founder/agent updates a single gate.
+    // Pipeline gates (PATCH) â€” founder/agent updates a single gate.
     const gateMatch = /^\/api\/pipeline\/gates\/([^/]+)$/.exec(path);
     if (gateMatch && method === "PATCH") {
       const body = (await readBody<{ status?: string; note?: string }>(request).catch(() => ({}))) as { status?: string; note?: string };
@@ -3201,7 +3205,7 @@ export class ExecutiveAgent {
     // Contacts
     if (path === "/api/contacts" && method === "GET") return json({ contacts: this.store.listContacts() });
 
-    // Outreach pipeline (growth — migration v35). Founder-authenticated API.
+    // Outreach pipeline (growth â€” migration v35). Founder-authenticated API.
     if (path === "/api/outreach/prospects" && method === "GET") {
       const status = url.searchParams.get("status") ?? undefined;
       return json({ prospects: this.store.listProspects({ status: status ?? undefined }), counts: this.store.countProspectsByStatus() });
@@ -3303,7 +3307,7 @@ export class ExecutiveAgent {
     const runContinue = /^\/api\/agents\/runs\/([^/]+)\/continue$/.exec(path);
     if (runContinue && method === "POST") {
       const id = decodeURIComponent(runContinue[1]!);
-      // Any run by id — the old top-100-window scan 404'd old runs even when
+      // Any run by id â€” the old top-100-window scan 404'd old runs even when
       // they existed (and the window shrank as more runs were recorded).
       const run = this.store.getAgentRun(id);
       if (!run) return json({ error: "Run not found" }, 404);
@@ -3312,7 +3316,7 @@ export class ExecutiveAgent {
       // on a finished outcome and puts a stale checkpoint back on the wire.
       const runTask = run.task_id ? this.store.getTask(run.task_id) : null;
       if (runTask && (runTask.status === "DONE" || runTask.status === "CANCELLED")) {
-        return json({ error: `Task ${runTask.id} is ${runTask.status} — nothing to continue; create a new task instead` }, 409);
+        return json({ error: `Task ${runTask.id} is ${runTask.status} â€” nothing to continue; create a new task instead` }, 409);
       }
       this.store.resetAgentRun(id);
       // Actually re-execute the reopened run instead of leaving it RUNNING
@@ -3325,10 +3329,10 @@ export class ExecutiveAgent {
     if (path === "/api/local-agent/heartbeat" && method === "POST") {
       const body = (await readBody<{ host?: string; version?: string; pid?: string; claimed?: boolean; agent_id?: string }>(request).catch(() => ({}))) as { host?: string; version?: string; pid?: string; claimed?: boolean; agent_id?: string };
       // Each physical runtime registers under its own instance id (validated;
-      // role is pinned — a heartbeat can never grant itself a role).
+      // role is pinned â€” a heartbeat can never grant itself a role).
       const agentId = resolveDaemonAgentId(body.agent_id);
       this.store.upsertLocalAgentHeartbeat({ host: body.host, version: body.version, pid: body.pid, claimed: body.claimed, id: agentId });
-      // AOrgI registry: the daemon is a real runtime instance — register it
+      // AOrgI registry: the daemon is a real runtime instance â€” register it
       // (software-engineering role: it executes local build/render/tooling
       // capability) with the same heartbeat so org liveness is honest.
       this.store.upsertOrgAgent({
@@ -3347,6 +3351,41 @@ export class ExecutiveAgent {
     if (path === "/api/local-tasks" && method === "GET") {
       return json({ tasks: this.store.listLocalTasks(50) });
     }
+    // Founder override: queue work for the always-on machine by hand. Goes
+    // through the same dispatch policy as the agent, so a duplicate or a
+    // repeated research pass is refused with the reason (and the existing id).
+    if (path === "/api/local-tasks" && method === "POST") {
+      const body = (await readBody<{ prompt?: string; taskId?: string }>(request).catch(() => ({}))) as { prompt?: string; taskId?: string };
+      if (!body.prompt || !body.prompt.trim()) return json({ error: "prompt required" }, 400);
+      const decision = prepareDispatch(this.store, { prompt: body.prompt.trim(), taskId: body.taskId });
+      if (!decision.ok) {
+        return json({ ok: false, refused: true, code: decision.code, existingId: decision.existingId, error: decision.error }, 409);
+      }
+      const id = newId("ltk");
+      const at = nowIso();
+      this.store.createLocalTask({
+        id,
+        created_at: at,
+        updated_at: at,
+        source: "founder",
+        task_id: body.taskId,
+        prompt: decision.prompt,
+        status: "PENDING",
+        meta_json: JSON.stringify({ investigation: decision.investigation, original_prompt: body.prompt.trim() }),
+      });
+      this.store.insertAudit({
+        id: newId("aud"),
+        actor: "founder",
+        action: "local_tasks.dispatch",
+        entity_type: "local_tasks",
+        entity_id: id,
+        detail_json: JSON.stringify({ task_id: body.taskId ?? null, discovery: decision.investigation }),
+        source: "api",
+        created_at: at,
+        updated_at: at,
+      });
+      return json({ ok: true, taskId: id, discovery: decision.investigation });
+    }
     if (path === "/api/local-tasks/claim" && method === "POST") {
       const body = (await readBody<{ claimer?: string }>(request).catch(() => ({}))) as { claimer?: string };
       const task = this.store.claimLocalTask(body.claimer ?? "api");
@@ -3360,12 +3399,12 @@ export class ExecutiveAgent {
     if (path === "/api/local-tasks/finish" && method === "POST") {
       const body = (await readBody<{ id?: string; status?: string; result?: string; error?: string; agent_id?: string }>(request).catch(() => ({}))) as { id?: string; status?: string; result?: string; error?: string; agent_id?: string };
       this.store.finishLocalTask(body.id ?? "", (body.status === "FAILED" ? "FAILED" : "DONE") as never, body.result, body.error);
-      // AOrgI Phase 2 — every finished local task is real evidence and a real
+      // AOrgI Phase 2 â€” every finished local task is real evidence and a real
       // protocol message, not theater: trust for the daemon's local-execution
       // capability moves with measured outcomes; the COA receives a RESULT
       // (or DEVIATION on failure) message tied to the task.
       // Attribute the outcome to the instance that finished (two-runtime
-      // honesty, AOrgI §7) — never to a hardcoded default.
+      // honesty, AOrgI Â§7) â€” never to a hardcoded default.
       this.store.recordTrustEvidence(resolveDaemonAgentId(body.agent_id), "local_execution", body.status !== "FAILED");
       this.store.sendOrgMessage({
         fromRole: "role_software_engineering",
@@ -3456,8 +3495,8 @@ export class ExecutiveAgent {
   /**
    * Execute one chat turn with real provider streaming (gap 1), codepoint-safe
    * frame batching (gap 26) and true cancellation (gap 6). Persists the
-   * assistant message — including a partial answer when the founder stopped
-   * mid-reply — and best-effort names a brand-new conversation (gap 26).
+   * assistant message â€” including a partial answer when the founder stopped
+   * mid-reply â€” and best-effort names a brand-new conversation (gap 26).
    */
   private async executeChatTurn(
     sessionId: string,
@@ -3471,7 +3510,7 @@ export class ExecutiveAgent {
 
     // Frames are JSON ({text}/{reasoning}/{status}/{cancelled}) so the relay can
     // pass them straight through. They are batched (one write per ~200ms, not
-    // per token) and a flush never splits a UTF-16 surrogate pair — splitting
+    // per token) and a flush never splits a UTF-16 surrogate pair â€” splitting
     // one would decode as mojibake / U+FFFD mid-emoji.
     let queue: string[] = [];
     let pending = "";
@@ -3565,7 +3604,7 @@ export class ExecutiveAgent {
   /**
    * LLM auto-title (gap 26): one cheap, tool-less call to name a brand-new
    * conversation. Skipped when a title already exists (a founder rename wins)
-   * and never throws — a missing title is cosmetic.
+   * and never throws â€” a missing title is cosmetic.
    */
   private maybeGenerateTitle(sessionId: string, transcript: ChatMsg[], reply: string): void {
     try {
@@ -3584,7 +3623,7 @@ export class ExecutiveAgent {
             ],
             this.buildRegistry(),
             // The real store, not an empty function. An unmetered title call is real
-            // provider spend that no meter ever sees — the same defect class as
+            // provider spend that no meter ever sees â€” the same defect class as
             // the budget/ledger split, at a smaller scale.
             this.store,
             "deepseek-chat",
@@ -3749,8 +3788,8 @@ async function handleChatSse(request: Request, env: Env): Promise<Response> {
           }
           const data = (await res.json()) as { chunks: string[]; nextIndex: number; complete: boolean; error?: string };
           for (const chunk of data.chunks ?? []) {
-            // Frames are stored pre-encoded ({"text":…}/{"reasoning":…}/{"status":…}/{"cancelled":true}).
-            // Legacy rows hold raw strings — wrap those so old streams still work.
+            // Frames are stored pre-encoded ({"text":â€¦}/{"reasoning":â€¦}/{"status":â€¦}/{"cancelled":true}).
+            // Legacy rows hold raw strings â€” wrap those so old streams still work.
             let frame = chunk;
             try {
               JSON.parse(chunk);
@@ -3779,7 +3818,7 @@ async function handleChatSse(request: Request, env: Env): Promise<Response> {
       }
     },
     cancel() {
-      /* client disconnected — stop polling (the DO keeps working; POST /api/chat/stop cancels that) */
+      /* client disconnected â€” stop polling (the DO keeps working; POST /api/chat/stop cancels that) */
     },
   });
 
@@ -3879,7 +3918,7 @@ async function runExternalChecks(
 
   // DeepSeek balance sentinel (the "top up without me" piece): reads the live
   // balance, keeps it in KV for /api/ops/monitor, and alerts through BOTH
-  // channels when it falls below AI_BALANCE_WARN_USD — at most once per 24h.
+  // channels when it falls below AI_BALANCE_WARN_USD â€” at most once per 24h.
   let deepseekBalance: number | null = null;
   if (env.DEEPSEEK_API_KEY) {
     try {
@@ -4021,7 +4060,7 @@ export default {
       }
       return json({ error: "Method not allowed" }, 405);
     }
-    // NOTE: /mcp must stay in this forward condition — the read-only MCP
+    // NOTE: /mcp must stay in this forward condition â€” the read-only MCP
     // plane lives on the DO, and dropping it 404s the whole plane (regression
     // guard in test/mcp.test.ts asserts this line).
     if (path.startsWith("/api/") || path === "/mcp") {
@@ -4038,7 +4077,7 @@ export default {
     if (env.ASSETS) {
       return env.ASSETS.fetch(request);
     }
-    return json({ error: "Executive OS API only — build the console (npm run build:console) to enable assets." }, 404);
+    return json({ error: "Executive OS API only â€” build the console (npm run build:console) to enable assets." }, 404);
   },
 
   async scheduled(controller: ScheduledController, env: Env): Promise<void> {
@@ -4055,7 +4094,7 @@ export default {
       controller.noRetry();
       return;
     }
-    // Daily: export the whole OS database to R2 (kept 30 deep) — scheduled,
+    // Daily: export the whole OS database to R2 (kept 30 deep) â€” scheduled,
     // offsite, and independent of any local machine.
     if (controller.cron === "15 3 * * *") {
       try {

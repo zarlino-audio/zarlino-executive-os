@@ -22,7 +22,7 @@ import { newId } from "../ids";
 import { evaluateProductGates } from "./perceptual/manager";
 import { neuronLedger, DEFAULT_EXEC_MODEL } from "../integrations/workersai";
 import { voiceStatus, type VoiceEnv } from "./org/voice";
-import { isInvestigationPrompt } from "./org/dispatch";
+import { isInvestigationPrompt, localTaskIntent, originalPromptOf } from "./org/dispatch";
 export interface DoctorContext {
   store: ExecutiveStore;
   env: Record<string, string | undefined>;
@@ -516,8 +516,8 @@ export const DOCTOR_CHECKS: DoctorCheck[] = [
         const at = Date.parse(t.created_at ?? "");
         return Number.isFinite(at) && at >= since;
       });
-      const probes = tasks.filter((t) => isInvestigationPrompt(t.prompt));
-      const work = tasks.filter((t) => !isInvestigationPrompt(t.prompt));
+      const probes = tasks.filter((t) => localTaskIntent(t as never) === "research");
+      const work = tasks.filter((t) => localTaskIntent(t as never) === "work");
       const done = tasks.filter((t) => t.status === "DONE").length;
       const failed = tasks.filter((t) => t.status === "FAILED").length;
       const detail =

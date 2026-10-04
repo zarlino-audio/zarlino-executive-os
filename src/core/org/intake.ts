@@ -18,6 +18,7 @@
  */
 import type { ExecutiveStore } from "../../db/store";
 import { createTask } from "../tasks/model";
+import { findDuplicateTask } from "../tasks/dedupe";
 import { assignTask } from "../productivity/manager";
 import { newId, nowIso } from "../../ids";
 
@@ -148,6 +149,21 @@ export function createIntakeTask(
   input: { title: string; acceptance: string; roleId: string; from: string },
 ): IntakeResult | null {
   try {
+    const dup = findDuplicateTask(store, input.title);
+    if (dup) {
+      store.insertAudit({
+        id: newId("aud"),
+        actor: "cao_agent_01",
+        action: "cao.directive_duplicate",
+        entity_type: "tasks",
+        entity_id: dup.id,
+        detail_json: JSON.stringify({ from: input.from, title: input.title, matched: dup.title, similarity: dup.similarity }),
+        source: "runtime",
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      });
+      return null;
+    }
     const task = createTask({
       title: input.title,
       description: input.acceptance || undefined,
