@@ -173,7 +173,30 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ name, mime, dataBase64 }),
     }),
-
+  /** R2 artifacts: machine-setup packages, renders, build outputs. */
+  artifacts: (prefix = "artifacts/vm-setup/") =>
+    request<{ artifacts: ArtifactInfo[] }>(`/api/artifacts?prefix=${encodeURIComponent(prefix)}`),
+  /**
+   * Download an artifact and save it with its real filename. The fetch carries
+   * the founder bearer, so a plain <a href> cannot be used (the header would be
+   * missing) â€” hence blob + temporary anchor.
+   */
+  downloadArtifact: async (key: string, filename: string): Promise<void> => {
+    const token = getToken();
+    const res = await fetch(`/api/artifacts/${key.split("/").map(encodeURIComponent).join("/")}`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  },
   tasks: () => request<{ tasks: Task[] }>("/api/tasks"),
   createTask: (title: string, description?: string, priority?: string) =>
     request<{ ok: boolean; id: string }>("/api/tasks", {
@@ -367,6 +390,12 @@ export const api = {
 };
 
 // ---- Deep data bundle types -----------------------------------------------
+
+export interface ArtifactInfo {
+  key: string;
+  sizeBytes: number;
+  uploaded: string;
+}
 
 export interface DataBundle {
   generatedAt: string;

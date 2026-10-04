@@ -1,6 +1,6 @@
 /** Ops views: Files, Local Work & Agent Runs, System Doctor, Productivity. */
-import { useState } from "react";
-import { api, type Contradiction, type DataBundle, type DoctorReport } from "../api";
+import { useCallback, useEffect, useState } from "react";
+import { api, type ArtifactInfo, type Contradiction, type DataBundle, type DoctorReport } from "../api";
 import { Badge, fmt, timeAgo } from "../lib/entertain";
 
 interface ViewProps {
@@ -11,10 +11,90 @@ interface ViewProps {
 
 // ---- Files ------------------------------------------------------------------
 
-export function FilesView({ data, mutate: _mutate, notify: _notify }: ViewProps) {
+export function FilesView({ data, mutate: _mutate, notify }: ViewProps) {
   const files = data.files ?? [];
+  const [setupFiles, setSetupFiles] = useState<ArtifactInfo[]>([]);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const loadSetup = useCallback(async () => {
+    try {
+      const r = await api.artifacts("artifacts/vm-setup/");
+      setSetupFiles(r.artifacts ?? []);
+    } catch {
+      // The card must never break the page if the bucket is unreachable.
+      setSetupFiles([]);
+    }
+  }, []);
+
+  useEffect(() => { void loadSetup(); }, [loadSetup]);
+
+  const download = async (artifact: ArtifactInfo) => {
+    const filename = artifact.key.split("/").pop()?.replace(/^\d{4}-[^Z]+Z-/, "") ?? "artifact.bin";
+    setBusy(artifact.key);
+    try {
+      await api.downloadArtifact(artifact.key, filename);
+      notify(`Downloaded ${filename}`, true);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : "download failed");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const installer = setupFiles
+    .filter((f) => f.key.endsWith(".exe"))
+    .sort((a, b) => (a.uploaded < b.uploaded ? 1 : -1))[0];
+  const others = setupFiles.filter((f) => f !== installer);
+
   return (
     <div>
+      <div className="card">
+        <h2>Machine setup (VM)</h2>
+        {installer ? (
+          <>
+            <p>
+              One-click bring-up for the always-on VM: installs Node, pulls the executor + WhatsApp
+              bridge payload from this OS, writes local config, registers auto-start and verifies.
+              Run it inside the VM as Administrator and paste the founder token when asked.
+            </p>
+            <p>
+              <button onClick={() => void download(installer)} disabled={busy !== null}>
+                {busy === installer.key ? "Downloading..." : "Download " + (installer.key.split("/").pop()?.replace(/^\d{4}-[^Z]+Z-/, "") ?? "")}
+              </button>{" "}
+              <span className="muted mono">
+                {installer.sizeBytes < 1024 ? `${installer.sizeBytes} B` : `${fmt(Math.round(installer.sizeBytes / 1024))} KB`} - uploaded {timeAgo(installer.uploaded)}
+              </span>
+            </p>
+            {others.length > 0 && (
+              <table>
+                <thead>
+                  <tr><th>Supporting file</th><th>Size</th><th>Uploaded</th><th /></tr>
+                </thead>
+                <tbody>
+                  {others.map((f) => (
+                    <tr key={f.key}>
+                      <td className="mono">{f.key.split("/").pop()?.replace(/^\d{4}-[^Z]+Z-/, "")}</td>
+                      <td className="mono">{fmt(Math.round(f.sizeBytes / 1024))} KB</td>
+                      <td className="mono muted">{timeAgo(f.uploaded)}</td>
+                      <td><button onClick={() => void download(f)} disabled={busy !== null}>Download</button></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+            <p className="muted">
+              Manual steps that remain: start the VM in Azure, run the installer inside it, paste the
+              token, then scan the WhatsApp QR once. The installer embeds no secrets.
+            </p>
+          </>
+        ) : (
+          <p className="muted">
+            No setup package published yet. Build one with{" "}
+            <span className="mono">company-readiness\vm-setup\build-vm-setup.ps1 -Publish</span>.
+          </p>
+        )}
+      </div>
+
       <div className="card">
         <h2>Uploaded files</h2>
         {files.length === 0 ? (
