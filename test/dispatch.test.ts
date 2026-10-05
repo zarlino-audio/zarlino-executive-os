@@ -99,7 +99,7 @@ describe("prepareDispatch", () => {
     });
     expect(act.ok).toBe(true);
     expect(act.investigation).toBe(false);
-    expect(act.prompt).toContain("[OS DISPATCH DIRECTIVE]");
+    expect(act.prompt).toContain("[OS DISPATCH DIRECTIVE - Zarlino Constitution, binding]");
     expect(act.prompt).toContain("Your deliverable is a CHANGE plus proof");
   });
 

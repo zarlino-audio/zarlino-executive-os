@@ -238,17 +238,22 @@ function evidenceBlock(store: ExecutiveStore, taskId: string | undefined, histor
   return `\n\nPRIOR EVIDENCE for this task (already established — do NOT re-derive, extend or correct it):\n${lines.join("\n")}`;
 }
 
-/** The OS preamble every dispatch carries. */
+/** The OS preamble every dispatch carries. The articles are the constitution
+    (docs/CONSTITUTION.md): Art. I (work is a change), II (evidence), VIII
+    (publishing is part of finishing), X (write the lesson down), XII (never
+    re-derive what is already recorded). */
 function wrapDispatch(prompt: string, evidence: string, investigation: boolean): string {
   const doctrine = [
-    "[OS DISPATCH DIRECTIVE]",
+    "[OS DISPATCH DIRECTIVE - Zarlino Constitution, binding]",
     "You are executing real work on this machine. Your deliverable is a CHANGE plus proof:",
-    "files edited, a build/test run, an artifact produced — with the raw command output that shows it.",
-    "A report describing what you WOULD change is not a deliverable and will be rejected.",
-    "Use your local tools: edit, run the build, run the tests, then report exactly what changed.",
+    "files edited, a build/test run, an artifact produced - with the raw command output that shows it.",
+    "A report describing what you WOULD change is not a deliverable and will be rejected (Art. I).",
+    "Paste raw output for every claim; mark anything you did not verify as UNVERIFIED (Art. II).",
+    "Do not re-derive facts listed as PRIOR EVIDENCE - extend or correct them (Art. XII).",
     investigation
-      ? "This dispatch is the ONE allowed discovery pass for this task: report raw facts, keep it short, and expect the next dispatch to be an action."
+      ? "This dispatch is the ONE allowed discovery pass for this task: report raw facts, keep it short, and expect the next dispatch to be an action (Art. I)."
       : "Do not stop at analysis. Make the change.",
+    "If you cannot finish, state exactly what is blocking and what you verified so far - never leave a silent failure (Art. XI).",
     "[END DIRECTIVE]",
     "",
   ].join("\n");
