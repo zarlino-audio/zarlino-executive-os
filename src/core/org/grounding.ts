@@ -434,15 +434,15 @@ export function retrieveEntityStatus(store: ExecutiveStore, def: EntityDef): Ent
  *  retrieved records. Ids are short and never fabricated. */
 export function composeGroundedReply(s: EntityStatus): string {
   const lines: string[] = [];
-  const shortId = (id: string) => id.replace(/^(tsk|rrun|appr)_[^_]+_/, "").slice(0, 10);
+  const cut = (text: string, n: number): string => (text.length > n ? `${text.slice(0, n - 1).trimEnd()}…` : text);
 
   if (s.active_tasks.length === 0 && s.remote_runs.length === 0) {
     const recent = s.recent_done_tasks[0];
     lines.push(`Checked the board — nothing active on ${s.entity} right now.`);
-    if (recent) lines.push(`Latest recorded: ${recent.title} (${recent.status.toLowerCase()}).`);
+    if (recent) lines.push(`Latest recorded: ${cut(recent.title, 90)} (${recent.status.toLowerCase()}).`);
     lines.push(`If you expected work to be running, tell me what it is and I'll put it on the board with an owner.`);
   } else {
-    const work = s.active_tasks.map((t) => `${t.title} — ${t.status.toLowerCase()} (${t.id})`).slice(0, 3);
+    const work = s.active_tasks.map((t) => `${cut(t.title, 80)} — ${t.status.toLowerCase()} (${t.id})`).slice(0, 3);
     if (work.length) lines.push(`${s.entity}: ${s.active_tasks.length} open item${s.active_tasks.length === 1 ? "" : "s"}. ${work.join("; ")}.`);
     else lines.push(`${s.entity}: no open task records.`);
     const activeRun = s.remote_runs.find((r) => r.status === "IN_PROGRESS" || r.status === "QUEUED" || r.status === "DISPATCHED" || r.status === "CANCEL_REQUESTED");
@@ -450,12 +450,12 @@ export function composeGroundedReply(s: EntityStatus): string {
     if (s.blockers.length) {
       const b = s.blockers[0]!;
       const extra = s.blockers.length > 1 ? ` (+${s.blockers.length - 1} more)` : "";
-      lines.push(`Blocker: ${b.label} [${b.kind} ${b.id}]${extra}.`);
+      lines.push(`Blocker: ${cut(b.label, 90)} [${b.kind} ${b.id}]${extra}.`);
     }
-    if (s.latest_verified_event) lines.push(`Latest verified: ${s.latest_verified_event.detail}.`);
+    if (s.latest_verified_event) lines.push(`Latest verified: ${cut(s.latest_verified_event.detail, 160)}.`);
   }
 
-  if (s.unknowns.length) lines.push(`Not on record: ${s.unknowns[0]}.`);
+  if (s.unknowns.length) lines.push(`Not on record: ${cut(s.unknowns[0]!, 120)}.`);
   return lines.slice(0, 5).join("\n");
 }
 
