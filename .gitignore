@@ -30,3 +30,6 @@ local-daemon.log
 dist-worker/
 # session scratch (never commit tool output)
 _*.txt
+
+# Session scratch (monitors, probes) - never part of the product.
+notes/_*
