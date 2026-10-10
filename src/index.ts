@@ -1800,13 +1800,57 @@ export class ExecutiveAgent {
       });
     }
     if (path === "/api/tasks" && method === "POST") {
-      const body = (await readBody<{ title?: string; description?: string; priority?: string }>(request).catch(() => ({}))) as { title?: string; description?: string; priority?: string };
+      const body = (await readBody<{
+        title?: string;
+        description?: string;
+        priority?: string;
+        objective_id?: string;
+        acceptance_criteria?: string;
+        role_id?: string;
+        dependency_task_id?: string;
+      }>(request).catch(() => ({}))) as {
+        title?: string;
+        description?: string;
+        priority?: string;
+        objective_id?: string;
+        acceptance_criteria?: string;
+        role_id?: string;
+        dependency_task_id?: string;
+      };
       if (!body.title || !body.title.trim()) return json({ error: "title required" }, 400);
       const dup = findDuplicateTask(this.store, body.title);
       if (dup) return json({ ok: false, duplicate: true, existingId: dup.id, existingStatus: dup.status, note: duplicateNote(dup) }, 409);
-      const task = createTask({ title: body.title, description: body.description, priority: body.priority as never, source: "founder" });
+      // Objective linkage is what makes coordinated work a connected objective
+      // rather than a pile of unrelated tickets (spec §2.4).
+      if (body.objective_id && !this.store.getObjective(body.objective_id)) {
+        return json({ error: "objective not found" }, 404);
+      }
+      const task = createTask({
+        title: body.title,
+        description: body.description,
+        priority: body.priority as never,
+        objective_id: body.objective_id,
+        source: "founder",
+      });
       this.store.insertTask(task);
-      return json({ ok: true, id: task.id });
+      if (body.acceptance_criteria?.trim()) {
+        this.store.setTaskContract(task.id, { acceptance_criteria: body.acceptance_criteria.trim() });
+      }
+      if (body.dependency_task_id) {
+        this.store.updateTask(task.id, { dependency_task_id: body.dependency_task_id } as never);
+      }
+      let assignment: string | null = null;
+      if (body.role_id) {
+        try {
+          assignment = assignTask(this.store, task.id, {
+            roleId: body.role_id,
+            note: "CEO objective assignment",
+          });
+        } catch {
+          assignment = null;
+        }
+      }
+      return json({ ok: true, id: task.id, assignment, objective_id: body.objective_id ?? null });
     }
     const taskPatch = /^\/api\/tasks\/([^/]+)$/.exec(path);
     if (taskPatch && method === "GET") {
