@@ -21,6 +21,7 @@
 import type { ExecutiveStore } from "../../db/store";
 import { newId, nowIso } from "../../ids";
 import { intakeFounderDirective } from "./intake";
+import { groundedFounderReply, sanitizeFounderReply } from "./grounding";
 import {
   naturalFounderReply,
   naturalReplyFallback,
@@ -124,7 +125,16 @@ async function founderReply(
   env: FounderChannelEnv,
   text: string,
 ): Promise<string> {
-  return naturalFounderReply(store, env, text, buildFounderContext(store));
+  // Authoritative grounding (reliability fix 2026-10-12): an operational
+  // question about a resolved entity is answered from persisted OS records
+  // within this request — never from model inference, the approvals digest or
+  // conversational drift. The referent survives across messages.
+  const grounded = groundedFounderReply(store, text);
+  if (grounded.grounded) return grounded.reply;
+  const reply = await naturalFounderReply(store, env, text, buildFounderContext(store));
+  // No unbacked "I'm checking…" claims: nothing persisted was created on this
+  // path, so fake asynchronous language is replaced with an honest line.
+  return sanitizeFounderReply(reply, false);
 }
 
 /** settings key holding the approvals referenced by the last delivered digest. */
