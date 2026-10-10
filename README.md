@@ -23,7 +23,7 @@ research & maintenance tasks, gates risky actions behind approvals, and — sinc
 | **Files** | Uploaded-file registry with size/type validation |
 | **Local bridge** | `local_tasks` — the CLI agent (`scripts/local-agent.ts`) claims & executes machine tasks, heartbeats progress, reports results |
 | **Productivity Manager** | Token budgets per scope, task→role/skill assignment, cost-efficiency optimization (stale-assignment reaping, budget reallocation, batching/model-tier recommendations), contradiction & misconception detection with audit-trailed resolution |
-| **System Doctor** | 14 health checks, auto-fixes safe issues, logs every run, exposes `/api/doctor/run` + `/api/doctor/logs` |
+| **System Doctor** | Self-healing health checks, auto-fixes safe issues, logs every run, exposes `/api/doctor/run` + `/api/doctor/logs` |
 | **Console** | Founder web console (`web/`): overview, Doctor, chat, tasks, approvals, productivity, budget settings |
 
 ---

@@ -1,4 +1,0 @@
-[main 8104a94] feat(bridge): WhatsApp linked-device bridge (QR scan) - Baileys client that forwards inbound to the OS (founder vs stranger) and drains queued founder escalations; auth/session gitignored
- 3 files changed, 251 insertions(+)
- create mode 100644 tools/whatsapp-bridge/index.mjs
- create mode 100644 tools/whatsapp-bridge/package.json

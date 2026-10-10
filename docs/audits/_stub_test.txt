@@ -1,4 +1,0 @@
-LITERAL-GLYPH PROBE (raw non-ASCII characters placed directly in the payload, not escapes):
-
-emoji 🎛️ 中文 العربية é à ü ñ ẹ̀ ﬀ
-glyphs: ✅ 🟡 ❌ — … ’  ←

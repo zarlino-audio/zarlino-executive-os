@@ -1,3 +1,0 @@
-[main 2acb0b7] feat(voice): no spam + human voice for the founder channel - coalesce all queued escalations into ONE message (dup items merged), quiet gap (WHATSAPP_MIN_GAP_MINUTES, default 240), batch acks set last-sent; natural AI+template voice with no machine traces; strangers get a warm public reply
- 8 files changed, 386 insertions(+), 95 deletions(-)
- create mode 100644 src/core/org/voice.ts

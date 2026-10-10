@@ -1,2 +1,0 @@
-To https://github.com/zarlino-audio/zarlino-executive-os.git
-   ced4ece..b049ba5  main -> main

@@ -1,2 +1,0 @@
-[main ced4ece] fix(mcp): restore the outer worker /mcp forward dropped in 2adfbff (regression guard test asserts both forward + DO route); read-only plane reachable again
- 2 files changed, 13 insertions(+), 1 deletion(-)

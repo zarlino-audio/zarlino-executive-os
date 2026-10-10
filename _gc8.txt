@@ -1,2 +1,0 @@
-[main 1a1f818] fix(bridge): flaky uplink hardening - every OS call retries with backoff + 20s timeout (a dropped fetch must never drop a founder message); founder LID support (WHATSAPP_FOUNDER_LIDS) for linked-ID addressing
- 5 files changed, 58 insertions(+), 12 deletions(-)

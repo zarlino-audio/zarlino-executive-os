@@ -1,1 +1,0 @@
-fix(voice): anti-hallucination rules for founder replies - only facts from state, never invent; no third-person founder talk; temperature 0.25; digest may only list given items

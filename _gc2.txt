@@ -1,5 +1,0 @@
-[main 2adfbff] feat(whatsapp): founder channel via linked-device bridge - v34 whatsapp_messages (+dedupe), founder-number classification (fail-closed stranger path with canned reply), /api/whatsapp/inbound + outbox drain + ack, 5 tests
- 7 files changed, 569 insertions(+), 3 deletions(-)
- create mode 100644 src/core/org/founder-channel.ts
- create mode 100644 src/db/whatsapp-schema.ts
- create mode 100644 test/whatsapp-bridge.test.ts

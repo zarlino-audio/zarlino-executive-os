@@ -1,2 +1,0 @@
-[main 815c3f6] feat(whatsapp): founder replies ACT - approve/reject intent decides the pending item(s) from the last digest (48h window, audited, fail-safe); bridge gains full message-path visibility (upsert, skip reasons, send failures, compact decrypt warnings)
- 4 files changed, 201 insertions(+), 14 deletions(-)
