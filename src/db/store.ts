@@ -123,12 +123,17 @@ export class ExecutiveStore implements CostStorage {
     );
   }
 
-  private update(table: string, id: string, patch: object): void {
+  private update(table: string, id: string, patch: object, keyColumn = "id"): void {
     const rec = patch as Record<string, unknown>;
     const keys = Object.keys(rec);
     if (keys.length === 0) return;
     const sets = keys.map((k) => `${k} = ?`).join(", ");
-    this.sql.run(`UPDATE ${table} SET ${sets}, updated_at = ? WHERE id = ?`, ...keys.map((k) => normalize(rec[k])), new Date().toISOString(), id);
+    this.sql.run(
+      `UPDATE ${table} SET ${sets}, updated_at = ? WHERE ${keyColumn} = ?`,
+      ...keys.map((k) => normalize(rec[k])),
+      new Date().toISOString(),
+      id,
+    );
   }
 
   // -- executive state ----------------------------------------------------
@@ -1420,7 +1425,10 @@ export class ExecutiveStore implements CostStorage {
   }
   upsertProductValidation(v: ProductValidation): void {
     const rows = this.sql.all<Row>("SELECT product_id FROM product_validations WHERE product_id = ?", v.product_id);
-    if (rows.length > 0) this.update("product_validations", v.product_id, v);
+    // This table is keyed by product_id, not id — passing the key explicitly is
+    // what keeps the second write from failing with "no such column: id" (the
+    // CEO hit exactly that while recording validation evidence).
+    if (rows.length > 0) this.update("product_validations", v.product_id, v, "product_id");
     else this.insert("product_validations", v);
   }
 
