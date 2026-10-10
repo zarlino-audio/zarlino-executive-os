@@ -1316,6 +1316,36 @@ function internalTools(): Tool[] {
       },
     },
     {
+      name: "notes.get_note",
+      description:
+        "Read ONE note in full by id — including the full body. Use this to read evidence whose locator is `note <noteId>` (task evidence frequently points at a note); executive.get_file only reads Founder uploads and returns NOT_FOUND for a note id.",
+      inputSchema: z.object({ noteId: z.string().min(3).max(128) }),
+      requiredPermission: "read",
+      riskLevel: "LOW",
+      reversible: true,
+      auditRequired: false,
+      run: async (ctx: ToolContext, input: { noteId: string }) => {
+        const store = ctx.store;
+        if (!store) throw new Error("store unavailable");
+        // Accept the locator forms an evidence item may use: the bare id, or a
+        // `note <id>` / `note:<id>` prefix, optionally followed by a title
+        // (evidence locators read like `note nt_x — "ZTame launch drafts"`).
+        const raw = input.noteId.trim();
+        const id = /^(?:note[:\s]+)?\s*([A-Za-z0-9_-]+)/i.exec(raw)?.[1] ?? raw;
+        const note = store.getNote(id);
+        if (!note) return { noteId: id, status: "NOT_FOUND", note: "No note with that id. notes.list_notes returns the ids." };
+        return {
+          noteId: note.id,
+          title: note.title,
+          body: note.body ?? "",
+          tags: safeJsonArray(note.tags_json),
+          pinned: Boolean(note.pinned),
+          created_at: note.created_at,
+          updated_at: note.updated_at,
+        };
+      },
+    },
+    {
       name: "notes.delete_note",
       description: "Delete a note by id. Returns { deleted: boolean }.",
       inputSchema: z.object({ noteId: z.string().min(1).max(128) }),
