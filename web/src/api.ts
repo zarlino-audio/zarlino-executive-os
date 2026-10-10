@@ -412,7 +412,7 @@ export interface DataBundle {
   products: Array<{ id: string; name: string; category?: string; status: string; version?: string; price?: number }>;
   productStatus: Array<Record<string, unknown>>;
   projects: Array<Record<string, unknown>>;
-  objectives: Array<Record<string, unknown>>;
+  objectives: Objective[];
   tasks: Task[];
   decisions: Array<Record<string, unknown>>;
   risks: Array<Record<string, unknown>>;
@@ -838,10 +838,48 @@ export async function chatSse(streamId: string, handlers: ChatSseHandlers): Prom
 export interface Task {
   id: string;
   title: string;
+  description?: string | null;
   status: string;
   priority: string;
   project_id: string | null;
+  /** The objective this task serves — coordinated work is linked, not loose. */
+  objective_id?: string | null;
+  decision_id?: string | null;
+  /** Owning role (e.g. role_dsp_engineering, role_qa_verification). */
+  assignee_person_id?: string | null;
+  /**
+   * The task this one depends on. The scheduler does not start a dependent
+   * task while its predecessor is unfinished, so a card showing "waiting on X"
+   * is genuinely parked, not merely labelled.
+   */
+  dependency_task_id?: string | null;
+  /** What "done" means for this task (from the task contract). */
+  acceptance_criteria?: string | null;
+  success_condition?: string | null;
+  /** 1 = the Executive sweep starts it without a founder click. */
+  auto_run?: number | null;
+  /** Set only when the task was closed by explicit override, never by evidence. */
+  close_reason?: string | null;
+  completed_at?: string | null;
   created_at: string;
+  updated_at?: string | null;
+}
+
+export interface Objective {
+  id: string;
+  title: string;
+  description?: string | null;
+  status: string;
+  priority?: number | null;
+  /** Measurable completion criteria the objective is verified against. */
+  criteria_json?: string | null;
+  /** Verification record written when the org checked the criteria. */
+  evidence_json?: string | null;
+  verified_at?: string | null;
+  completed_at?: string | null;
+  source?: string | null;
+  created_at: string;
+  updated_at?: string | null;
 }
 
 export interface Approval {

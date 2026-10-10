@@ -297,15 +297,61 @@ export function Activity({ data }: ViewProps) {
 
 // ---- Tasks ------------------------------------------------------------------
 
+// ---- Tasks ------------------------------------------------------------------
+
+/** Department glyph for a role id (role_dsp_engineering → 🔧 dsp engineering). */
+function roleLabel(roleId?: string | null): string | null {
+  if (!roleId) return null;
+  const bare = roleId.replace(/^role_/, "").replace(/_/g, " ");
+  const emoji = /dsp|engineering|software/i.test(roleId)
+    ? "🔧"
+    : /qa|verif/i.test(roleId)
+      ? "🔍"
+      : /market|content/i.test(roleId)
+        ? "📣"
+        : /finance|governance/i.test(roleId)
+          ? "💰"
+          : /coa|executive|ceo/i.test(roleId)
+            ? "🧠"
+            : "🧩";
+  return `${emoji} ${bare}`;
+}
+
+/**
+ * Dependency state of a task. The scheduler refuses to start a dependent task
+ * while its predecessor is not DONE (core/tasks/dependencies.ts, and the same
+ * gate in the resume path), so "waiting" here means genuinely parked — not
+ * merely labelled — and the card says so instead of leaving it to guesswork.
+ */
+function depOf(t: Task, byId: Map<string, Task>): { state: "none" | "waiting" | "ready" | "unknown"; predecessor?: Task } {
+  if (!t.dependency_task_id) return { state: "none" };
+  const predecessor = byId.get(t.dependency_task_id);
+  if (!predecessor) return { state: "unknown" };
+  return { state: predecessor.status === "DONE" ? "ready" : "waiting", predecessor };
+}
+
+const shortId = (id: string) => (id.length > 12 ? `${id.slice(0, 10)}…` : id);
+
+const cutting = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}…` : s);
+
 export function Tasks({ data, mutate, notify }: ViewProps) {
   const [title, setTitle] = useState("");
   const [priority, setPriority] = useState("P2");
   const [busy, setBusy] = useState(false);
   const tasks = useMemo(() => data.tasks ?? [], [data]);
+  const byId = useMemo(() => new Map(tasks.map((t) => [t.id, t])), [tasks]);
+  const objectives = useMemo(() => data.objectives ?? [], [data]);
+  const objById = useMemo(() => new Map(objectives.map((o) => [o.id, o])), [objectives]);
   const open = tasks.filter((t) => t.status === "OPEN");
   const inProg = tasks.filter((t) => t.status === "IN_PROGRESS");
   const blocked = tasks.filter((t) => t.status === "BLOCKED");
   const done = tasks.filter((t) => t.status === "DONE");
+  const waiting = tasks.filter((t) => (t.status === "OPEN" || t.status === "IN_PROGRESS") && depOf(t, byId).state === "waiting");
+  const achieved = objectives.filter((o) => o.status === "ACHIEVED");
+  const rankedObjectives = useMemo(
+    () => [...objectives].sort((a, b) => (a.status === "ACTIVE" ? -1 : 0) - (b.status === "ACTIVE" ? -1 : 0)),
+    [objectives],
+  );
 
   const create = async () => {
     if (!title.trim() || busy) return;
@@ -355,33 +401,100 @@ export function Tasks({ data, mutate, notify }: ViewProps) {
         <div className="row" style={{ marginTop: 10 }}>
           <span className="chip">🩺 {open.length} to do</span>
           <span className="chip">▶ {inProg.length} in progress</span>
+          <span className="chip">⛓ {waiting.length} waiting on a dependency</span>
           <span className="chip">⛔ {blocked.length} blocked</span>
           <span className="chip">✔ {done.length} done</span>
+          <span className="chip">🎯 {achieved.length} objectives achieved</span>
         </div>
       </div>
+
+      {/* Objectives: what the open work is FOR, and how completion is judged. */}
+      {objectives.length > 0 && (
+        <div className="card">
+          <h2>Objectives</h2>
+          <p className="muted">
+            An objective closes only when every linked task is closed and the recorded criteria are verified —
+            "ACHIEVED" is refused while work is still open.
+          </p>
+          {rankedObjectives.slice(0, 8).map((o) => {
+            const linked = tasks.filter((t) => t.objective_id === o.id);
+            const openLinked = linked.filter((t) => t.status !== "DONE" && t.status !== "CANCELLED");
+            return (
+              <div className="obj-item" key={o.id}>
+                <div className="row" style={{ gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                  <Badge tone={o.status === "ACHIEVED" ? "ok" : o.status === "ACTIVE" ? "warn" : undefined}>{o.status}</Badge>
+                  <strong>{o.title}</strong>
+                  <span className="muted">
+                    {openLinked.length} open / {linked.length} tasks
+                  </span>
+                  {o.verified_at && <span className="muted">verified {timeAgo(o.verified_at)}</span>}
+                </div>
+                {o.criteria_json && (
+                  <details className="task-crit">
+                    <summary>Completion criteria</summary>
+                    <p>{o.criteria_json}</p>
+                  </details>
+                )}
+                {o.evidence_json && (
+                  <details className="task-crit">
+                    <summary>Verification record</summary>
+                    <p>{o.evidence_json}</p>
+                  </details>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
 
       <div className="task-board">
         {board.map((col) => (
           <div className="task-col" key={col.status}>
             <h3>{col.label} <span className="muted">({col.items.length})</span></h3>
             {col.items.length === 0 && <p className="muted">—</p>}
-            {col.items.slice(0, 40).map((t) => (
-              <div className="task-card" key={t.id}>
-                <div className="task-title">{t.title}</div>
-                <div className="row" style={{ gap: 6, marginTop: 8 }}>
-                  <Badge tone={t.priority === "P0" ? "fail" : t.priority === "P1" ? "warn" : undefined}>{t.priority}</Badge>
-                  <button className="mini" onClick={() => setStatus(t, col.status === "OPEN" ? "IN_PROGRESS" : col.status === "IN_PROGRESS" ? "DONE" : "OPEN")}>
-                    {col.status === "OPEN" ? "▶ Start" : col.status === "IN_PROGRESS" ? "✔ Done" : "↩ Reopen"}
-                  </button>
-                  {col.status === "BLOCKED" && (
-                    <button className="mini" onClick={() => setStatus(t, "IN_PROGRESS")}>Unblock</button>
+            {col.items.slice(0, 40).map((t) => {
+              const dep = depOf(t, byId);
+              const obj = t.objective_id ? objById.get(t.objective_id) : undefined;
+              const role = roleLabel(t.assignee_person_id);
+              return (
+                <div className="task-card" key={t.id}>
+                  <div className="task-title">{t.title}</div>
+                  <div className="task-meta">
+                    {role && <span>{role}</span>}
+                    {obj && <span title={obj.title}>🎯 {cutting(obj.title, 34)}</span>}
+                    <span>{t.auto_run ? "🤖 auto" : "✋ manual"}</span>
+                  </div>
+                  {dep.state === "waiting" && (
+                    <div className="task-note warn">
+                      ⛓ waiting on {dep.predecessor ? cutting(dep.predecessor.title, 60) : shortId(t.dependency_task_id!)} — it will not
+                      start until that finishes
+                    </div>
                   )}
-                  {(col.status === "OPEN" || col.status === "IN_PROGRESS") && (
-                    <button className="mini" onClick={() => setStatus(t, "BLOCKED")}>⛔</button>
+                  {dep.state === "ready" && <div className="task-note ok">⛓ ready — predecessor is done</div>}
+                  {dep.state === "unknown" && <div className="task-note">⛓ depends on {shortId(t.dependency_task_id!)}</div>}
+                  {t.acceptance_criteria && (
+                    <details className="task-crit">
+                      <summary>Acceptance criteria</summary>
+                      <p>{t.acceptance_criteria}</p>
+                    </details>
                   )}
+                  {t.close_reason && <div className="task-note">Closed with a recorded reason: {cutting(t.close_reason, 160)}</div>}
+                  {t.completed_at && <div className="muted">closed {timeAgo(t.completed_at)}</div>}
+                  <div className="row" style={{ gap: 6, marginTop: 8 }}>
+                    <Badge tone={t.priority === "P0" ? "fail" : t.priority === "P1" ? "warn" : undefined}>{t.priority}</Badge>
+                    <button className="mini" onClick={() => setStatus(t, col.status === "OPEN" ? "IN_PROGRESS" : col.status === "IN_PROGRESS" ? "DONE" : "OPEN")}>
+                      {col.status === "OPEN" ? "▶ Start" : col.status === "IN_PROGRESS" ? "✔ Done" : "↩ Reopen"}
+                    </button>
+                    {col.status === "BLOCKED" && (
+                      <button className="mini" onClick={() => setStatus(t, "IN_PROGRESS")}>Unblock</button>
+                    )}
+                    {(col.status === "OPEN" || col.status === "IN_PROGRESS") && (
+                      <button className="mini" onClick={() => setStatus(t, "BLOCKED")}>⛔</button>
+                    )}
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
             {col.items.length > 40 && <p className="muted">…and {col.items.length - 40} more — open them via the agent or a narrowed search.</p>}
           </div>
         ))}
