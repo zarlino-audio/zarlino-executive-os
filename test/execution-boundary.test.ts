@@ -291,6 +291,130 @@ describe("remote execution", () => {
     // Nothing was recorded as a run, and no evidence exists anywhere.
     expect(store.listRemoteRuns(10).length).toBe(0);
   });
+
+  it("does NOT bind a stale run from an earlier dispatch (tight locate window)", async () => {
+    const stale = new Date(Date.now() - 10 * 60_000).toISOString();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        const ok = (status: number, body: unknown) => ({
+          ok: status >= 200 && status < 300,
+          status,
+          text: async () => (body === undefined ? "" : JSON.stringify(body)),
+          json: async () => body,
+        });
+        if (url.includes("/dispatches") && method === "POST") return ok(204, undefined) as unknown as Response;
+        if (url.includes("/actions/workflows/")) return ok(200, { id: 7, name: "CI" }) as unknown as Response;
+        if (url.includes("/actions/runs")) {
+          return ok(200, {
+            workflow_runs: [
+              { id: 111, workflow_id: 7, path: ".github/workflows/ci.yml", status: "completed", conclusion: "success", created_at: stale, html_url: "u111" },
+            ],
+          }) as unknown as Response;
+        }
+        return ok(404, {}) as unknown as Response;
+      }),
+    );
+    const d = await dispatchRemoteWorkflow(store, { GITHUB_TOKEN: "t" }, { repo: "o/r", workflow: "ci.yml" });
+    expect(d.ok).toBe(true);
+    // The only listed run predates the dispatch → must NOT be claimed as ours.
+    expect(d.run?.github_run_id ?? null).toBeNull();
+    expect(d.run?.status).toBe("DISPATCHED");
+  });
+
+  it("never binds a GitHub run already bound to another remote run", async () => {
+    const recent = new Date(Date.now() - 3_000).toISOString();
+    const at = nowIso();
+    store.createRemoteRun({
+      id: "rrun_other",
+      repo: "o/r",
+      workflow_file: "ci.yml",
+      ref: "main",
+      status: "IN_PROGRESS",
+      github_run_id: "222",
+      dispatched_at: at,
+      source: "test",
+      created_at: at,
+      updated_at: at,
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        const ok = (status: number, body: unknown) => ({
+          ok: status >= 200 && status < 300,
+          status,
+          text: async () => (body === undefined ? "" : JSON.stringify(body)),
+          json: async () => body,
+        });
+        if (url.includes("/dispatches") && method === "POST") return ok(204, undefined) as unknown as Response;
+        if (url.includes("/actions/workflows/")) return ok(200, { id: 7, name: "CI" }) as unknown as Response;
+        if (url.includes("/actions/runs")) {
+          return ok(200, {
+            workflow_runs: [
+              { id: 222, workflow_id: 7, path: ".github/workflows/ci.yml", status: "in_progress", conclusion: null, created_at: recent, html_url: "u222" },
+            ],
+          }) as unknown as Response;
+        }
+        return ok(404, {}) as unknown as Response;
+      }),
+    );
+    const d = await dispatchRemoteWorkflow(store, { GITHUB_TOKEN: "t" }, { repo: "o/r", workflow: "ci.yml" });
+    expect(d.ok).toBe(true);
+    expect(d.run?.github_run_id ?? null).toBeNull();
+    expect(store.getRemoteRun("rrun_other")?.github_run_id).toBe("222");
+  });
+
+  it("heals a mis-bound run: unbinds the stale run and re-locates the real one", async () => {
+    const dispatchedAt = nowIso();
+    const staleCreated = new Date(Date.now() - 10 * 60_000).toISOString();
+    const freshCreated = new Date(Date.now() - 4_000).toISOString();
+    store.createRemoteRun({
+      id: "rrun_heal",
+      repo: "o/r",
+      workflow_file: "ci.yml",
+      ref: "main",
+      status: "COMPLETED",
+      github_run_id: "555",
+      run_url: "u555",
+      conclusion: "success",
+      dispatched_at: dispatchedAt,
+      source: "test",
+      created_at: dispatchedAt,
+      updated_at: dispatchedAt,
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        const ok = (status: number, body: unknown) => ({
+          ok: status >= 200 && status < 300,
+          status,
+          text: async () => (body === undefined ? "" : JSON.stringify(body)),
+          json: async () => body,
+        });
+        if (/\/actions\/runs\/555$/.test(url)) {
+          return ok(200, { id: 555, status: "completed", conclusion: "success", created_at: staleCreated, html_url: "u555", head_sha: "old" }) as unknown as Response;
+        }
+        if (url.includes("/actions/runs?")) {
+          return ok(200, {
+            workflow_runs: [
+              { id: 777, workflow_id: 7, path: ".github/workflows/ci.yml", status: "queued", conclusion: null, created_at: freshCreated, html_url: "u777" },
+            ],
+          }) as unknown as Response;
+        }
+        return ok(404, {}) as unknown as Response;
+      }),
+    );
+    const s = await syncRemoteRun(store, { GITHUB_TOKEN: "t" }, "rrun_heal");
+    expect(s?.note).toMatch(/healed/);
+    expect(s?.run.github_run_id).toBe("777");
+    expect(s?.run.run_url).toBe("u777");
+    expect(s?.run.status).toBe("QUEUED");
+  });
 });
 
 describe("objectives (persistent, gated completion)", () => {

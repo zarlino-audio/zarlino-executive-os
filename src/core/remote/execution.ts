@@ -41,6 +41,14 @@ export function isActiveRemoteStatus(status: string): boolean {
 export const UNMATCHED_AFTER_MS = 15 * 60_000;
 /** Minimum gap between two syncs of the same run. */
 export const SYNC_MIN_GAP_MS = 45_000;
+/**
+ * How far BEFORE the dispatch time a GitHub run may have been created and
+ * still count as "ours". Kept tight on purpose: the first locate runs before
+ * GitHub has listed the new run, and a wide window (120s, pre-2026-10-11)
+ * mis-bound a fresh dispatch to the PREVIOUS run of the same workflow — a
+ * false COMPLETED. 8 seconds covers clock skew without covering a prior run.
+ */
+export const LOCATE_SLACK_MS = 8_000;
 /** Dispatch → wait at most this long before first locate attempt is final. */
 const GITHUB_API = "https://api.github.com";
 
@@ -219,10 +227,19 @@ async function locateDispatchedRun(
   );
   if (!listing.ok) return null;
   const runs = ((listing.json ?? {}) as { workflow_runs?: Array<Record<string, unknown>> }).workflow_runs ?? [];
+  // A GitHub run already bound to ANOTHER remote run must never be re-bound:
+  // two dispatches of the same workflow must not share one GitHub run.
+  const boundElsewhere = new Set(
+    store
+      .listRemoteRuns(100)
+      .filter((x) => x.id !== run.id && x.github_run_id)
+      .map((x) => String(x.github_run_id)),
+  );
   const candidates = runs
     .filter((r) => {
       const createdAt = Date.parse(String(r.created_at ?? ""));
-      if (!Number.isFinite(createdAt) || createdAt < dispatchedAtMs - 120_000) return false;
+      if (!Number.isFinite(createdAt) || createdAt < dispatchedAtMs - LOCATE_SLACK_MS) return false;
+      if (r.id !== undefined && boundElsewhere.has(String(r.id))) return false;
       if (workflowId !== undefined && r.workflow_id !== undefined && Number(r.workflow_id) !== workflowId) return false;
       const path = String(r.path ?? "");
       return !path || path.endsWith(`/${run.workflow_file}`) || path === run.workflow_file;
@@ -376,6 +393,29 @@ export async function syncRemoteRun(store: ExecutiveStore, env: RemoteEnv, runId
     return { run: store.getRemoteRun(run.id) ?? run, changed: false, note: `sync failed (HTTP ${res.status})` };
   }
   const ghRun = (res.json ?? {}) as Record<string, unknown>;
+  // Self-heal: a binding to a run that PREDATES our dispatch is a mis-bind
+  // (observed live 2026-10-11 — the first locate saw only the previous run).
+  // Clear it and re-locate rather than reporting the wrong run's outcome.
+  const runCreatedAt = Date.parse(String(ghRun.created_at ?? ghRun.run_started_at ?? ""));
+  const myDispatchMs = Date.parse(run.dispatched_at);
+  if (Number.isFinite(runCreatedAt) && Number.isFinite(myDispatchMs) && runCreatedAt < myDispatchMs - LOCATE_SLACK_MS) {
+    store.updateRemoteRun(run.id, {
+      github_run_id: undefined as unknown as string,
+      run_url: undefined as unknown as string,
+      status: "DISPATCHED",
+      conclusion: undefined as unknown as string,
+      finished_at: undefined as unknown as string,
+      error: undefined as unknown as string,
+      detail_json: JSON.stringify({ healed_at: nowIso(), reason: "stale run binding cleared (bound run predates the dispatch)" }),
+      last_synced_at: nowIso(),
+      updated_at: nowIso(),
+    });
+    const refreshed = store.getRemoteRun(run.id) ?? run;
+    const relocalized = await locateDispatchedRun(store, env, refreshed, myDispatchMs, undefined);
+    return relocalized
+      ? { run: relocalized, changed: true, note: "stale binding healed; re-located the real run" }
+      : { run: store.getRemoteRun(run.id) ?? refreshed, changed: true, note: "stale binding cleared; awaiting the real run" };
+  }
   let artifacts: Array<Record<string, unknown>> | undefined;
   const ghStatus = String(ghRun.status ?? "");
   if (ghStatus === "completed") {
