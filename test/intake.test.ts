@@ -123,7 +123,7 @@ describe("createIntakeTask", () => {
 
   it("writes the confirmation in plain words", () => {
     const text = intakeConfirmation(
-      { taskId: "tsk_x", title: "Fix the installer", acceptance: "It runs on a clean VM", roleId: "role_dsp_engineering", assignmentId: null },
+      { taskId: "tsk_x", title: "Fix the installer", acceptance: "It runs on a clean VM", roleId: "role_dsp_engineering", assignmentId: null, objectiveId: "obj_x" },
       "DSP Engineering",
     );
     expect(text).toContain("Fix the installer");

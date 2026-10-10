@@ -51,6 +51,7 @@ import {
   WHATSAPP_BRIDGE_SQL,
   OUTREACH_SQL,
   PROSPECT_REPLIES_SQL,
+  REMOTE_EXECUTION_SQL,
 } from "./schema";
 import type { Sql } from "./sql";
 
@@ -168,6 +169,7 @@ export const MIGRATIONS: Migration[] = [
   { version: 36, name: "prospect_replies", sql: [PROSPECT_REPLIES_SQL] },
   { version: 37, name: "commercial_roles", sql: [ORG_ROLES_V37_SQL] },
   { version: 38, name: "cao_role", sql: [ORG_ROLES_V38_SQL] },
+  { version: 39, name: "remote_execution", sql: [REMOTE_EXECUTION_SQL] },
 
 ];
 

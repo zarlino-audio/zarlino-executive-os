@@ -56,6 +56,25 @@ export const REPO_ROOT = process.env.ZARLINO_WORKSPACE
   : resolve(EXEC_OS, "..");
 export const WEBSITE = join(REPO_ROOT, "zarlino-website");
 
+/**
+ * Secrets are never readable by the machine agent (spec §10). The read tools
+ * are sandboxed to the repo, but the repo itself contains credential files
+ * (.dev.vars, auth sessions, key material) that must not enter a transcript
+ * or a model prompt.
+ */
+function isSecretPath(p: string): boolean {
+  const rel = p.replace(/\\/g, "/").toLowerCase();
+  return (
+    /(^|\/)\.dev\.vars$/.test(rel) ||
+    /(^|\/)\.env(\.|$)/.test(rel) ||
+    /\.pem$/.test(rel) ||
+    /(^|\/)id_rsa/.test(rel) ||
+    /(^|\/)auth\//.test(rel) ||
+    /(^|\/)\.local\//.test(rel) ||
+    /(^|\/)\.wrangler\//.test(rel)
+  );
+}
+
 // ---- env -------------------------------------------------------------------
 const dotenv = loadDotEnv(join(EXEC_OS, ".dev.vars"));
 export const API_KEY = process.env.DEEPSEEK_API_KEY ?? dotenv.DEEPSEEK_API_KEY ?? "";
@@ -224,7 +243,7 @@ const MAKENSIS = "C:\\Program Files (x86)\\NSIS\\makensis.exe";
 const VCVARS = "C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Auxiliary\\Build\\vcvars64.bat";
 const PYTHON = "python"; // python 3.14 with numpy/scipy on PATH
 
-export const TOOLS: LocalTool[] = [
+const ALL_TOOLS: LocalTool[] = [
   {
     name: "local_list_dir",
     description: "List the entries of a directory in the Zarlino repo",
@@ -253,6 +272,7 @@ export const TOOLS: LocalTool[] = [
     needsConfirm: false,
     run: async (args) => {
       const p = resolve(REPO_ROOT, String(args.path));
+      if (isSecretPath(p)) return "DENIED: secrets/credentials are out of bounds for the machine agent (execution boundary, spec §10).";
       if (!existsSync(p)) return `NOT FOUND: ${p}`;
       const text = readFileSync(p, "utf8");
       const total = text.length;
@@ -821,6 +841,38 @@ if ($alive) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
   },
 ];
 
+/**
+ * EXECUTION BOUNDARY (spec §2.3): the machine/VM is the CEO's communication
+ * and intelligence environment — it does NOT execute engineering work. The
+ * engineering tools (write/run/build/test/render/package/deploy) are removed
+ * from the default toolset; a DEDICATED remote build environment can opt in
+ * explicitly with LOCAL_ENGINEERING_ENABLED=1, but the VM's operational role
+ * must never set it.
+ */
+export const ENGINEERING_TOOL_NAMES: readonly string[] = [
+  "local_write_file",
+  "local_run_command",
+  "local_run_tests",
+  "local_build_console",
+  "local_deploy_website",
+  "local_new_plugin",
+  "local_build_plugin",
+  "local_plugin_tests",
+  "local_render_ab",
+  "local_fl_launch_test",
+  "local_package_release",
+  "local_ship_check",
+];
+
+export const LOCAL_ENGINEERING_ENABLED = /^(1|true|yes|on)$/i.test(
+  String(process.env.LOCAL_ENGINEERING_ENABLED ?? ""),
+);
+
+/** The toolset the agent actually gets — engineering filtered unless opted in. */
+export const TOOLS: LocalTool[] = LOCAL_ENGINEERING_ENABLED
+  ? ALL_TOOLS
+  : ALL_TOOLS.filter((t) => !ENGINEERING_TOOL_NAMES.includes(t.name));
+
 export const TOOL_SCHEMAS = TOOLS.map((t) => ({
   type: "function",
   function: { name: t.name, description: t.description, parameters: t.parameters },
@@ -900,27 +952,37 @@ export async function buildSystem(): Promise<string> {
     "  XII. Never re-derive facts the task already gives you as PRIOR EVIDENCE.",
     `Plugin source layout: each plugin lives under "plugins/<Name>/Source" (e.g. plugins/ZScorch/Source). Available plugins: ${plugins}.`,
     "To inspect or report on a plugin UI, ALWAYS prefer the `local_plugin_ui` tool (action=report or action=read) — it knows the correct paths. Use local_list_dir / local_read_file only for other files (docs, config, website).",
-    "PLUGIN FACTORY WORKFLOW — taking a plugin concept to SHIPPED (end-to-end, no human needed):",
-    "  1. local_new_plugin (name=...) to scaffold a new plugin from the template (or start from an existing plugin).",
-    "  2. Write the DSP/UI code in plugins/<Name>/Source with local_write_file (edit PluginProcessor.cpp/.h, PluginEditor.cpp/.h).",
-    "  3. local_build_plugin (plugin=<Name>) — builds Release VST3 + Standalone + runs ctest.",
-    "  4. local_plugin_tests (plugin=<Name>) if tests fail or to re-verify.",
-    "  5. local_render_ab (plugin=<Name>) — renders + uploads A/B audio so the Founder can listen remotely and pick a side.",
-    "  6. local_fl_launch_test (plugin=<Name>) — DAW launch test. ALWAYS FL Studio 21 (C:\\Program Files\\Image-Line\\FL Studio 21\\FL64.exe), NEVER FL 2025.",
-    "  7. local_package_release (plugin=<Name>, version=...) — NSIS installer + VST3/Standalone zips.",
-    "  8. local_ship_check (plugin=<Name>) — verify all gates; report READY TO SHIP or list what is missing.",
-    "If the task is 'take X from concept to shipped', run the whole pipeline and report each step's result.",
-    "You can read/write local files, run commands/tests/builds, and deploy the website.",
-    "Rules:",
-    " 1. Prefer local tools over guessing file contents.",
-    " 2. For write/command/deploy tools, state exactly what you will change first.",
-    " 3. Never delete data or modify .dev.vars / secrets.",
-    " 4. If a tool needs confirmation and it is cancelled, adapt and tell the user.",
-    "Working method (always follow this order for implementation tasks):",
-    "  PLAN → read/explore the relevant files first and state your plan",
-    "  IMPLEMENT → make the change with local_write_file / local_run_command",
-    "  VERIFY → run the tests / build that prove the change works (local_run_tests, local_build_console)",
-    "  REPORT → end with a concise report: what you did, what changed, and the verification result.",
+    ...(LOCAL_ENGINEERING_ENABLED
+      ? [
+          "PLUGIN FACTORY WORKFLOW — taking a plugin concept to SHIPPED (end-to-end, no human needed):",
+          "  1. local_new_plugin (name=...) to scaffold a new plugin from the template (or start from an existing plugin).",
+          "  2. Write the DSP/UI code in plugins/<Name>/Source with local_write_file (edit PluginProcessor.cpp/.h, PluginEditor.cpp/.h).",
+          "  3. local_build_plugin (plugin=<Name>) — builds Release VST3 + Standalone + runs ctest.",
+          "  4. local_plugin_tests (plugin=<Name>) if tests fail or to re-verify.",
+          "  5. local_render_ab (plugin=<Name>) — renders + uploads A/B audio so the Founder can listen remotely and pick a side.",
+          "  6. local_fl_launch_test (plugin=<Name>) — DAW launch test. ALWAYS FL Studio 21 (C:\\Program Files\\Image-Line\\FL Studio 21\\FL64.exe), NEVER FL 2025.",
+          "  7. local_package_release (plugin=<Name>, version=...) — NSIS installer + VST3/Standalone zips.",
+          "  8. local_ship_check (plugin=<Name>) — verify all gates; report READY TO SHIP or list what is missing.",
+          "If the task is 'take X from concept to shipped', run the whole pipeline and report each step's result.",
+          "You can read/write local files, run commands/tests/builds, and deploy the website (engineering mode explicitly enabled on this machine).",
+          "Rules:",
+          " 1. Prefer local tools over guessing file contents.",
+          " 2. For write/command/deploy tools, state exactly what you will change first.",
+          " 3. Never delete data or modify .dev.vars / secrets.",
+          " 4. If a tool needs confirmation and it is cancelled, adapt and tell the user.",
+          "Working method (always follow this order for implementation tasks):",
+          "  PLAN → read/explore the relevant files first and state your plan",
+          "  IMPLEMENT → make the change with local_write_file / local_run_command",
+          "  VERIFY → run the tests / build that prove the change works (local_run_tests, local_build_console)",
+          "  REPORT → end with a concise report: what you did, what changed, and the verification result.",
+        ]
+      : [
+          "EXECUTION BOUNDARY (binding): this machine is the CEO's communication/intelligence environment. Engineering execution — writing or modifying source, building, testing, rendering, packaging, deploying — is REMOTE-ONLY and is dispatched to GitHub Actions by the cloud Executive. The engineering tools are NOT available here; do not attempt engineering work. You may inspect (read-only) and answer non-engineering machine questions.",
+          "Rules:",
+          " 1. Prefer local tools over guessing file contents.",
+          " 2. Never read or reproduce secrets (.dev.vars, keys, auth state) — those reads are denied by policy.",
+          " 3. If something requires engineering execution, say so and stop: the cloud Executive must dispatch it remotely.",
+        ]),
     "If the task includes acceptance criteria, confirm each one is met before reporting DONE.",
     overview
       ? `Live Executive OS context:\n${JSON.stringify(overview, null, 2)}`

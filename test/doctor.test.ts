@@ -21,7 +21,7 @@ describe("System Doctor", () => {
 
   it("runs every check and logs the run", async () => {
     const report = await runDoctor(
-      { store, env: { DEEPSEEK_API_KEY: "x" }, registry: { functionSchemas: () => [{ function: { name: "ok_tool" } }] } as never, now: () => new Date().toISOString() },
+      { store, env: { DEEPSEEK_API_KEY: "x", INTERNAL_SECRET: "test-internal", GITHUB_TOKEN: "test-token" }, registry: { functionSchemas: () => [{ function: { name: "ok_tool" } }] } as never, now: () => new Date().toISOString() },
       { autoFix: true, trigger: "test" },
     );
     expect(report.summary.total).toBe(DOCTOR_CHECKS.length);

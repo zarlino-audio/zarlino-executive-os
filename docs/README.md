@@ -7,6 +7,10 @@
 - `OPERATOR_RUNBOOK.md` — day-to-day operation of the OS (deploy, doctor, recovery).
 - `INSTANCE_AND_RETIREMENT.md` — machine instances (VM / laptop), daemon registration and the
   retirement procedure.
+- `EXECUTION_BOUNDARY.md` — the VM/machine is comms + intelligence only; how engineering work
+  is kept out of the machine queue (creation gate, claim gate, policy sweep).
+- `REMOTE_EXECUTION.md` — engineering runs on GitHub Actions: dispatch, monitoring, evidence,
+  cancellation, statuses and bounds.
 - `REMOTE_DEV_MACHINE.md` — remote build/dev machine notes.
 - `PERCEPTUAL_INTELLIGENCE.md` — perceptual evaluation layer (evaluators, gates, knowledge).
 

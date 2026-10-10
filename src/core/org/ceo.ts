@@ -31,12 +31,14 @@ export interface CeoEnv extends AiEnv, NotifyEnv {
 
 /**
  * The founder's hard line — the only matters the CEO will not decide alone.
- * Everything else, including deploys/releases/publishes, is decided
+ * Everything else, including routine deploys/releases/publishes, is decided
  * autonomously and audited. Keep this list short and serious: money
- * movement, legal, credentials, irreversible destruction, domain/ownership.
+ * movement, legal, credentials, irreversible destruction, domain/ownership,
+ * and CONSEQUENTIAL public commitments (public release / publish-to-public /
+ * production deploy) which spec §6 lists as founder-grade decisions.
  */
 const HARD_ESCALATE_RE =
-  /\b(pay|payment|payout|paystack|invoice|refund|bank|wire|transfer|money|spend|budget|pricing|price|salary|purchase|buy|legal|contract)\b|licen[cs]e key|credential|password|secret|api key|\brotate\b|\bdelete|\bdestroy|\berase|\bwipe\b|\bpurge\b|\bterminate|ownership|\bdomain\b|\bdns\b|irreversible/i;
+  /\b(pay|payment|payout|paystack|invoice|refund|bank|wire|transfer|money|spend|budget|pricing|price|salary|purchase|buy|legal|contract)\b|licen[cs]e key|credential|password|secret|api key|\brotate\b|\bdelete|\bdestroy|\berase|\bwipe\b|\bpurge\b|\bterminate|ownership|\bdomain\b|\bdns\b|irreversible|public release|release to (the )?public|publish(ing)? (publicly|to the public)|production deploy|deploy to production/i;
 
 export interface CeoDecision {
   id: string;

@@ -23,6 +23,8 @@ import { evaluateProductGates } from "./perceptual/manager";
 import { neuronLedger, DEFAULT_EXEC_MODEL } from "../integrations/workersai";
 import { voiceStatus, type VoiceEnv } from "./org/voice";
 import { isInvestigationPrompt, localTaskIntent, originalPromptOf } from "./org/dispatch";
+import { applyExecutionBoundarySweep, isEngineeringPrompt } from "./org/execution-boundary";
+import { remoteRunsSummary } from "./remote/execution";
 export interface DoctorContext {
   store: ExecutiveStore;
   env: Record<string, string | undefined>;
@@ -1005,6 +1007,129 @@ export const DOCTOR_CHECKS: DoctorCheck[] = [
         return okResult("perceptual.evidence_gaps", "No unresolved perceptual evidence gaps", "MEDIUM", "All products have adequate perceptual evidence or no validation gate requiring it.");
       } catch {
         return okResult("perceptual.evidence_gaps", "No unresolved perceptual evidence gaps", "MEDIUM", "Perceptual check unavailable (schema older than v22).");
+      }
+    },
+  },
+  {
+    id: "security.internal_secret",
+    label: "Internal routes are configured and fail closed",
+    severity: "HIGH",
+    run: (ctx) => {
+      const v = ctx.env.INTERNAL_SECRET;
+      if (v && String(v).trim()) {
+        return okResult("security.internal_secret", "Internal routes are configured and fail closed", "HIGH", "INTERNAL_SECRET is configured; internal routes reject unknown callers and no hardcoded fallback exists.");
+      }
+      return failResult(
+        "security.internal_secret",
+        "Internal routes are configured and fail closed",
+        "HIGH",
+        "INTERNAL_SECRET is NOT configured — internal routes accept nobody and worker-side internal calls are skipped (fail closed).",
+        "Set the worker secret: wrangler secret put INTERNAL_SECRET (mirror it into .dev.vars for local tooling).",
+      );
+    },
+  },
+  {
+    id: "execution.boundary",
+    label: "Engineering work cannot execute on a machine (remote-only)",
+    severity: "HIGH",
+    run: (ctx, autoFix) => {
+      if (autoFix) {
+        try {
+          applyExecutionBoundarySweep(ctx.store);
+        } catch {
+          /* sweep is best-effort */
+        }
+      }
+      try {
+        const pending = ctx.store.listLocalTasks(200).filter((t) => ["PENDING", "CLAIMED", "RUNNING"].includes(String(t.status)));
+        const leaks = pending
+          .filter((t) => t.execution_target === "machine_maintenance" && isEngineeringPrompt(originalPromptOf(t as never)))
+          .map((t) => t.id);
+        if (leaks.length > 0) {
+          return failResult(
+            "execution.boundary",
+            "Engineering work cannot execute on a machine (remote-only)",
+            "HIGH",
+            `${leaks.length} engineering-classified row(s) are tagged machine_maintenance: ${leaks.join(", ")}.`,
+            "Cancel/re-route them to remote dispatch (remote.dispatch_workflow) — never let them run locally.",
+          );
+        }
+      } catch {
+        /* older schema — fall through to the ungoverned check */
+      }
+      const ungoverned = ctx.store.listUngovernedLocalTasks(200);
+      if (ungoverned.length > 0) {
+        return warnResult(
+          "execution.boundary",
+          "Engineering work cannot execute on a machine (remote-only)",
+          "HIGH",
+          `${ungoverned.length} legacy local row(s) lack an execution_target tag — they are NOT claimable (fail closed) until classified.`,
+          "Run doctor with autoFix (or wait for the maintenance sweep) to classify them.",
+        );
+      }
+      return okResult("execution.boundary", "Engineering work cannot execute on a machine (remote-only)", "HIGH", "No engineering work in the machine queue; only machine_maintenance rows are claimable.");
+    },
+  },
+  {
+    id: "remote.execution",
+    label: "Remote execution path (GitHub Actions) is configured and fresh",
+    severity: "HIGH",
+    run: (ctx) => {
+      const token = ctx.env.GITHUB_TOKEN;
+      if (!token) {
+        return failResult(
+          "remote.execution",
+          "Remote execution path (GitHub Actions) is configured and fresh",
+          "HIGH",
+          "GITHUB_TOKEN is not configured — remote.dispatch_workflow fails closed and engineering work cannot be dispatched.",
+          "Set the GITHUB_TOKEN worker secret (fine-grained token with actions:write on the repositories).",
+        );
+      }
+      const summary = remoteRunsSummary(ctx.store);
+      const stale = ctx.store
+        .listActiveRemoteRuns(20)
+        .filter((r) => !r.last_synced_at || Date.now() - Date.parse(r.last_synced_at) > 10 * 60_000);
+      if (stale.length > 0) {
+        return warnResult(
+          "remote.execution",
+          "Remote execution path (GitHub Actions) is configured and fresh",
+          "HIGH",
+          `${stale.length} active remote run(s) not synced in 10+ minutes: ${stale.map((r) => r.id).join(", ")}.`,
+          "Run remote.sync_runs (or wait for the alarm sweep; polling is bounded to protect rate limits).",
+        );
+      }
+      return okResult(
+        "remote.execution",
+        "Remote execution path (GitHub Actions) is configured and fresh",
+        "HIGH",
+        `${summary.active} active run(s); ${summary.completedLast7d} completed / ${summary.failedLast7d} failed in the last 7 days.`,
+      );
+    },
+  },
+  {
+    id: "org.objectives",
+    label: "Objectives are verified or have work in flight",
+    severity: "MEDIUM",
+    run: (ctx) => {
+      try {
+        const active = ctx.store.listObjectives("ACTIVE");
+        const stalled = active.filter((o) => {
+          const tasks = ctx.store.listTasksForObjective(o.id);
+          if (tasks.length === 0) return false; // brand-new objective, nothing dispatched yet
+          return tasks.every((t) => t.status === "DONE" || t.status === "CANCELLED");
+        });
+        if (stalled.length > 0) {
+          return warnResult(
+            "org.objectives",
+            "Objectives are verified or have work in flight",
+            "MEDIUM",
+            `${stalled.length} objective(s) have no open work but are not verified: ${stalled.map((o) => o.id).join(", ")}.`,
+            "Verify against criteria and mark ACHIEVED (executive.update_objective) or open the next task.",
+          );
+        }
+        return okResult("org.objectives", "Objectives are verified or have work in flight", "MEDIUM", `${active.length} active objective(s); none is silently stalled.`);
+      } catch {
+        return okResult("org.objectives", "Objectives are verified or have work in flight", "MEDIUM", "Objectives check unavailable (schema older than v39).");
       }
     },
   },

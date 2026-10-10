@@ -33,6 +33,8 @@ export interface IntakeResult {
   acceptance: string;
   roleId: string;
   assignmentId: string | null;
+  /** The persistent objective this directive created (spec §2.4). */
+  objectiveId: string;
 }
 
 /** Words that make a message an instruction rather than a conversation. */
@@ -146,7 +148,7 @@ function extractJson(text: string): Record<string, unknown> | null {
  */
 export function createIntakeTask(
   store: ExecutiveStore,
-  input: { title: string; acceptance: string; roleId: string; from: string },
+  input: { title: string; acceptance: string; roleId: string; from: string; sourceText?: string },
 ): IntakeResult | null {
   try {
     const dup = findDuplicateTask(store, input.title);
@@ -164,10 +166,28 @@ export function createIntakeTask(
       });
       return null;
     }
+    // Every founder directive becomes a PERSISTENT objective with measurable
+    // completion criteria (acceptance §B). The task serves the objective; the
+    // objective survives restarts and is verified as a whole.
+    const at = nowIso();
+    const objectiveId = newId("obj");
+    store.insertObjective({
+      id: objectiveId,
+      title: input.title,
+      description: input.sourceText ? `From the founder: "${input.sourceText.slice(0, 500)}"` : undefined,
+      status: "ACTIVE",
+      priority: 2,
+      source: "founder_whatsapp",
+      criteria_json: input.acceptance || undefined,
+      source_ref: input.from || undefined,
+      created_at: at,
+      updated_at: at,
+    });
     const task = createTask({
       title: input.title,
       description: input.acceptance || undefined,
       success_condition: input.acceptance || undefined,
+      objective_id: objectiveId,
       source: "founder_whatsapp",
     });
     store.insertTask(task);
@@ -193,12 +213,13 @@ export function createIntakeTask(
         acceptance: input.acceptance,
         role_id: input.roleId,
         assignment: assignmentId,
+        objective_id: objectiveId,
       }),
       source: "runtime",
       created_at: nowIso(),
       updated_at: nowIso(),
     });
-    return { taskId: task.id, title: task.title, acceptance: input.acceptance, roleId: input.roleId, assignmentId };
+    return { taskId: task.id, title: task.title, acceptance: input.acceptance, roleId: input.roleId, assignmentId, objectiveId };
   } catch {
     return null;
   }
@@ -233,6 +254,7 @@ export async function intakeFounderDirective(
     acceptance: cls.acceptance,
     roleId: cls.role_id,
     from,
+    sourceText: text,
   });
   if (!result) return null;
   const roleName = roles.find((r) => r.id === result.roleId)?.name;

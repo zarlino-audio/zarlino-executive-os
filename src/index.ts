@@ -26,6 +26,14 @@ import { resolveDaemonAgentId } from "./core/org/agents";
 import { handleInboundWhatsApp, DIGEST_APPROVALS_SETTING } from "./core/org/founder-channel";
 import { composeFounderDigest, cooldown, markFounderMessageSent, voiceStatus } from "./core/org/voice";
 import { prepareDispatch } from "./core/org/dispatch";
+import { applyExecutionBoundarySweep, classifyLocalWork } from "./core/org/execution-boundary";
+import {
+  cancelRemoteRun,
+  dispatchRemoteWorkflow,
+  remoteRunsSummary,
+  syncActiveRemoteRuns,
+  syncRemoteRun,
+} from "./core/remote/execution";
 import { findDuplicateTask, duplicateNote } from "./core/tasks/dedupe";
 import { artifactKey, normalizeArtifactPath, MAX_ARTIFACT_BYTES } from "./core/artifacts";
 import { escalateToFounder, sendWhatsApp } from "./integrations/whatsapp";
@@ -133,13 +141,13 @@ export interface Env {
 }
 
 const INTERNAL_HEADER = "x-exec-internal";
-// Fallback only: production sets the INTERNAL_SECRET worker secret and both
-// the worker and the DO prefer it (keep in sync via internalSecret()).
-const INTERNAL_SECRET = "zarlino-internal-scheduled";
-
-function internalSecret(env?: Env): string {
+// FAIL CLOSED: there is NO hardcoded fallback secret. When INTERNAL_SECRET is
+// not configured, internal routes accept nobody and worker-side internal
+// calls are skipped; the doctor check `security.internal_secret` makes the
+// misconfiguration loud instead of silently permissive.
+function internalSecret(env?: Env): string | null {
   const v = env?.INTERNAL_SECRET;
-  return v && String(v).trim() ? String(v).trim() : INTERNAL_SECRET;
+  return v && String(v).trim() ? String(v).trim() : null;
 }
 const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
 
@@ -204,7 +212,9 @@ function authorized(request: Request, env: Env, store: ExecutiveStore): boolean 
   return false;
 }
 
-function internal(request: Request, secret: string): boolean {
+function internal(request: Request, secret: string | null): boolean {
+  // Fail closed: a missing configured secret never matches (spec §8/§10).
+  if (!secret) return false;
   return request.headers.get(INTERNAL_HEADER) === secret;
 }
 
@@ -470,7 +480,7 @@ Working rules:
 3. Audit-worthy actions are recorded automatically by the tool registry.
 4. Keep replies concise and actionable. Use markdown for structure.
 5. When the Founder asks, run the System Doctor (system.doctor) to check and repair the system; run maintenance (system.maintenance) when housekeeping is needed.
-6. You can queue work for the LOCAL machine via executive.request_local_task / executive.delegate_idea and poll with executive.get_local_task.`;
+6. The LOCAL machine is for non-engineering maintenance only (health/connectivity checks; executive.request_local_task with machine_maintenance:true). ENGINEERING work â€” code changes, builds, tests, renders, packaging, deploys â€” is REMOTE-ONLY: dispatch it to GitHub Actions with remote.dispatch_workflow (attach taskId so evidence lands on the board), then track it with remote.sync_runs.`;
 
 function buildSystemContext(env: Env): ChatMsg {
   return {
@@ -1069,6 +1079,24 @@ export class ExecutiveAgent {
     } catch {
       /* auto-run must never break wake */
     }
+    // Execution boundary (spec §2.3): classify any legacy local rows once â€”
+    // engineering work is cancelled out of the machine queue with an explicit
+    // reason, everything else is tagged machine_maintenance. Idempotent, cheap.
+    try {
+      applyExecutionBoundarySweep(this.store);
+    } catch {
+      /* boundary sweep must never break wake */
+    }
+    // Remote execution (spec §2.5): poll GitHub for dispatched runs on
+    // alarm/cron sweeps only (bounded: 3 runs, 45s min gap per run) â€” never
+    // during request wakes, so console latency is unaffected.
+    if (opts.runAutoJobs) {
+      try {
+        await syncActiveRemoteRuns(this.store, this.env as unknown as { GITHUB_TOKEN?: string }, 3);
+      } catch {
+        /* remote sync must never break the sweep */
+      }
+    }
     // Arm the alarm WITHOUT deferring an already-pending one. Frequent cold
     // starts (console polls) used to re-arm it to +5min every wake, starving
     // the alarm path â€” the very reason auto-runs piled up un-executed.
@@ -1137,6 +1165,7 @@ export class ExecutiveAgent {
       audit: s.listAudit(40),
       files: s.listUploadedFiles(50).map((f) => ({ id: f.id, name: f.name, kind: f.kind, mime: f.mime, sizeBytes: f.size_bytes, created_at: f.created_at })),
       localTasks: s.listLocalTasks(50),
+      remoteRuns: s.listRemoteRuns(30),
       runs: s.listAgentRuns(50),
       toolExecutions: s.listToolExecutions(40),
       metrics: s.listMetrics(10),
@@ -2980,6 +3009,115 @@ export class ExecutiveAgent {
       return json(result);
     }
 
+    // Remote execution (engineering runs on GitHub Actions — spec §2.5).
+    // The VM dispatches, tracks and collects evidence; it never executes.
+    if (path === "/api/remote/runs" && method === "GET") {
+      return json({ summary: remoteRunsSummary(this.store), runs: this.store.listRemoteRuns(50) });
+    }
+    if (path === "/api/remote/dispatch" && method === "POST") {
+      const body = (await readBody<{ repo?: string; workflow?: string; ref?: string; inputs?: Record<string, string>; taskId?: string; objectiveId?: string }>(request).catch(() => ({}))) as { repo?: string; workflow?: string; ref?: string; inputs?: Record<string, string>; taskId?: string; objectiveId?: string };
+      const decision = await dispatchRemoteWorkflow(this.store, this.env, {
+        repo: String(body.repo ?? ""),
+        workflow: String(body.workflow ?? ""),
+        ref: body.ref,
+        inputs: body.inputs,
+        taskId: body.taskId,
+        objectiveId: body.objectiveId,
+        source: "api",
+      });
+      return json(
+        decision.ok ? { ok: true, run: decision.run } : { ok: false, code: decision.code, error: decision.error, existingId: decision.existingId },
+        decision.ok ? 200 : 409,
+      );
+    }
+    if (path === "/api/remote/sync" && method === "POST") {
+      const body = (await readBody<{ limit?: number }>(request).catch(() => ({}))) as { limit?: number };
+      const sweep = await syncActiveRemoteRuns(this.store, this.env, Math.max(1, Math.min(10, Number(body.limit) || 3)));
+      return json({ ok: true, ...sweep });
+    }
+    const remoteSyncOne = /^\/api\/remote\/runs\/([^/]+)\/sync$/.exec(path);
+    if (remoteSyncOne && method === "POST") {
+      const r = await syncRemoteRun(this.store, this.env, decodeURIComponent(remoteSyncOne[1]!));
+      return r ? json({ ok: true, run: r.run, note: r.note ?? null }) : json({ error: "Remote run not found" }, 404);
+    }
+    const remoteCancelOne = /^\/api\/remote\/runs\/([^/]+)\/cancel$/.exec(path);
+    if (remoteCancelOne && method === "POST") {
+      const body = (await readBody<{ reason?: string }>(request).catch(() => ({}))) as { reason?: string };
+      const r = await cancelRemoteRun(this.store, this.env, decodeURIComponent(remoteCancelOne[1]!), body.reason);
+      return json({ ok: r.ok, note: r.note });
+    }
+
+    // Objectives — persistent organizational objectives (spec §2.4 / §4).
+    if (path === "/api/objectives" && method === "GET") {
+      const status = url.searchParams.get("status") ?? undefined;
+      return json({
+        objectives: this.store.listObjectives(status ?? undefined).map((o) => ({
+          ...o,
+          tasks: this.store.listTasksForObjective(o.id).map((t) => ({ id: t.id, title: t.title, status: t.status })),
+        })),
+      });
+    }
+    if (path === "/api/objectives" && method === "POST") {
+      const body = (await readBody<{ title?: string; description?: string; criteria?: string }>(request).catch(() => ({}))) as { title?: string; description?: string; criteria?: string };
+      if (!body.title?.trim()) return json({ error: "title required" }, 400);
+      const at = nowIso();
+      const id = newId("obj");
+      this.store.insertObjective({
+        id,
+        title: body.title.trim().slice(0, 200),
+        description: body.description?.slice(0, 1000),
+        status: "ACTIVE",
+        priority: 2,
+        source: "founder",
+        criteria_json: body.criteria?.slice(0, 2000),
+        created_at: at,
+        updated_at: at,
+      });
+      return json({ ok: true, id });
+    }
+    const objPatch = /^\/api\/objectives\/([^/]+)$/.exec(path);
+    if (objPatch && (method === "PATCH" || method === "POST")) {
+      const id = decodeURIComponent(objPatch[1]!);
+      const objective = this.store.getObjective(id);
+      if (!objective) return json({ error: "Objective not found" }, 404);
+      const body = (await readBody<{ status?: string; criteria?: string; evidence?: string }>(request).catch(() => ({}))) as { status?: string; criteria?: string; evidence?: string };
+      const status = ["ACTIVE", "PAUSED", "ACHIEVED", "CANCELLED"].includes(String(body.status ?? "")) ? String(body.status) : undefined;
+      if (status === "ACHIEVED") {
+        // Acceptance gate: an objective is never marked complete while linked
+        // tasks are open or no measurable criteria exist (spec §4 stage 7).
+        const tasks = this.store.listTasksForObjective(id);
+        const open = tasks.filter((t) => t.status !== "DONE" && t.status !== "CANCELLED");
+        if (open.length > 0) {
+          return json({ error: `cannot mark ACHIEVED: ${open.length} linked task(s) still open`, open }, 409);
+        }
+        if (!(body.criteria?.trim() || objective.criteria_json)) {
+          return json({ error: "cannot mark ACHIEVED: no completion criteria recorded" }, 409);
+        }
+      }
+      const at = nowIso();
+      const patch: Record<string, unknown> = {};
+      if (status) patch.status = status;
+      if (body.criteria?.trim()) patch.criteria_json = body.criteria.trim().slice(0, 2000);
+      if (body.evidence?.trim()) patch.evidence_json = body.evidence.trim().slice(0, 2000);
+      if (status === "ACHIEVED") {
+        patch.verified_at = at;
+        patch.completed_at = at;
+      }
+      this.store.updateObjective(id, patch as never);
+      this.store.insertAudit({
+        id: newId("aud"),
+        actor: "founder",
+        action: "objective.updated",
+        entity_type: "objectives",
+        entity_id: id,
+        detail_json: JSON.stringify({ status: status ?? null }),
+        source: "api",
+        created_at: at,
+        updated_at: at,
+      });
+      return json({ ok: true, objective: this.store.getObjective(id) });
+    }
+
     // Export / import
     if (path === "/api/export" && method === "GET") {
       return json({ ok: true, exportedAt: nowIso(), snapshot: this.store.exportSnapshot() });
@@ -3342,7 +3480,7 @@ export class ExecutiveAgent {
         model: "deepseek-v4",
         host: body.host ?? agentId,
         version: body.version,
-        capabilitiesJson: JSON.stringify(["local_execution", "build", "render", "automation"]),
+        capabilitiesJson: JSON.stringify(["machine_maintenance"]),
       });
       return json({ ok: true, lastSeen: nowIso(), agentId });
     }
@@ -3355,8 +3493,14 @@ export class ExecutiveAgent {
     // through the same dispatch policy as the agent, so a duplicate or a
     // repeated research pass is refused with the reason (and the existing id).
     if (path === "/api/local-tasks" && method === "POST") {
-      const body = (await readBody<{ prompt?: string; taskId?: string }>(request).catch(() => ({}))) as { prompt?: string; taskId?: string };
+      const body = (await readBody<{ prompt?: string; taskId?: string; machine_maintenance?: boolean }>(request).catch(() => ({}))) as { prompt?: string; taskId?: string; machine_maintenance?: boolean };
       if (!body.prompt || !body.prompt.trim()) return json({ error: "prompt required" }, 400);
+      // Execution boundary (spec §2.3): engineering work never queues for a
+      // machine — it must be dispatched remotely (GitHub Actions).
+      const boundary = classifyLocalWork(body.prompt.trim(), body.machine_maintenance === true);
+      if (!boundary.local_allowed) {
+        return json({ ok: false, refused: true, code: "REMOTE_ONLY", boundary: boundary.reason }, 409);
+      }
       const decision = prepareDispatch(this.store, { prompt: body.prompt.trim(), taskId: body.taskId });
       if (!decision.ok) {
         return json({ ok: false, refused: true, code: decision.code, existingId: decision.existingId, error: decision.error }, 409);
@@ -3371,7 +3515,8 @@ export class ExecutiveAgent {
         task_id: body.taskId,
         prompt: decision.prompt,
         status: "PENDING",
-        meta_json: JSON.stringify({ investigation: decision.investigation, original_prompt: body.prompt.trim() }),
+        execution_target: boundary.target,
+        meta_json: JSON.stringify({ investigation: decision.investigation, original_prompt: body.prompt.trim(), execution_target: boundary.target }),
       });
       this.store.insertAudit({
         id: newId("aud"),
@@ -3379,17 +3524,19 @@ export class ExecutiveAgent {
         action: "local_tasks.dispatch",
         entity_type: "local_tasks",
         entity_id: id,
-        detail_json: JSON.stringify({ task_id: body.taskId ?? null, discovery: decision.investigation }),
+        detail_json: JSON.stringify({ task_id: body.taskId ?? null, discovery: decision.investigation, execution_target: boundary.target }),
         source: "api",
         created_at: at,
         updated_at: at,
       });
-      return json({ ok: true, taskId: id, discovery: decision.investigation });
+      return json({ ok: true, taskId: id, discovery: decision.investigation, execution_target: boundary.target });
     }
     if (path === "/api/local-tasks/claim" && method === "POST") {
       const body = (await readBody<{ claimer?: string }>(request).catch(() => ({}))) as { claimer?: string };
       const task = this.store.claimLocalTask(body.claimer ?? "api");
-      return task ? json({ ok: true, task }) : json({ ok: true, task: null });
+      return task
+        ? json({ ok: true, task })
+        : json({ ok: true, task: null, boundary: "machine maintenance only — engineering work is remote-only (GitHub Actions)" });
     }
     if (path === "/api/local-tasks/heartbeat" && method === "POST") {
       const body = (await readBody<{ id?: string; status?: string }>(request).catch(() => ({}))) as { id?: string; status?: string };
@@ -3859,10 +4006,12 @@ interface BackupResult {
 /** Export the full OS snapshot from the DO and land it in R2 (kept 30 deep). */
 async function runDailyBackup(env: Env, stub: DurableObjectStub): Promise<BackupResult> {
   if (!env.ARTIFACTS) return { ok: false, error: "R2 binding ARTIFACTS is not configured" };
+  const secret = internalSecret(env);
+  if (!secret) return { ok: false, error: "INTERNAL_SECRET is not configured — internal routes fail closed; set the worker secret" };
   const res = await stub.fetch(
     new Request("https://executive.internal/api/_backup-export", {
       method: "POST",
-      headers: { [INTERNAL_HEADER]: internalSecret(env) },
+      headers: { [INTERNAL_HEADER]: secret },
     }),
   );
   if (!res.ok) return { ok: false, error: `snapshot export failed (HTTP ${res.status})` };
@@ -4000,16 +4149,19 @@ async function runExternalChecks(
  * second, independent channel (ntfy) when ALERT_NTFY_URL is configured.
  */
 async function notifyBoth(env: Env, stub: DurableObjectStub, subject: string, body: string, priority: string): Promise<void> {
-  try {
-    await stub.fetch(
-      new Request("https://executive.internal/api/_alert", {
-        method: "POST",
-        headers: { [INTERNAL_HEADER]: internalSecret(env), "content-type": "application/json" },
-        body: JSON.stringify({ subject, body, priority }),
-      }),
-    );
-  } catch {
-    /* founder channel is best-effort; ntfy still fires */
+  const secret = internalSecret(env);
+  if (secret) {
+    try {
+      await stub.fetch(
+        new Request("https://executive.internal/api/_alert", {
+          method: "POST",
+          headers: { [INTERNAL_HEADER]: secret, "content-type": "application/json" },
+          body: JSON.stringify({ subject, body, priority }),
+        }),
+      );
+    } catch {
+      /* founder channel is best-effort; ntfy still fires */
+    }
   }
   const ntfy = env.ALERT_NTFY_URL;
   if (ntfy) {
@@ -4105,11 +4257,18 @@ export default {
       controller.noRetry();
       return;
     }
-    // Internal kick that runs doctor + auto-run + reschedules.
+    // Internal kick that runs doctor + auto-run + reschedules. Fail closed:
+    // without INTERNAL_SECRET the DO refuses the kick, so skip it explicitly
+    // instead of sending an unauthenticated request.
+    const kickSecret = internalSecret(env);
+    if (!kickSecret) {
+      controller.noRetry();
+      return;
+    }
     await stub.fetch(
       new Request("https://executive.internal/api/_scheduled", {
         method: "POST",
-        headers: { [INTERNAL_HEADER]: internalSecret(env) },
+        headers: { [INTERNAL_HEADER]: kickSecret },
       }),
     );
     controller.noRetry();

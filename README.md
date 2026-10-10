@@ -21,10 +21,25 @@ research & maintenance tasks, gates risky actions behind approvals, and — sinc
 | **Integrations** | Web fetch/search, website deploy (wrangler), GitHub (repos/issues/PRs), Cloudflare (pages deploy), vision (image description), Paystack (revenue + transfers) |
 | **Chat** | SSE-streamed DeepSeek chat with tool-calling loop, budget-gated |
 | **Files** | Uploaded-file registry with size/type validation |
-| **Local bridge** | `local_tasks` — the CLI agent (`scripts/local-agent.ts`) claims & executes machine tasks, heartbeats progress, reports results |
+| **Local bridge (boundary)** | `local_tasks` — machine MAINTENANCE only (health/liveness/connectivity checks). Engineering work never runs locally: it is dispatched to GitHub Actions and tracked as a remote run (`remote.*` tools). The execution boundary is enforced at creation, at claim time and by an idempotent policy sweep (see `docs/EXECUTION_BOUNDARY.md`) |
 | **Productivity Manager** | Token budgets per scope, task→role/skill assignment, cost-efficiency optimization (stale-assignment reaping, budget reallocation, batching/model-tier recommendations), contradiction & misconception detection with audit-trailed resolution |
 | **System Doctor** | Self-healing health checks, auto-fixes safe issues, logs every run, exposes `/api/doctor/run` + `/api/doctor/logs` |
 | **Console** | Founder web console (`web/`): overview, Doctor, chat, tasks, approvals, productivity, budget settings |
+
+---
+
+## Execution boundary & remote execution (v39)
+
+The VM/machine that hosts the founder channel is the CEO's **communication and intelligence
+environment — not an engineering workstation**. Engineering work is executed remotely on
+GitHub Actions via `remote.dispatch_workflow`, tracked as persistent runs, and verified from
+the run's conclusion and artifacts (evidence lands on the linked task; verified only on
+success). Local machine dispatch is limited to explicitly acknowledged non-engineering
+maintenance and is refused (`REMOTE_ONLY`) otherwise. Cancellation propagates to GitHub;
+failed runs are recorded as failures and never mark work complete.
+
+See [`docs/EXECUTION_BOUNDARY.md`](docs/EXECUTION_BOUNDARY.md) and
+[`docs/REMOTE_EXECUTION.md`](docs/REMOTE_EXECUTION.md).
 
 ---
 
@@ -55,6 +70,10 @@ Checks (`src/core/doctor.ts`):
 | `productivity.stale_assignments` | MEDIUM | marks 48h-no-progress assignments STALLED |
 | `productivity.budget_health` | MEDIUM | — (reported; warns at ≥90% of monthly budget) |
 | `productivity.contradictions` | LOW | — (reported; count of open findings) |
+| `security.internal_secret` | HIGH | — (FAILs when INTERNAL_SECRET is unset; internal routes fail closed, no hardcoded fallback) |
+| `execution.boundary` | HIGH | classifies legacy local rows (engineering → CANCELLED with remote redirect; rest → machine_maintenance) |
+| `remote.execution` | HIGH | — (FAILs without GITHUB_TOKEN; WARNs when active remote runs are not synced) |
+| `org.objectives` | MEDIUM | — (WARNs when an objective has no open work but is not verified) |
 
 Every run is logged to `doctor_logs` (migration v17) and is visible in the console and via
 `GET /api/doctor/logs`. The public `GET /api/health` reports the last Doctor result so

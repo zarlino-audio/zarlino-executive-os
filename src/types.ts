@@ -73,6 +73,14 @@ export interface Objective {
   created_at: string;
   updated_at: string;
   completed_at?: string;
+  /** Measurable completion criteria (founder instruction / CAO draft). */
+  criteria_json?: string;
+  /** When the objective's completion was verified against its criteria. */
+  verified_at?: string;
+  /** Provenance for founder-created objectives (e.g. WhatsApp message id). */
+  source_ref?: string;
+  /** Evidence locators recorded at verification time (URLs, run ids, hashes). */
+  evidence_json?: string;
 }
 
 export interface Project {
@@ -97,6 +105,8 @@ export interface Task {
   title: string;
   description?: string;
   project_id?: string;
+  /** The organizational objective this task serves (acceptance §B). */
+  objective_id?: string;
   decision_id?: string;
   assignee_person_id?: string;
   status: TaskStatus | string;
@@ -775,6 +785,47 @@ export interface LocalTask {
   updated_at: string;
   lease_expires_at?: string;
   meta_json?: string;
+  /**
+   * Execution-boundary target ("machine_maintenance" | "engineering").
+   * Engineering work is REMOTE-ONLY (GitHub Actions); a machine daemon may
+   * only claim rows explicitly marked machine_maintenance.
+   */
+  execution_target?: string;
+}
+
+/** Remote executions are GitHub Actions runs dispatched by the Executive OS. */
+export type RemoteRunStatus =
+  | "DISPATCHED"
+  | "QUEUED"
+  | "IN_PROGRESS"
+  | "COMPLETED"
+  | "FAILED"
+  | "CANCELLED"
+  | "UNMATCHED";
+
+export interface RemoteRun {
+  id: string;
+  task_id?: string;
+  objective_id?: string;
+  repo: string;
+  workflow_file: string;
+  ref: string;
+  inputs_json?: string;
+  status: RemoteRunStatus | string;
+  conclusion?: string;
+  github_run_id?: string;
+  run_url?: string;
+  artifacts_json?: string;
+  evidence_id?: string;
+  dispatched_at: string;
+  last_synced_at?: string;
+  finished_at?: string;
+  cancel_requested_at?: string;
+  error?: string;
+  detail_json?: string;
+  source: string;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface UploadedFile {

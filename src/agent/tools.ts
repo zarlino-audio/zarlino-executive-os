@@ -18,6 +18,10 @@ import { visionTools } from "../integrations/vision";
 import { paystackTools } from "../integrations/paystack";
 import { doctorTools } from "../core/doctor";
 import { prepareDispatch } from "../core/org/dispatch";
+import { classifyLocalWork } from "../core/org/execution-boundary";
+import { cancelRemoteRunsForTask } from "../core/remote/execution";
+import { remoteTools } from "../integrations/remote";
+import { escalateToFounder } from "../integrations/whatsapp";
 import { findDuplicateTask, duplicateNote } from "../core/tasks/dedupe";
 import { assessFinancials } from "../core/finance/calc";
 import { createTask } from "../core/tasks/model";
@@ -708,24 +712,145 @@ function internalTools(): Tool[] {
         });
         // Disarm auto-run: a cancelled task must never be claimable again.
         store.updateTask(input.taskId, { auto_run: 0 });
-        return { ok: true, id: cancelled.id, title: cancelled.title, status: cancelled.status, reason: input.reason };
+        // Cancellation propagates: remote runs for this task are cancelled on
+        // GitHub where supported; a run that already finished is reported as
+        // its true terminal state, never as a fake cancel (spec §9).
+        const remote = await cancelRemoteRunsForTask(
+          store,
+          ctx.env as { GITHUB_TOKEN?: string },
+          input.taskId,
+          input.reason,
+        ).catch(() => ({ attempted: 0, notes: ["remote cancellation check failed"] as string[] }));
+        return { ok: true, id: cancelled.id, title: cancelled.title, status: cancelled.status, reason: input.reason, remote };
+      },
+    },
+    {
+      name: "executive.list_objectives",
+      description:
+        "List persistent organizational objectives with their completion criteria, status and linked task counts (open vs total). Use this to check the state of a founder directive before reporting progress.",
+      inputSchema: z.object({ status: z.string().max(40).optional() }),
+      requiredPermission: "read",
+      riskLevel: "LOW",
+      reversible: true,
+      auditRequired: false,
+      run: async (ctx: ToolContext, input: { status?: string }) => {
+        const store = ctx.store;
+        if (!store) throw new Error("store unavailable");
+        return {
+          objectives: store.listObjectives(input.status || undefined).slice(0, 50).map((o) => {
+            const tasks = store.listTasksForObjective(o.id);
+            const open = tasks.filter((t) => t.status !== "DONE" && t.status !== "CANCELLED").length;
+            return {
+              id: o.id,
+              title: o.title,
+              status: o.status,
+              criteria: o.criteria_json ?? null,
+              verified_at: o.verified_at ?? null,
+              tasks: tasks.length,
+              open_tasks: open,
+              created_at: o.created_at,
+            };
+          }),
+        };
+      },
+    },
+    {
+      name: "executive.update_objective",
+      description:
+        "Update an objective: record completion criteria, change status (ACTIVE/PAUSED/ACHIEVED/CANCELLED), or attach verification evidence. ACHIEVED is REFUSED while any linked task is still open or when no completion criteria are recorded — an objective is never marked complete while mandatory criteria remain unsatisfied (spec §4 stage 7). Founder is notified when an objective is achieved.",
+      inputSchema: z.object({
+        id: z.string().min(3).max(80),
+        status: z.enum(["ACTIVE", "PAUSED", "ACHIEVED", "CANCELLED"]).optional(),
+        criteria: z.string().max(2000).optional(),
+        evidence: z.string().max(2000).optional(),
+      }),
+      requiredPermission: "modify",
+      riskLevel: "LOW",
+      reversible: true,
+      auditRequired: true,
+      run: async (ctx: ToolContext, input: { id: string; status?: "ACTIVE" | "PAUSED" | "ACHIEVED" | "CANCELLED"; criteria?: string; evidence?: string }) => {
+        const store = ctx.store;
+        if (!store) throw new Error("store unavailable");
+        const objective = store.getObjective(input.id);
+        if (!objective) return { ok: false, error: `objective ${input.id} not found` };
+        const criteria = input.criteria?.trim() || objective.criteria_json || "";
+        if (input.status === "ACHIEVED") {
+          const tasks = store.listTasksForObjective(objective.id);
+          const open = tasks.filter((t) => t.status !== "DONE" && t.status !== "CANCELLED");
+          if (open.length > 0) {
+            return {
+              ok: false,
+              error: `cannot mark ACHIEVED: ${open.length} linked task(s) still open`,
+              open_tasks: open.map((t) => ({ id: t.id, title: t.title, status: t.status })),
+            };
+          }
+          if (!criteria) {
+            return { ok: false, error: "cannot mark ACHIEVED: no completion criteria recorded — record criteria first" };
+          }
+        }
+        const at = nowIso();
+        const patch: Record<string, unknown> = { updated_at: at };
+        if (input.status) patch.status = input.status;
+        if (input.criteria) patch.criteria_json = input.criteria.trim();
+        if (input.evidence) patch.evidence_json = input.evidence.trim();
+        if (input.status === "ACHIEVED") {
+          patch.verified_at = at;
+          patch.completed_at = at;
+        }
+        store.updateObjective(objective.id, patch as never);
+        store.insertAudit({
+          id: newId("aud"),
+          actor: "cao_agent_01",
+          action: "objective.updated",
+          entity_type: "objectives",
+          entity_id: objective.id,
+          detail_json: JSON.stringify({ status: input.status ?? null, criteria: !!input.criteria, evidence: !!input.evidence }),
+          source: "runtime",
+          created_at: at,
+          updated_at: at,
+        });
+        if (input.status === "ACHIEVED") {
+          const tasks = store.listTasksForObjective(objective.id);
+          const evidenceList = input.evidence ? `\nEvidence: ${input.evidence}` : "";
+          await escalateToFounder(store, ctx.env as never, {
+            subject: `\u2705 Objective achieved: ${objective.title}`,
+            body: `Criteria met: ${criteria}. Tasks closed: ${tasks.length}/${tasks.length}.${evidenceList}`,
+            source: "objective",
+            priority: "NORMAL",
+          });
+        }
+        const next = store.getObjective(objective.id);
+        return { ok: true, objective: next ? { id: next.id, title: next.title, status: next.status, criteria: next.criteria_json ?? null, verified_at: next.verified_at ?? null } : null };
       },
     },
     {
       name: "executive.request_local_task",
       description:
-        "Queue a task for the LOCAL machine (this dev machine, where the repo + plugin UI source live). The local daemon claims it, inspects plugin UI / repo files locally, runs commands or builds if needed, and posts a report back. Use this when you need to inspect something that only exists on the local machine (plugin UI source, local files, local builds). Returns a taskId to poll with executive.get_local_task.",
+        "Queue a NON-ENGINEERING maintenance task for the local machine (health/liveness checks, local facts, connectivity). EXECUTION BOUNDARY: the local machine/VM never executes engineering work — code changes, builds, tests, renders, packaging and deploys are REMOTE-ONLY and must be dispatched to GitHub Actions via remote.dispatch_workflow. Engineering prompts (or prompts without an explicit machine_maintenance acknowledgement) are refused with code REMOTE_ONLY.",
       inputSchema: z.object({
         prompt: z.string().min(1).max(8000),
         taskId: z.string().max(64).optional(),
+        machine_maintenance: z.boolean().optional(),
       }),
       requiredPermission: "create",
       riskLevel: "LOW",
       reversible: true,
       auditRequired: true,
-      run: async (ctx: ToolContext, input: { prompt: string; taskId?: string }) => {
+      run: async (ctx: ToolContext, input: { prompt: string; taskId?: string; machine_maintenance?: boolean }) => {
         const store = ctx.store;
         if (!store) throw new Error("store unavailable");
+        // Execution boundary first (spec §2.3): engineering work is never
+        // queued for a machine; it goes to the remote environment instead.
+        const boundary = classifyLocalWork(input.prompt, input.machine_maintenance === true);
+        if (!boundary.local_allowed) {
+          return {
+            queued: false,
+            refused: true,
+            code: "REMOTE_ONLY",
+            boundary: boundary.reason,
+            note: "Engineering execution is remote-only. Use remote.dispatch_workflow (GitHub Actions) for this work; local dispatch is limited to non-engineering machine checks with machine_maintenance:true.",
+          };
+        }
         // Dispatch policy: no duplicate prompts, one discovery pass per task,
         // act-first directive + prior evidence attached (see core/org/dispatch).
         const decision = prepareDispatch(store, { prompt: input.prompt, taskId: input.taskId });
@@ -749,32 +874,35 @@ function internalTools(): Tool[] {
           task_id: input.taskId,
           prompt: decision.prompt,
           status: "PENDING",
-          meta_json: JSON.stringify({ investigation: decision.investigation, original_prompt: input.prompt }),
+          execution_target: boundary.target,
+          meta_json: JSON.stringify({ investigation: decision.investigation, original_prompt: input.prompt, execution_target: boundary.target }),
         });
         return {
           queued: true,
           taskId: id,
           discovery: decision.investigation,
-          note: "Queued for the local machine. Poll executive.get_local_task (or the web console Local Work card) for the result — the local daemon must be running.",
+          execution_target: boundary.target,
+          note: "Queued as machine maintenance. Poll executive.get_local_task (or the web console Local Work card) for the result — the local daemon must be running.",
         };
       },
     },
     {
       name: "executive.delegate_idea",
       description:
-        "Turn a high-level idea into concrete LOCAL implementation work (the bridge between the CEO's idea and the machine that can build it). You provide the idea + optional context; this tool creates a task for the local machine WITH a structured brief (goal, context, acceptance criteria, deliverable) so the local agent knows exactly what 'done' means. Returns a taskId to poll with executive.get_local_task.",
+        "Turn a high-level idea into a concrete brief (goal, context, acceptance criteria, deliverable). EXECUTION BOUNDARY: implementation ideas are ENGINEERING work — they are refused for local execution and must be dispatched to GitHub Actions via remote.dispatch_workflow (create the task first so evidence lands on the board). Only explicitly non-engineering machine checks (machine_maintenance:true) may be queued locally.",
       inputSchema: z.object({
         idea: z.string().min(1).max(4000),
         context: z.string().max(4000).optional(),
         acceptance: z.string().max(2000).optional(),
         deliverable: z.string().max(1000).optional(),
         taskId: z.string().max(64).optional(),
+        machine_maintenance: z.boolean().optional(),
       }),
       requiredPermission: "create",
       riskLevel: "LOW",
       reversible: true,
       auditRequired: true,
-      run: async (ctx: ToolContext, input: { idea: string; context?: string; acceptance?: string; deliverable?: string; taskId?: string }) => {
+      run: async (ctx: ToolContext, input: { idea: string; context?: string; acceptance?: string; deliverable?: string; taskId?: string; machine_maintenance?: boolean }) => {
         const store = ctx.store;
         if (!store) throw new Error("store unavailable");
         const id = newId("ltk");
@@ -797,6 +925,18 @@ function internalTools(): Tool[] {
         ]
           .filter(Boolean)
           .join("\n\n");
+        // Execution boundary: implementation work never runs on a machine.
+        const boundary = classifyLocalWork(prompt, input.machine_maintenance === true);
+        if (!boundary.local_allowed) {
+          return {
+            queued: false,
+            refused: true,
+            code: "REMOTE_ONLY",
+            boundary: boundary.reason,
+            brief,
+            note: "Engineering work is remote-only. Create/assign a task, then dispatch the repository's GitHub Actions workflow with remote.dispatch_workflow (attach taskId so CI evidence lands on the board).",
+          };
+        }
         const decision = prepareDispatch(store, { prompt, taskId: input.taskId });
         if (!decision.ok) {
           return {
@@ -817,14 +957,15 @@ function internalTools(): Tool[] {
           task_id: input.taskId,
           prompt: decision.prompt,
           status: "PENDING",
-          meta_json: JSON.stringify({ ...brief, investigation: decision.investigation, original_prompt: prompt }),
+          execution_target: boundary.target,
+          meta_json: JSON.stringify({ ...brief, investigation: decision.investigation, original_prompt: prompt, execution_target: boundary.target }),
         });
         ctx.audit("executive", "local.task.delegated", "local_task", id, { taskId: input.taskId });
         return {
           queued: true,
           taskId: id,
           brief,
-          note: "Delegated to the local machine with a structured brief. Poll executive.get_local_task for the result.",
+          note: "Delegated as machine maintenance. Poll executive.get_local_task for the result.",
         };
       },
     },
@@ -2255,6 +2396,7 @@ export function buildToolRegistry(deps: {
   const env = deps.env;
   for (const tool of [
     ...githubTools(env),
+    ...remoteTools(),
     ...cloudflareTools(env),
     ...youtubeTools(env),
     ...websiteTools(env),

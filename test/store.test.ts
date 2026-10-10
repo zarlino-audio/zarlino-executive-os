@@ -64,6 +64,7 @@ describe("ExecutiveStore (node:sqlite)", () => {
 
     store.createLocalTask({
       id: "lt_lease", prompt: "y", status: "CLAIMED", claimed_by: "ghost", source: "test",
+      execution_target: "machine_maintenance",
       created_at: now, updated_at: now,
       lease_expires_at: new Date(Date.now() - 60 * 1000).toISOString(),
     });
@@ -102,6 +103,7 @@ describe("ExecutiveStore (node:sqlite)", () => {
   it("local task claim lease round-trips", () => {
     store.createLocalTask({
       id: "lt_claim", prompt: "do work", status: "PENDING", source: "test",
+      execution_target: "machine_maintenance",
       created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
     });
     // claimLocalTask claims the OLDEST pending task — lt_lease (re-queued by
@@ -120,22 +122,22 @@ describe("ExecutiveStore (node:sqlite)", () => {
     // DONE with the limit message (runTurn returns it instead of throwing).
     store.createLocalTask({
       id: "lt_limited", prompt: "long task", status: "DONE", result: "Reached the tool-call limit — please rephrase or narrow the task.",
-      source: "test", created_at: now, updated_at: now,
+      source: "test", execution_target: "machine_maintenance", created_at: now, updated_at: now,
     });
     // FAILED with the limit message in error.
     store.createLocalTask({
       id: "lt_limited2", prompt: "long task 2", status: "FAILED", error: "Reached the tool-call limit",
-      source: "test", created_at: now, updated_at: now,
+      source: "test", execution_target: "machine_maintenance", created_at: now, updated_at: now,
     });
     // DONE with a funding error — must NOT be requeued.
     store.createLocalTask({
       id: "lt_nomoney", prompt: "paywall", status: "FAILED", error: "DeepSeek HTTP 402: Insufficient Balance",
-      source: "test", created_at: now, updated_at: now,
+      source: "test", execution_target: "machine_maintenance", created_at: now, updated_at: now,
     });
     // DONE normally — must NOT be requeued.
     store.createLocalTask({
       id: "lt_ok", prompt: "fine", status: "DONE", result: "all good",
-      source: "test", created_at: now, updated_at: now,
+      source: "test", execution_target: "machine_maintenance", created_at: now, updated_at: now,
     });
 
     const ids = store.requeueLocalTasks();

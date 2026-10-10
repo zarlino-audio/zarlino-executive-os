@@ -8,6 +8,7 @@ export interface CreateTaskInput {
   title: string;
   description?: string;
   project_id?: string;
+  objective_id?: string;
   decision_id?: string;
   assignee_person_id?: string;
   priority?: Priority | string;
@@ -25,6 +26,7 @@ export function createTask(input: CreateTaskInput): Task {
     title: input.title.trim(),
     description: input.description?.trim() ?? undefined,
     project_id: input.project_id,
+    objective_id: input.objective_id,
     decision_id: input.decision_id,
     assignee_person_id: input.assignee_person_id,
     status: input.status ?? "OPEN",

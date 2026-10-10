@@ -76,6 +76,7 @@ import type {
   Product,
   ProductValidation,
   PostObjectiveRecord,
+  RemoteRun,
   ProductivityAssignment,
   ProductivityMetric,
   ProductStatusRecord,
@@ -198,6 +199,15 @@ export class ExecutiveStore implements CostStorage {
   getObjective(id: string): Objective | null {
     const rows = this.sql.all<Row>("SELECT * FROM objectives WHERE id = ?", id);
     return rows.length ? rowTo<Objective>(rows[0]) : null;
+  }
+  updateObjective(id: string, patch: Partial<Objective>): void {
+    this.update("objectives", id, patch as Row);
+  }
+  /** Tasks linked to an objective (objective → task linkage, spec §2.4). */
+  listTasksForObjective(objectiveId: string, limit = 200): Task[] {
+    return this.sql
+      .all<Row>("SELECT * FROM tasks WHERE objective_id = ? ORDER BY created_at ASC LIMIT ?", objectiveId, limit)
+      .map((r) => rowTo<Task>(r));
   }
 
   // -- projects -----------------------------------------------------------
@@ -2433,10 +2443,15 @@ export class ExecutiveStore implements CostStorage {
    * Atomically claim the oldest PENDING task for a local daemon, with a lease
    * (default 10 min, extended by heartbeats). If the daemon's machine goes
    * offline, the lease lapses and another daemon can re-claim the task.
+   *
+   * EXECUTION BOUNDARY (spec §2.3): only rows explicitly tagged
+   * `machine_maintenance` are claimable. Engineering work is remote-only and
+   * never enters this queue; untagged legacy rows are not claimable either
+   * (fail closed) until the boundary sweep classifies them.
    */
   claimLocalTask(claimer: string, leaseMs = 10 * 60_000): LocalTask | null {
     const rows = this.sql.all<Row>(
-      "SELECT * FROM local_tasks WHERE status = 'PENDING' ORDER BY created_at ASC LIMIT 1",
+      "SELECT * FROM local_tasks WHERE status = 'PENDING' AND execution_target = 'machine_maintenance' ORDER BY created_at ASC LIMIT 1",
     );
     const task = rows[0];
     if (!task) return null;
@@ -2494,12 +2509,10 @@ export class ExecutiveStore implements CostStorage {
   }
   /**
    * Requeue completed/failed local tasks whose result or error mentions a
-   * retryable condition (default: the tool-call limit). A task that "finished"
-   * with the tool-call-limit message never actually completed — it returns to
-   * PENDING so the daemon retries it with the extended limit. Tasks whose text
-   * contains `exclude` (default "402" — insufficient balance, needs funding)
-   * are skipped. Uses SQL LIKE so only matching rows are read (row-budget safe).
-   * Returns the requeued ids.
+   * retryable condition (default: the tool-call limit). Only rows tagged
+   * `machine_maintenance` are eligible — engineering rows are never requeued
+   * onto a machine (execution boundary, spec §2.3). Tasks whose text contains
+   * `exclude` (default "402") are skipped. Returns the requeued ids.
    */
   requeueLocalTasks(opts: { match?: string; exclude?: string; limit?: number } = {}): string[] {
     const match = opts.match ?? "tool-call limit";
@@ -2507,7 +2520,7 @@ export class ExecutiveStore implements CostStorage {
     const limit = Math.max(1, Math.min(5000, opts.limit ?? 2000));
     const like = `%${match}%`;
     const rows = this.sql.all<Row>(
-      "SELECT id, result, error FROM local_tasks WHERE status IN ('DONE','FAILED') AND (result LIKE ? OR error LIKE ?) ORDER BY updated_at ASC LIMIT ?",
+      "SELECT id, result, error FROM local_tasks WHERE status IN ('DONE','FAILED') AND (result LIKE ? OR error LIKE ?) AND execution_target = 'machine_maintenance' ORDER BY updated_at ASC LIMIT ?",
       like, like, limit,
     );
     const now = new Date().toISOString();
@@ -2516,12 +2529,73 @@ export class ExecutiveStore implements CostStorage {
       const text = `${String(r.result ?? "")} ${String(r.error ?? "")}`;
       if (exclude && text.includes(exclude)) continue;
       this.sql.run(
-        "UPDATE local_tasks SET status = 'PENDING', result = NULL, error = NULL, finished_at = NULL, claimed_by = NULL, started_at = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ?",
+        "UPDATE local_tasks SET status = 'PENDING', result = NULL, error = NULL, finished_at = NULL, claimed_by = NULL, started_at = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND execution_target = 'machine_maintenance'",
         now, String(r.id),
       );
       ids.push(String(r.id));
     }
     return ids;
+  }
+
+  // -- execution boundary helpers (migration v39, spec §2.3) ---------------
+  /** Legacy PENDING rows with no execution_target tag (pre-boundary rows). */
+  listUngovernedLocalTasks(limit = 200): Array<{ id: string; prompt: string; task_id?: string | null; meta_json?: string | null }> {
+    return this.sql
+      .all<Row>(
+        "SELECT id, prompt, task_id, meta_json FROM local_tasks WHERE execution_target IS NULL AND status = 'PENDING' ORDER BY created_at ASC LIMIT ?",
+        limit,
+      )
+      .map((r) => ({
+        id: String(r.id),
+        prompt: String(r.prompt ?? ""),
+        task_id: r.task_id ? String(r.task_id) : null,
+        meta_json: r.meta_json ? String(r.meta_json) : null,
+      }));
+  }
+  setLocalTaskTarget(id: string, target: string): void {
+    this.sql.run("UPDATE local_tasks SET execution_target = ?, updated_at = ? WHERE id = ?", target, nowIso(), id);
+  }
+  /** Boundary cancellation: the row leaves the queue with an explicit reason. */
+  cancelLocalTaskPolicy(id: string, reason: string): void {
+    const now = nowIso();
+    this.sql.run(
+      "UPDATE local_tasks SET status = 'CANCELLED', error = ?, finished_at = ?, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND status IN ('PENDING','CLAIMED','RUNNING')",
+      reason, now, now, id,
+    );
+  }
+
+  // -- remote execution runs (migration v39) -------------------------------
+  createRemoteRun(r: RemoteRun): void {
+    this.insert("remote_runs", r);
+  }
+  getRemoteRun(id: string): RemoteRun | null {
+    const rows = this.sql.all<Row>("SELECT * FROM remote_runs WHERE id = ?", id);
+    return rows.length ? rowTo<RemoteRun>(rows[0]!) : null;
+  }
+  updateRemoteRun(id: string, patch: Partial<RemoteRun>): void {
+    this.update("remote_runs", id, patch as Row);
+  }
+  listRemoteRuns(limit = 50): RemoteRun[] {
+    return this.sql.all<Row>("SELECT * FROM remote_runs ORDER BY created_at DESC LIMIT ?", limit).map((r) => rowTo<RemoteRun>(r));
+  }
+  listActiveRemoteRuns(limit = 20): RemoteRun[] {
+    return this.sql
+      .all<Row>(
+        "SELECT * FROM remote_runs WHERE status IN ('DISPATCHED','QUEUED','IN_PROGRESS','CANCEL_REQUESTED') ORDER BY updated_at ASC LIMIT ?",
+        limit,
+      )
+      .map((r) => rowTo<RemoteRun>(r));
+  }
+  listRemoteRunsForTask(taskId: string): RemoteRun[] {
+    return this.sql.all<Row>("SELECT * FROM remote_runs WHERE task_id = ? ORDER BY created_at DESC LIMIT 50", taskId).map((r) => rowTo<RemoteRun>(r));
+  }
+  /** Idempotency guard: an active run for the same task + workflow. */
+  findActiveRemoteRun(taskId: string, repo: string, workflowFile: string): RemoteRun | null {
+    const rows = this.sql.all<Row>(
+      "SELECT * FROM remote_runs WHERE task_id = ? AND repo = ? AND workflow_file = ? AND status IN ('DISPATCHED','QUEUED','IN_PROGRESS','CANCEL_REQUESTED') ORDER BY created_at DESC LIMIT 1",
+      taskId, repo, workflowFile,
+    );
+    return rows.length ? rowTo<RemoteRun>(rows[0]!) : null;
   }
 
   // -- uploaded files (migration v11) -------------------------------------
