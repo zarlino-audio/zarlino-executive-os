@@ -75,7 +75,11 @@ you haven't heard or seen:
 - 💰 Finance shows cash/revenue/expenses/runway. "—" means the value is unknown
   (not zero).
 - If the agent starts failing with **HTTP 402**, the DeepSeek account is out of
-  balance — top it up at platform.deepseek.com; the Doctor will tell you.
+  balance — top it up at platform.deepseek.com; the Doctor will tell you. A second account can be registered as
+  `DEEPSEEK_API_KEY_FALLBACK` (worker secret + `.dev.vars`): key-level refusals
+  (401/402/403) automatically retry on it for chat, agent runs, the founder
+  channel, vision, growth replies and the local daemon; the balance monitor
+  reports the first key with funds.
 
 ## 7. When the agent gets stuck
 
