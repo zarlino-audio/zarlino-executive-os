@@ -53,15 +53,21 @@ export function buildReplyPrompt(input: {
 
 /** One-shot DeepSeek completion (no tools, low temperature, bounded length). */
 export async function generateProspectReply(
-  env: { DEEPSEEK_API_KEY?: string },
+  env: { DEEPSEEK_API_KEY?: string; DEEPSEEK_API_KEY_FALLBACK?: string },
   input: { name?: string; subject?: string; replyText: string; intent: string },
 ): Promise<string> {
-  const key = String(env.DEEPSEEK_API_KEY ?? "").trim();
-  if (!key) throw new Error("DEEPSEEK_API_KEY not configured");
+  const keys = Array.from(
+    new Set(
+      [String(env.DEEPSEEK_API_KEY ?? "").trim(), String(env.DEEPSEEK_API_KEY_FALLBACK ?? "").trim()].filter((k) => k.length > 8),
+    ),
+  );
+  if (keys.length === 0) throw new Error("DEEPSEEK_API_KEY not configured");
   const { system, user } = buildReplyPrompt(input);
-  const res = await fetch(DEEPSEEK_URL, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+  let res: Response | null = null;
+  for (const key of keys) {
+    res = await fetch(DEEPSEEK_URL, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       model: "deepseek-chat",
       messages: [
@@ -72,7 +78,10 @@ export async function generateProspectReply(
       max_tokens: 400,
     }),
     signal: AbortSignal.timeout(45_000),
-  });
+    });
+    if (res.ok || ![401, 402, 403].includes(res.status)) break;
+  }
+  if (!res) throw new Error("DeepSeek: no usable API key");
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new Error(`DeepSeek HTTP ${res.status}: ${body.slice(0, 160)}`);

@@ -78,12 +78,24 @@ function isSecretPath(p: string): boolean {
 // ---- env -------------------------------------------------------------------
 const dotenv = loadDotEnv(join(EXEC_OS, ".dev.vars"));
 export const API_KEY = process.env.DEEPSEEK_API_KEY ?? dotenv.DEEPSEEK_API_KEY ?? "";
+/**
+ * Every configured key, primary first. DEEPSEEK_API_KEY_FALLBACK covers an
+ * exhausted primary account (the HTTP 402 that stalled the daemon from
+ * 2026-10-05 until the founder registered a second key on 2026-10-11).
+ */
+export const API_KEYS: string[] = Array.from(
+  new Set(
+    [API_KEY, process.env.DEEPSEEK_API_KEY_FALLBACK ?? dotenv.DEEPSEEK_API_KEY_FALLBACK ?? ""]
+      .map((k) => String(k).trim())
+      .filter((k) => k.length > 8),
+  ),
+);
 export const TOKEN = process.env.FOUNDER_AUTH_TOKEN ?? dotenv.FOUNDER_AUTH_TOKEN ?? "";
 export const EXEC_URL = process.env.EXEC_OS_URL ?? "https://os.zarlinoaudio.com";
 export const AUTO_YES = process.argv.includes("--yes");
 
 export function ensureApiKey(): void {
-  if (!API_KEY) {
+  if (API_KEYS.length === 0) {
     console.error("DEEPSEEK_API_KEY not found — add it to executive-os/.dev.vars or the environment.");
     process.exit(1);
   }
@@ -886,9 +898,13 @@ export async function callDeepSeek(messages: Array<Record<string, unknown>>): Pr
   // responding to each 'tool_call_id'"). No-op when already valid.
   const repaired = repairToolCallSequence(messages);
   if (repaired !== messages) messages.splice(0, messages.length, ...repaired);
+  // Key fallback: retry with the next key ONLY on an auth/balance refusal
+  // (401/402/403); any other failure would repeat identically.
+  let lastErr: unknown = null;
+  for (let k = 0; k < API_KEYS.length; k++) {
   const res = await fetch("https://api.deepseek.com/chat/completions", {
     method: "POST",
-    headers: { Authorization: `Bearer ${API_KEY}`, "Content-Type": "application/json" },
+    headers: { Authorization: `Bearer ${API_KEYS[k]}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       model: "deepseek-chat",
       messages,
@@ -898,11 +914,18 @@ export async function callDeepSeek(messages: Array<Record<string, unknown>>): Pr
       stream: false,
     }),
   });
-  if (!res.ok) throw new Error(`DeepSeek HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
+  if (!res.ok) {
+    const err = new Error(`DeepSeek HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
+    lastErr = err;
+    if (k < API_KEYS.length - 1 && [401, 402, 403].includes(res.status)) continue;
+    throw err;
+  }
   const data = (await res.json()) as { choices?: Array<{ message?: Record<string, unknown> }> };
   const message = data.choices?.[0]?.message;
   if (!message) throw new Error("Empty model response");
   return message;
+  }
+  throw lastErr ?? new Error("DeepSeek: no usable API key");
 }
 
 export async function executeToolCall(name: string, rawArgs: string): Promise<string> {

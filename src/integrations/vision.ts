@@ -25,12 +25,19 @@ export function visionTools(env: Record<string, string | undefined>): Tool[] {
       reversible: true,
       auditRequired: false,
       run: async (ctx: ToolContext, input: { imageBase64: string; mimeType?: string; prompt?: string }) => {
-        const key = env.DEEPSEEK_API_KEY ?? ctx.env.DEEPSEEK_API_KEY;
-        if (!key) return { configured: false, note: "DEEPSEEK_API_KEY not configured." };
+        const keys = [
+          env.DEEPSEEK_API_KEY ?? ctx.env.DEEPSEEK_API_KEY,
+          env.DEEPSEEK_API_KEY_FALLBACK ?? ctx.env.DEEPSEEK_API_KEY_FALLBACK,
+        ]
+          .map((k) => (typeof k === "string" ? k.trim() : ""))
+          .filter((k) => k.length > 8);
+        if (keys.length === 0) return { configured: false, note: "DEEPSEEK_API_KEY not configured." };
         const mime = input.mimeType ?? "image/png";
         const dataUrl = `data:${mime};base64,${input.imageBase64}`;
         const started = Date.now();
-        const res = await fetch(API, {
+        let res: Response | null = null;
+        for (const key of keys) {
+          res = await fetch(API, {
           method: "POST",
           headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -46,8 +53,11 @@ export function visionTools(env: Record<string, string | undefined>): Tool[] {
             ],
             max_tokens: 1024,
             stream: false,
-          }),
-        });
+          }), // close body
+          });
+          if (res.ok || ![401, 402, 403].includes(res.status)) break;
+        }
+        if (!res) return { configured: true, error: "Vision provider: no usable API key" };
         if (!res.ok) {
           const body = await res.text().catch(() => "");
           return { configured: true, error: `Vision provider ${res.status}: ${body.slice(0, 300)}`, note: "The provider may not support image inputs on this model/account." };

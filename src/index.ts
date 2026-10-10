@@ -37,6 +37,7 @@ import {
 import { findDuplicateTask, duplicateNote } from "./core/tasks/dedupe";
 import { artifactKey, normalizeArtifactPath, MAX_ARTIFACT_BYTES } from "./core/artifacts";
 import { escalateToFounder, sendWhatsApp } from "./integrations/whatsapp";
+import { deepseekKeys, isDeepseekKeyFailure } from "./integrations/deepseek";
 import { OUTREACH_TEMPLATES, outreachDailyCap, maybeAutoReply, recordProspectReply, runFollowUps, runOutreachCycle, sendOutreachNow } from "./core/outreach";
 import { emailConfigured, type SendEmailBinding } from "./integrations/email";
 import { chargeNeurons, DEFAULT_EXEC_MODEL, executiveGenerate, neuronBudget, neuronLedger, neuronsUsedToday } from "./integrations/workersai";
@@ -81,6 +82,8 @@ export interface Env {
   ARTIFACTS?: R2Bucket;
   ASSETS?: Fetcher;
   DEEPSEEK_API_KEY?: string;
+  /** Secondary DeepSeek key, used when the primary is exhausted/rejected. */
+  DEEPSEEK_API_KEY_FALLBACK?: string;
   FOUNDER_AUTH_TOKEN?: string;
   INTERNAL_SECRET?: string;
   GITHUB_TOKEN?: string;
@@ -343,6 +346,33 @@ async function callDeepSeek(
 }
 
 /**
+ * One call with key fallback: try each configured DeepSeek key in order and
+ * advance ONLY on an auth/balance refusal (401/402/403). A malformed request
+ * or a network failure fails identically on the second key, so it propagates.
+ */
+async function callDeepSeekWithFallback(
+  env: Env,
+  messages: ChatMsg[],
+  registry: ToolRegistry,
+  store: ExecutiveStore,
+  model: string,
+  opts: { signal?: AbortSignal; noTools?: boolean; sessionId?: string; runId?: string } = {},
+): Promise<ChatMsg> {
+  const keys = deepseekKeys(env);
+  if (keys.length === 0) throw new Error("DEEPSEEK_API_KEY not configured - set it as a Worker secret.");
+  let lastErr: unknown = null;
+  for (let k = 0; k < keys.length; k++) {
+    try {
+      return await callDeepSeek(keys[k]!, messages, registry, store, model, opts);
+    } catch (err) {
+      lastErr = err;
+      if (k >= keys.length - 1 || !isDeepseekKeyFailure(err)) throw err;
+    }
+  }
+  throw lastErr ?? new Error("DeepSeek: no usable API key");
+}
+
+/**
  * Streaming completion (audit gap 1): forwards content + reasoning deltas to
  * `onDelta` as they arrive and assembles the final assistant message â€”
  * including `tool_calls`, whose id/name/arguments arrive as fragments spread
@@ -518,8 +548,8 @@ async function agentLoop(opts: {
   model?: string;
   maxIterations?: number;
 }): Promise<{ text: string; iterations: number; toolsCalled: number; limitReached: boolean }> {
-  const apiKey = opts.env.DEEPSEEK_API_KEY;
-  if (!apiKey) throw new Error("DEEPSEEK_API_KEY not configured â€” set it as a Worker secret.");
+  const apiKeys = deepseekKeys(opts.env);
+  if (apiKeys.length === 0) throw new Error("DEEPSEEK_API_KEY not configured â€” set it as a Worker secret.");
   const model = opts.model ?? "deepseek-chat";
   const store = opts.store;
   const maxIter = opts.maxIterations ?? 8;
@@ -559,32 +589,48 @@ async function agentLoop(opts: {
     // Doctor's maintenance sweep even though it was actively working.
     if (opts.runId) store.heartbeatAgentRun(opts.runId, iterations, toolsCalled);
     let reply: ChatMsg;
+    // Key fallback: the primary account may be exhausted (HTTP 402) while the
+    // founder's fallback key still funds light traffic. Only an auth/balance
+    // refusal justifies the second key — a 400 transcript would fail twice.
+    const invokeModel = async (): Promise<ChatMsg> => {
+      const onDelta = opts.onDelta;
+      let lastErr: unknown = null;
+      for (let k = 0; k < apiKeys.length; k++) {
+        try {
+          const out = onDelta
+            ? await callDeepSeekStream(apiKeys[k]!, messages, opts.registry, store, model, onDelta, opts.signal, {
+                sessionId: opts.sessionId,
+                runId: opts.runId,
+              })
+            : await callDeepSeek(apiKeys[k]!, messages, opts.registry, store, model, {
+                signal: opts.signal,
+                sessionId: opts.sessionId,
+                runId: opts.runId,
+              });
+          if (k > 0) {
+            // Observability: only record when the fallback key was needed.
+            try {
+              store.setSetting("deepseek_last_key", "fallback");
+            } catch {
+              /* observability only */
+            }
+          }
+          return out;
+        } catch (err) {
+          lastErr = err;
+          if (k >= apiKeys.length - 1 || !isDeepseekKeyFailure(err)) throw err;
+        }
+      }
+      throw lastErr ?? new Error("DeepSeek: no usable API key");
+    };
     try {
-      reply = opts.onDelta
-        ? await callDeepSeekStream(apiKey, messages, opts.registry, store, model, opts.onDelta, opts.signal, {
-            sessionId: opts.sessionId,
-            runId: opts.runId,
-          })
-        : await callDeepSeek(apiKey, messages, opts.registry, store, model, {
-            signal: opts.signal,
-            sessionId: opts.sessionId,
-            runId: opts.runId,
-          });
+      reply = await invokeModel();
     } catch (err) {
       // Self-heal a broken tool-call sequence (e.g. a checkpoint written by an
       // older build) and retry once instead of failing the whole run.
       if (!isToolCallSequenceError(err)) throw err;
       messages.splice(0, messages.length, ...repairToolCallSequence(messages));
-      reply = opts.onDelta
-        ? await callDeepSeekStream(apiKey, messages, opts.registry, store, model, opts.onDelta, opts.signal, {
-            sessionId: opts.sessionId,
-            runId: opts.runId,
-          })
-        : await callDeepSeek(apiKey, messages, opts.registry, store, model, {
-            signal: opts.signal,
-            sessionId: opts.sessionId,
-            runId: opts.runId,
-          });
+      reply = await invokeModel();
     }
     messages.push(reply);
     const toolCalls = reply.tool_calls;
@@ -3758,9 +3804,10 @@ export class ExecutiveAgent {
       if (this.store.getChatSessionTitle(sessionId)) return;
       const firstUser = transcript.find((m) => m.role === "user")?.content ?? "";
       if (!firstUser.trim() || !reply.trim()) return;
-      const apiKey = this.env.DEEPSEEK_API_KEY;
-      if (!apiKey) return;
+      const apiKeys = deepseekKeys(this.env);
+      if (apiKeys.length === 0) return;
       const promise = (async () => {
+        for (const apiKey of apiKeys) {
         try {
           const out = await callDeepSeek(
             apiKey,
@@ -3778,8 +3825,10 @@ export class ExecutiveAgent {
           );
           const title = sanitizeChatTitle(String(out.content ?? ""));
           if (title.length >= 3) this.store.setChatSessionTitle(sessionId, title, "auto");
-        } catch {
-          /* cosmetic */
+          return;
+        } catch (err) {
+          if (!isDeepseekKeyFailure(err)) return; // a 400 would fail on the fallback too
+        }
         }
       })();
       this.state.waitUntil(promise);
@@ -4069,14 +4118,23 @@ async function runExternalChecks(
   // balance, keeps it in KV for /api/ops/monitor, and alerts through BOTH
   // channels when it falls below AI_BALANCE_WARN_USD â€” at most once per 24h.
   let deepseekBalance: number | null = null;
-  if (env.DEEPSEEK_API_KEY) {
+  // Try every configured key: the primary may be exhausted while the fallback
+  // key is funding lighter traffic (observed live 2026-10-11). The balance
+  // endpoint answers 200 even for a drained account, so a funded key wins:
+  // keep the first parsed value, but keep looking while it is <= 0.
+  for (const key of deepseekKeys(env)) {
     try {
       const r = await fetch("https://api.deepseek.com/user/balance", {
-        headers: { Authorization: `Bearer ${env.DEEPSEEK_API_KEY}` },
+        headers: { Authorization: `Bearer ${key}` },
       });
-      if (r.ok) deepseekBalance = parseDeepSeekBalance(await r.json());
+      if (!r.ok) continue;
+      const parsed = parseDeepSeekBalance(await r.json());
+      if (parsed !== null) {
+        deepseekBalance = parsed;
+        if (parsed > 0) break;
+      }
     } catch {
-      /* balance check is best-effort */
+      /* balance check is best-effort; try the next key */
     }
   }
   if (kv && deepseekBalance !== null) {
