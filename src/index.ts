@@ -68,6 +68,7 @@ import {
 import { newId, nowIso } from "./ids";
 import { evaluateChecks, planBackupPrune, parseDeepSeekBalance, MONITOR_TARGETS, type CheckResult, type MonitorState } from "./core/monitor";
 import { isTerminalTaskStatus, GovernanceError } from "./core/tasks/evidence";
+import { dependencyState, releaseCompletedDependencies } from "./core/tasks/dependencies";
 import type { AgentRun, DoctorLog, Task } from "./types";
 import type { ModelCallRecord as _M } from "./core/model/types";
 type ModelCall = _M;
@@ -741,6 +742,10 @@ function truncate(s: string, n: number): string {
 // ---------------------------------------------------------------------------
 
 function startAutoRunnable(store: ExecutiveStore, maxJobs: number): { started: string[] } {
+  // Dependency release first: a task blocked while its predecessor was still
+  // running becomes runnable the moment that predecessor is DONE (objective
+  // linkage — otherwise a chain stalls on an input that has already arrived).
+  releaseCompletedDependencies(store);
   const running = store.countRunningAgentRuns();
   const budget = Math.max(0, maxJobs - running);
   if (budget <= 0) return { started: [] };
@@ -750,6 +755,9 @@ function startAutoRunnable(store: ExecutiveStore, maxJobs: number): { started: s
     if (started.length >= budget) break;
     if (store.pendingApprovalForTask(t.id)) continue;
     if (store.hasRunningRunForTask(t.id)) continue;
+    // Dependency gate: no start while the predecessor is unfinished — QA does
+    // not "verify" a run that has not happened yet.
+    if (dependencyState(store, t) === "WAITING") continue;
     // Backoff: don't immediately re-spawn a run for a task whose last run just
     // failed (e.g. DeepSeek 402) â€” that would churn a run every wake.
     if (store.hasRecentFailedRunForTask(t.id)) continue;
@@ -797,6 +805,9 @@ function resumeInterruptedRuns(store: ExecutiveStore, maxJobs: number): { resume
       if (store.pendingApprovalForTask(run.task_id)) continue;
       const task = store.getTask(run.task_id);
       if (task && !["OPEN", "IN_PROGRESS"].includes(task.status)) continue;
+      // Same dependency gate as fresh starts: resuming a dependent run while
+      // its predecessor is unfinished would repeat the guesswork.
+      if (task && dependencyState(store, task) === "WAITING") continue;
       store.updateTask(run.task_id, { status: "IN_PROGRESS" } as never);
     }
     store.resetAgentRun(run.id);

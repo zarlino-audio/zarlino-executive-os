@@ -252,6 +252,16 @@ export class ExecutiveStore implements CostStorage {
     );
     return rows.map((r) => rowTo<Task>(r));
   }
+  /**
+   * BLOCKED tasks that declare a dependency — the release half of the
+   * dependency contract (src/core/tasks/dependencies.ts): once the predecessor
+   * completes, these become runnable again instead of stalling the objective.
+   */
+  listBlockedDependents(): Task[] {
+    return this.sql
+      .all<Row>("SELECT * FROM tasks WHERE status = 'BLOCKED' AND dependency_task_id IS NOT NULL")
+      .map((r) => rowTo<Task>(r));
+  }
   /** True if an agent run is currently executing for this task. */
   hasRunningRunForTask(taskId: string): boolean {
     const rows = this.sql.all<Row>("SELECT id FROM agent_jobs WHERE task_id = ? AND status = 'RUNNING' LIMIT 1", taskId);
