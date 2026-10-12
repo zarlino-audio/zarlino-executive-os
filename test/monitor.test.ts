@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { evaluateChecks, planBackupPrune, parseDeepSeekBalance, type MonitorState } from "../src/core/monitor";
+import {
+  buildWebsiteTargets,
+  evaluateChecks,
+  planBackupPrune,
+  parseDeepSeekBalance,
+  STATIC_TARGETS,
+  WEBSITE_FALLBACK_TARGETS,
+  type MonitorState,
+} from "../src/core/monitor";
 
 const now = "2026-10-02T00:00:00.000Z";
 
@@ -85,5 +93,52 @@ describe("deepseek balance parsing (top-up sentinel)", () => {
     expect(parseDeepSeekBalance({})).toBeNull();
     expect(parseDeepSeekBalance({ balance_infos: [] })).toBeNull();
     expect(parseDeepSeekBalance({ balance_infos: [{ total_balance: "n/a" }] })).toBeNull();
+  });
+});
+
+describe("website contract -> monitor targets (single source of truth)", () => {
+  const contract = {
+    schemaVersion: 1,
+    service: "zarlino-website",
+    required: [
+      { path: "/", status: 200 },
+      { path: "/plugins/ztame/", status: 200 },
+    ],
+    redirect: [{ path: "/plugins/ztame", status: 307, to: "/plugins/ztame/" }],
+    absent: [{ path: "/about", status: 404 }],
+    api: [
+      { path: "/api/health", status: 200 },
+      { path: "/api/license", status: 405, method: "GET" },
+    ],
+    artifacts: [{ path: "/downloads/x.zip", status: 200, method: "HEAD" }],
+  };
+
+  it("builds exactly one target per contract entry, with deterministic ids", () => {
+    const targets = buildWebsiteTargets(contract);
+    expect(targets.map((t) => t.id)).toEqual([
+      "site:required:/",
+      "site:required:/plugins/ztame/",
+      "site:redirect:/plugins/ztame",
+      "site:absent:/about",
+      "site:api:/api/health",
+      "site:api:/api/license",
+      "site:artifacts:/downloads/x.zip",
+    ]);
+  });
+
+  it("keeps exact expected statuses, methods and redirect handling", () => {
+    const byId = new Map(buildWebsiteTargets(contract).map((t) => [t.id, t]));
+    expect(byId.get("site:required:/")?.expect).toBe(200);
+    expect(byId.get("site:absent:/about")?.expect).toBe(404);
+    expect(byId.get("site:redirect:/plugins/ztame")?.expect).toBe(307);
+    expect(byId.get("site:redirect:/plugins/ztame")?.redirect).toBe("manual");
+    expect(byId.get("site:artifacts:/downloads/x.zip")?.method).toBe("HEAD");
+    expect(byId.get("site:api:/api/health")?.url).toBe("https://zarlinoaudio.com/api/health");
+  });
+
+  it("fallback ids remain compatible with contract-derived ids (state continuity)", () => {
+    for (const t of WEBSITE_FALLBACK_TARGETS) expect(t.id).toMatch(/^site:/);
+    expect(WEBSITE_FALLBACK_TARGETS.some((t) => t.expect === 404)).toBe(true);
+    expect(STATIC_TARGETS.some((t) => t.id === "os-api")).toBe(true);
   });
 });

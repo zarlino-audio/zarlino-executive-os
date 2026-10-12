@@ -66,7 +66,7 @@ import {
   scoreProduct,
 } from "./core/perceptual/manager";
 import { newId, nowIso } from "./ids";
-import { evaluateChecks, planBackupPrune, parseDeepSeekBalance, MONITOR_TARGETS, type CheckResult, type MonitorState } from "./core/monitor";
+import { evaluateChecks, planBackupPrune, parseDeepSeekBalance, STATIC_TARGETS, WEBSITE_BASE, WEBSITE_FALLBACK_TARGETS, WEBSITE_REPO, buildWebsiteTargets, type CheckResult, type MonitorState, type MonitorTarget, type WebsiteContract } from "./core/monitor";
 import { isTerminalTaskStatus, GovernanceError } from "./core/tasks/evidence";
 import { dependencyState, releaseCompletedDependencies } from "./core/tasks/dependencies";
 import type { AgentRun, DoctorLog, Task } from "./types";
@@ -4135,24 +4135,146 @@ async function runDailyBackup(env: Env, stub: DurableObjectStub): Promise<Backup
   return { ok: true, key, bytes: body.length, pruned: prune.length };
 }
 
+/** Shared user-agent for outbound monitor requests. */
+const MONITOR_UA = "ZarlinoOS-Monitor/1.0";
+
+/** GitHub API headers for monitor checks (token when configured). */
+function monitorGithubHeaders(env: Env): Record<string, string> {
+  const h: Record<string, string> = {
+    accept: "application/vnd.github+json",
+    "user-agent": MONITOR_UA,
+  };
+  if (env.GITHUB_TOKEN) h.authorization = `Bearer ${env.GITHUB_TOKEN}`;
+  return h;
+}
+
+/**
+ * PRODUCTION_IDENTITY — compare the live website's reported commit
+ * (/api/health) with the repo's current main SHA. This is the documented
+ * PRODUCTION_DRIFT detector: stale production must never be silently healthy.
+ * If either side cannot be read, the check is OK-with-note ("identity
+ * unverified") rather than a fabricated failure — UNKNOWN, not certainty.
+ */
+async function checkProductionIdentity(env: Env): Promise<CheckResult> {
+  const id = "site:identity";
+  try {
+    const [healthRes, mainRes] = await Promise.all([
+      fetch(`${WEBSITE_BASE}/api/health`, { headers: { "user-agent": MONITOR_UA } }),
+      fetch(`https://api.github.com/repos/${WEBSITE_REPO}/commits/main`, {
+        headers: monitorGithubHeaders(env),
+      }),
+    ]);
+    if (!healthRes.ok) {
+      return { id, ok: false, status: healthRes.status, error: `website /api/health HTTP ${healthRes.status}` };
+    }
+    if (!mainRes.ok) {
+      return { id, ok: true, status: 0, error: `identity unverified: GitHub API HTTP ${mainRes.status}` };
+    }
+    const health = (await healthRes.json()) as { commit?: string };
+    const main = (await mainRes.json()) as { sha?: string };
+    const commit = health.commit;
+    const sha = main.sha;
+    if (!commit || !sha) {
+      return { id, ok: true, status: 0, error: "identity unverified: missing sha in response" };
+    }
+    if (commit === sha) return { id, ok: true, status: 200 };
+    return {
+      id,
+      ok: false,
+      status: 0,
+      error: `PRODUCTION_DRIFT: production ${commit.slice(0, 12)} != main ${sha.slice(0, 12)}`,
+    };
+  } catch (e) {
+    return { id, ok: true, status: 0, error: `identity unverified: ${String(e)}` };
+  }
+}
+
+/**
+ * DEPLOYMENT_FAILURE — the latest completed run of the website deploy workflow
+ * on main. A failed deploy while main has moved on is a deployment failure
+ * (distinct from an application failure, which the route targets catch).
+ */
+async function checkDeployWorkflow(env: Env): Promise<CheckResult> {
+  const id = "site:deploy-workflow";
+  try {
+    const r = await fetch(
+      `https://api.github.com/repos/${WEBSITE_REPO}/actions/workflows/deploy.yml/runs?branch=main&per_page=1`,
+      { headers: monitorGithubHeaders(env) },
+    );
+    if (!r.ok) {
+      return { id, ok: true, status: 0, error: `deployment check unverified: GitHub API HTTP ${r.status}` };
+    }
+    const data = (await r.json()) as {
+      workflow_runs?: Array<{ id: number; status: string; conclusion: string | null }>;
+    };
+    const run = data.workflow_runs?.[0];
+    if (!run) return { id, ok: true, status: 0, error: "deployment check unverified: no runs" };
+    if (run.status !== "completed") return { id, ok: true, status: 200 };
+    if (run.conclusion === "success") return { id, ok: true, status: 200 };
+    return {
+      id,
+      ok: false,
+      status: 0,
+      error: `DEPLOYMENT_FAILED: latest main deploy run ${run.id} -> ${run.conclusion}`,
+    };
+  } catch (e) {
+    return { id, ok: true, status: 0, error: `deployment check unverified: ${String(e)}` };
+  }
+}
+
 /** Check the external surfaces + bridge liveness; alert on transitions only. */
 async function runExternalChecks(
   env: Env,
   stub: DurableObjectStub,
 ): Promise<{ checks: CheckResult[]; transitions: Array<{ id: string; to: string }>; balance?: number | null }> {
   const checks: CheckResult[] = [];
-  for (const t of MONITOR_TARGETS) {
+
+  // Website coverage comes from the site's OWN route contract (/api/contract),
+  // so the OS can never infer website health from a partial, hand-maintained
+  // subset of routes. Earlier monitoring probed ONLY the website homepage —
+  // which stayed green for weeks while every non-asset path answered
+  // Cloudflare 1101. If the contract cannot be fetched, essential fallback
+  // coverage is probed AND site:contract fails loudly — never silent blindness.
+  let siteTargets: MonitorTarget[];
+  try {
+    const cr = await fetch(`${WEBSITE_BASE}/api/contract`, {
+      headers: { "user-agent": MONITOR_UA },
+    });
+    if (cr.ok) {
+      const contract = (await cr.json()) as WebsiteContract;
+      siteTargets = buildWebsiteTargets(contract);
+      checks.push({ id: "site:contract", ok: true, status: cr.status });
+    } else {
+      siteTargets = [...WEBSITE_FALLBACK_TARGETS];
+      checks.push({ id: "site:contract", ok: false, status: cr.status, error: `contract HTTP ${cr.status}` });
+    }
+  } catch (e) {
+    siteTargets = [...WEBSITE_FALLBACK_TARGETS];
+    checks.push({ id: "site:contract", ok: false, status: 0, error: String(e) });
+  }
+
+  const probeTargets = [...siteTargets, ...STATIC_TARGETS];
+  for (const t of probeTargets) {
     try {
       const r = await fetch(t.url, {
         method: t.method,
-        redirect: "follow",
-        headers: { "user-agent": "ZarlinoOS-Monitor/1.0" },
+        redirect: t.redirect ?? "follow",
+        headers: { "user-agent": MONITOR_UA },
       });
       checks.push({ id: t.id, ok: r.status === t.expect, status: r.status });
     } catch (e) {
       checks.push({ id: t.id, ok: false, status: 0, error: String(e) });
     }
   }
+
+  // STALE PRODUCTION / PRODUCTION_DRIFT: does production report the same
+  // commit as main? A green route subset on an old artifact is drift, not
+  // health. Unverifiable comparisons are recorded OK-with-note (UNKNOWN beats
+  // fabricated certainty; a false DOWN would be noise).
+  checks.push(await checkProductionIdentity(env));
+
+  // DEPLOYMENT FAILURE: conclusion of the latest deploy run on main.
+  checks.push(await checkDeployWorkflow(env));
   // Founder-channel (WhatsApp bridge) liveness from the KV heartbeat mirror.
   // Never-seen counts as OK (no false alarm right after a deploy); stale beyond
   // 20 minutes fails, so two consecutive 15-min checks (~30 min of silence)
@@ -4213,7 +4335,7 @@ async function runExternalChecks(
 
   const prev: Record<string, MonitorState | undefined> = {};
   if (kv) {
-    for (const t of [...MONITOR_TARGETS.map((m) => m.id), "whatsapp-bridge"]) {
+    for (const t of [...probeTargets.map((m) => m.id), "site:contract", "site:identity", "site:deploy-workflow", "whatsapp-bridge"]) {
       const raw = await kv.get(`monitor:${t}`);
       if (raw) prev[t] = safeJson(raw, undefined) as MonitorState | undefined;
     }
@@ -4225,7 +4347,7 @@ async function runExternalChecks(
   const out: Array<{ id: string; to: string }> = [];
   for (const tr of transitions) {
     const state = next.find((s) => s.id === tr.id);
-    const target = MONITOR_TARGETS.find((t) => t.id === tr.id);
+    const target = probeTargets.find((t) => t.id === tr.id);
     const subject = tr.to === "DOWN" ? `\uD83D\uDD34 ${tr.id} is DOWN` : `\u2705 ${tr.id} recovered`;
     const body =
       tr.to === "DOWN"
@@ -4314,9 +4436,15 @@ export default {
       if (path === "/api/ops/monitor" && request.method === "GET") {
         const states: unknown[] = [];
         if (env.ZARLINO_KV) {
-          for (const t of MONITOR_TARGETS) {
-            const raw = await env.ZARLINO_KV.get(`monitor:${t.id}`);
-            states.push(raw ? safeJson(raw, { id: t.id, state: "UNKNOWN" }) : { id: t.id, state: "UNKNOWN" });
+          // States are keyed per target id under `monitor:` — list them so the
+          // view reflects the CURRENT target set (contract-derived), and never
+          // a stale hard-coded list.
+          const listed = await env.ZARLINO_KV.list({ prefix: "monitor:" });
+          for (const k of listed.keys) {
+            if (k.name.startsWith("monitor:notified:")) continue;
+            const raw = await env.ZARLINO_KV.get(k.name);
+            const id = k.name.replace(/^monitor:/, "");
+            states.push(raw ? safeJson(raw, { id, state: "UNKNOWN" }) : { id, state: "UNKNOWN" });
           }
         }
         const last = env.ZARLINO_KV ? await env.ZARLINO_KV.get("backup:last") : null;

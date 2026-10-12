@@ -16,20 +16,104 @@ export interface MonitorTarget {
   url: string;
   expect: number;
   method: "GET" | "HEAD";
+  /** redirect handling; "manual" is required for targets that EXPECT a 3xx. */
+  redirect?: "follow" | "manual";
 }
 
-export const MONITOR_TARGETS: MonitorTarget[] = [
-  { id: "website", url: "https://zarlinoaudio.com/", expect: 200, method: "GET" },
-  // The OS worker cannot fetch its own custom domain (self-fetch -> 522), so
-  // the OS API is probed THROUGH the website worker (a different worker).
-  { id: "os-api", url: "https://zarlinoaudio.com/api/probe-exec-os", expect: 200, method: "GET" },
+/** Canonical website surface (the site's deployed worker + repo of record). */
+export const WEBSITE_BASE = "https://zarlinoaudio.com";
+export const WEBSITE_REPO = "zarlino-audio/zarlino-website";
+
+/** Minimal shape of https://zarlinoaudio.com/api/contract (routes/contract.json). */
+export interface WebsiteContract {
+  schemaVersion: number;
+  service?: string;
+  required: Array<{ path: string; status: number }>;
+  redirect: Array<{ path: string; to?: string; status: number }>;
+  absent: Array<{ path: string; status: number }>;
+  api: Array<{ path: string; status: number; method?: string }>;
+  artifacts: Array<{ path: string; status: number; method?: string }>;
+}
+
+/**
+ * Targets that are NOT part of the website route contract:
+ *   - os-api: the OS API is probed THROUGH the website worker (the OS worker
+ *     cannot fetch its own custom domain: self-fetch -> 522).
+ */
+export const STATIC_TARGETS: MonitorTarget[] = [
+  { id: "os-api", url: `${WEBSITE_BASE}/api/probe-exec-os`, expect: 200, method: "GET" },
+];
+
+/**
+ * Essential coverage used ONLY when /api/contract cannot be fetched. Ids match
+ * buildWebsiteTargets() ids so state continuity is preserved across fallbacks.
+ */
+export const WEBSITE_FALLBACK_TARGETS: MonitorTarget[] = [
+  { id: "site:required:/", url: `${WEBSITE_BASE}/`, expect: 200, method: "GET" },
   {
-    id: "downloads",
-    url: "https://zarlinoaudio.com/downloads/ZTame-v1.2.0-Windows-Installer.exe",
+    id: "site:required:/plugins/ztame/",
+    url: `${WEBSITE_BASE}/plugins/ztame/`,
     expect: 200,
-    method: "HEAD",
+    method: "GET",
+  },
+  { id: "site:api:/api/health", url: `${WEBSITE_BASE}/api/health`, expect: 200, method: "GET" },
+  {
+    id: "site:absent:/nonexistent-404-probe",
+    url: `${WEBSITE_BASE}/nonexistent-404-probe`,
+    expect: 404,
+    method: "GET",
   },
 ];
+
+/**
+ * Build one monitor target per contract entry. The OS never maintains its own
+ * route subset: the website's routes/contract.json (served at /api/contract)
+ * is the ONE authoritative route list, so the OS cannot infer website health
+ * from a hand-picked slice of evidence.
+ *
+ * Expected-404 entries are first-class: a 404 there counts as OK, anything
+ * else fails; a 404 on a required entry is an application failure. Redirect
+ * entries are probed with redirect:"manual" so the 307 itself is asserted.
+ */
+export function buildWebsiteTargets(
+  contract: WebsiteContract,
+  baseUrl: string = WEBSITE_BASE,
+): MonitorTarget[] {
+  const base = baseUrl.replace(/\/$/, "");
+  const targets: MonitorTarget[] = [];
+  for (const e of contract.required) {
+    targets.push({ id: `site:required:${e.path}`, url: base + e.path, expect: e.status, method: "GET" });
+  }
+  for (const e of contract.redirect) {
+    targets.push({
+      id: `site:redirect:${e.path}`,
+      url: base + e.path,
+      expect: e.status,
+      method: "GET",
+      redirect: "manual",
+    });
+  }
+  for (const e of contract.absent) {
+    targets.push({ id: `site:absent:${e.path}`, url: base + e.path, expect: e.status, method: "GET" });
+  }
+  for (const e of contract.api) {
+    targets.push({
+      id: `site:api:${e.path}`,
+      url: base + e.path,
+      expect: e.status,
+      method: e.method === "HEAD" ? "HEAD" : "GET",
+    });
+  }
+  for (const e of contract.artifacts) {
+    targets.push({
+      id: `site:artifacts:${e.path}`,
+      url: base + e.path,
+      expect: e.status,
+      method: "HEAD",
+    });
+  }
+  return targets;
+}
 
 export interface CheckResult {
   id: string;
