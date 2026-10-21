@@ -69,6 +69,7 @@ import { newId, nowIso } from "./ids";
 import { evaluateChecks, planBackupPrune, parseDeepSeekBalance, STATIC_TARGETS, WEBSITE_BASE, WEBSITE_FALLBACK_TARGETS, WEBSITE_REPO, buildWebsiteTargets, type CheckResult, type MonitorState, type MonitorTarget, type WebsiteContract } from "./core/monitor";
 import { isTerminalTaskStatus, GovernanceError } from "./core/tasks/evidence";
 import { dependencyState, releaseCompletedDependencies } from "./core/tasks/dependencies";
+import { handleFactoryRoute } from "./core/factory/routes";
 import type { AgentRun, DoctorLog, Task } from "./types";
 import type { ModelCallRecord as _M } from "./core/model/types";
 type ModelCall = _M;
@@ -89,6 +90,18 @@ export interface Env {
   INTERNAL_SECRET?: string;
   GITHUB_TOKEN?: string;
   CF_API_TOKEN?: string;
+  /**
+   * Plugin Factory gateway: the shared service credential the customer
+   * application uses for /api/factory/*. Separate from FOUNDER_AUTH_TOKEN and
+   * INTERNAL_SECRET on purpose — a customer-facing worker must never hold a
+   * credential that opens the founder surface.
+   */
+  FACTORY_GATEWAY_SECRET?: string;
+  /** Token the build workflow uses to report completion (never a founder token). */
+  BUILD_REPORT_TOKEN?: string;
+  FACTORY_REPO?: string;
+  FACTORY_BUILD_REF?: string;
+  FACTORY_MAX_BUILD_MINUTES?: string;
   /** YouTube Data API v3 key for prospect sourcing (youtube.* tools). */
   YOUTUBE_API_KEY?: string;
   PAYSTACK_SECRET_KEY?: string;
@@ -1399,6 +1412,24 @@ export class ExecutiveAgent {
         doctorLastRun: doctor?.run_at ?? null,
         doctorHealthy: doctor ? (safeJson(doctor.summary_json, null) as { fail?: number } | null)?.fail === 0 : null,
       });
+    }
+
+    // Plugin Factory gateway (service-to-service). Handled before the founder
+    // gate because it has its own credential and its own (narrow) surface: it
+    // never exposes console data and never accepts a founder token.
+    if (path.startsWith("/api/factory/")) {
+      const factoryResponse = await handleFactoryRoute(
+        {
+          sql: this.sql,
+          env: this.env,
+          bucket: this.env.ARTIFACTS ? { get: (key: string) => this.env.ARTIFACTS!.get(key) } : null,
+          meter: this.store,
+          fetchImpl: undefined,
+        },
+        request,
+        url,
+      );
+      if (factoryResponse) return factoryResponse;
     }
 
     // Auth (login is public; logout/status/change-password need a session/token).

@@ -3452,6 +3452,7 @@ export const SNAPSHOT_TABLES = [
   "org_analyst_reports", "org_chaos_tests",
   "org_incidents",
   "org_topology_proposals",
+  "factory_builds", "factory_build_events",
 ];
 
 /** Map a task_evidence row: `verified` is stored as 0/1 in SQLite. */

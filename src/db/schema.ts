@@ -11,7 +11,7 @@
  *   - tests (node:sqlite).
  */
 
-export const SCHEMA_VERSION = 39;
+export const SCHEMA_VERSION = 40;
 
 /**
  * System Doctor (migration v17): persistent log of every Doctor run — what
@@ -1926,3 +1926,4 @@ export { WHATSAPP_BRIDGE_SQL } from "./whatsapp-schema";
 export { OUTREACH_SQL } from "./outreach-schema";
 export { PROSPECT_REPLIES_SQL } from "./outreach-schema";
 export { REMOTE_EXECUTION_SQL } from "./remote-schema";
+export { FACTORY_BUILD_SQL } from "./factory-build-schema";

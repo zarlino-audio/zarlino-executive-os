@@ -64,17 +64,27 @@ export function isDeepseekKeyFailure(err: unknown): boolean {
 export async function deepseekComplete(
   env: DeepSeekEnv,
   messages: DeepSeekChatMessage[],
-  opts: { maxTokens?: number; temperature?: number; timeoutMs?: number; model?: string } = {},
+  opts: {
+    maxTokens?: number;
+    temperature?: number;
+    timeoutMs?: number;
+    model?: string;
+    /** "json_object" asks the provider to emit a single JSON object. */
+    responseFormat?: "json_object" | "text";
+    /** Injected in tests; defaults to the global fetch. */
+    fetchImpl?: typeof fetch;
+  } = {},
 ): Promise<DeepSeekResult | null> {
   const keys = deepseekKeys(env);
   if (keys.length === 0) return null;
   const model = opts.model ?? env.DEEPSEEK_CAO_MODEL ?? DEFAULT_CAO_DEEPSEEK_MODEL;
   const base = (env.DEEPSEEK_BASE_URL ?? "https://api.deepseek.com").replace(/\/$/, "");
+  const fetchImpl = opts.fetchImpl ?? fetch;
   for (let i = 0; i < keys.length; i++) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 20_000);
     try {
-      const res = await fetch(`${base}/chat/completions`, {
+      const res = await fetchImpl(`${base}/chat/completions`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${keys[i]}`,
@@ -85,6 +95,7 @@ export async function deepseekComplete(
           messages,
           max_tokens: opts.maxTokens ?? 400,
           ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
+          ...(opts.responseFormat ? { response_format: { type: opts.responseFormat } } : {}),
           stream: false,
         }),
         signal: controller.signal,
