@@ -478,6 +478,14 @@ export function completeBuild(sql: Sql, buildId: string, input: CompletionInput)
   const artifactKey =
     str(artifacts.key) ?? (artifactName ? buildArtifactKey(buildId, artifactName) : null);
 
+  // Defence in depth (review finding): an artifact key must live under THIS
+  // build's prefix. The publish job is trusted with the record, but a malformed
+  // or replayed record must not be able to point a customer at another build's
+  // bytes.
+  if (artifactKey !== null && (!isSafeFactoryArtifactKey(artifactKey) || !artifactKey.startsWith(`factory-builds/${buildId}/`))) {
+    return failBuild(sql, buildId, "EVIDENCE_INVALID", { reason: "artifact key does not belong to this build" }, "orchestrator");
+  }
+
   const aiCost = num(record.aiCostUsd) ?? num(cost.aiCostUsd) ?? build.ai_cost_usd ?? 0;
   const estimatedVariableCost =
     num(record.estimatedVariableCostUsd) ?? num(cost.estimatedVariableCostUsd) ?? build.estimated_variable_cost_usd ?? 0;

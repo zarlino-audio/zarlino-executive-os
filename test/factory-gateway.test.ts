@@ -450,6 +450,35 @@ describe("factory gateway routes", () => {
     expect(response!.status).toBe(404);
   });
 
+  it("refuses an artifact key that does not belong to the build", async () => {
+    const { fetchImpl } = fakeFetch(() => new Response(null, { status: 204 }));
+    const buildId = "fb-20261021T000014-mmm333";
+    await route(dispatchRequest(buildId), baseEnv, { fetchImpl });
+
+    const response = await route(
+      completionRequest(buildId, {
+        qaPassed: true,
+        qaReport: { passed: true },
+        artifact: { name: "x.vst3.zip", key: "factory-builds/fb-someone-else-000000/artifact/x.vst3.zip" },
+      }),
+    );
+    const body = (await response!.json()) as { build: { status: string; failureState: string; artifact: unknown } };
+    expect(body.build.status).toBe("FAILED");
+    expect(body.build.failureState).toBe("EVIDENCE_INVALID");
+    expect(body.build.artifact).toBeNull();
+
+    const traversal = "fb-20261021T000015-nnn444";
+    await route(dispatchRequest(traversal), baseEnv, { fetchImpl });
+    const second = await route(
+      completionRequest(traversal, {
+        qaPassed: true,
+        qaReport: { passed: true },
+        artifact: { name: "x.vst3.zip", key: `factory-builds/${traversal}/../other/artifact/x.zip` },
+      }),
+    );
+    expect(((await second!.json()) as { build: { status: string } }).build.status).toBe("FAILED");
+  });
+
   it("never exposes raw logs or internal keys in a public build view", async () => {
     const { fetchImpl } = fakeFetch(() => new Response(null, { status: 204 }));
     const buildId = "fb-20261021T000013-lll222";
