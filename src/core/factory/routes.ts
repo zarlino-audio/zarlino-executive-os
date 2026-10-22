@@ -37,6 +37,8 @@ export interface FactoryRouteContext {
   /** Optional metering sink; the DO passes its store. */
   meter?: Parameters<typeof interpretDescription>[1]["store"];
   fetchImpl?: typeof fetch;
+  /** Reuse window for a derived build stage (0 disables it). See SyncDeps. */
+  stageCacheMs?: number;
 }
 
 const GATEWAY_HEADER = "x-factory-gateway";
@@ -221,6 +223,7 @@ export async function handleFactoryRoute(
     const synced = await syncFactoryBuild(context.sql, context.env, buildId, {
       bucket: context.bucket ?? null,
       fetchImpl: context.fetchImpl,
+      stageCacheMs: context.stageCacheMs,
     });
 
     const includeEvents = url.searchParams.get("events") === "1";

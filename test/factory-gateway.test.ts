@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Factory gateway: AI interpretation, dispatch and the quality-gate completion
  * rule, exercised through the real route handler.
  *
@@ -150,7 +150,11 @@ describe("factory gateway routes", () => {
     return new Request(`https://os.example.com${path}`, { method: "GET", headers });
   }
 
-  async function route(request: Request, env: FactoryRouteEnv = baseEnv, extra: { bucket?: ReturnType<typeof r2Bucket>; fetchImpl?: typeof fetch } = {}) {
+  async function route(
+    request: Request,
+    env: FactoryRouteEnv = baseEnv,
+    extra: { bucket?: ReturnType<typeof r2Bucket>; fetchImpl?: typeof fetch; stageCacheMs?: number } = {},
+  ) {
     const response = await handleFactoryRoute(
       {
         sql,
@@ -158,6 +162,7 @@ describe("factory gateway routes", () => {
         bucket: extra.bucket ?? null,
         meter: store,
         fetchImpl: extra.fetchImpl,
+        stageCacheMs: extra.stageCacheMs,
       },
       request,
       new URL(request.url),
@@ -469,10 +474,16 @@ describe("factory gateway routes", () => {
     });
 
     await route(dispatchRequest(buildId), baseEnv, { fetchImpl });
-    const response = await route(get(`/api/factory/builds/${buildId}`, { "x-factory-gateway": GATEWAY }), baseEnv, {
-      bucket: r2Bucket({}),
-      fetchImpl,
-    });
+    // stageCacheMs: 0 observes every transition; production reuses a derived
+    // stage for 15s so a 4s poll costs one derivation, not one per tick.
+    const poll = () =>
+      route(get(`/api/factory/builds/${buildId}`, { "x-factory-gateway": GATEWAY }), baseEnv, {
+        bucket: r2Bucket({}),
+        fetchImpl,
+        stageCacheMs: 0,
+      });
+
+    const response = await poll();
     const body = (await response!.json()) as { build: { status: string }; syncSource: string };
     expect(body.syncSource).toBe("run_progress");
     // Compiling: it walked QUEUED -> ASSEMBLING -> BUILDING in one poll and
@@ -481,16 +492,14 @@ describe("factory gateway routes", () => {
 
     // The gate step starting moves it to TESTING; the publish job to PACKAGING.
     steps[7]!.status = "in_progress";
-    const testing = await route(get(`/api/factory/builds/${buildId}`, { "x-factory-gateway": GATEWAY }), baseEnv, {
-      bucket: r2Bucket({}),
-      fetchImpl,
-    });
+    const testing = await poll();
     expect(((await testing!.json()) as { build: { status: string } }).build.status).toBe("TESTING");
 
     steps[7]!.status = "completed";
     steps[8]!.status = "completed";
     const publishing = await route(get(`/api/factory/builds/${buildId}`, { "x-factory-gateway": GATEWAY }), baseEnv, {
       bucket: r2Bucket({}),
+      stageCacheMs: 0,
       fetchImpl: fakeFetch((captured) => {
         if (captured.url.includes("/jobs")) {
           return json({

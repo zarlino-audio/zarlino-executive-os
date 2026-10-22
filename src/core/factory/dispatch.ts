@@ -205,6 +205,14 @@ export interface SyncDeps {
   fetchImpl?: typeof fetch;
   now?: () => Date;
   maxMinutes?: number;
+  /**
+   * How long a build's derived stage may be reused before asking GitHub again.
+   *
+   * A customer watching the page polls every few seconds; the stage changes on a
+   * scale of minutes, and each derivation costs two GitHub API calls from one
+   * shared token. Defaults to 15s; tests set 0 to observe every transition.
+   */
+  stageCacheMs?: number;
 }
 
 export interface SyncResult {
@@ -271,9 +279,17 @@ export async function syncFactoryBuild(sql: Sql, env: FactoryEnv, buildId: strin
   //    minutes. A run that has not been picked up by a runner yet stays QUEUED,
   //    which is the truth.
   if (run && !run.conclusion && run.id && (run.status === "in_progress" || run.status === "completed")) {
-    const stage = await fetchRunStage(env, run.id, deps.fetchImpl ?? fetch);
-    const target = stage ?? "ASSEMBLING";
-    const advanced = advanceTo(sql, buildId, target);
+    const cacheMs = deps.stageCacheMs ?? 15_000;
+    const cached = cacheMs > 0 ? cachedStage(buildId) : null;
+    const fresh = cached !== null && now().getTime() - cached.at < cacheMs;
+    let stage: FactoryBuildState | null;
+    if (fresh) {
+      stage = cached!.stage;
+    } else {
+      stage = await fetchRunStage(env, run.id, deps.fetchImpl ?? fetch);
+      if (cacheMs > 0) stageCache.set(buildId, { at: now().getTime(), stage });
+    }
+    const advanced = advanceTo(sql, buildId, stage ?? "ASSEMBLING");
     if (advanced) return { build: advanced, source: "run_progress" };
   }
 
@@ -305,6 +321,21 @@ async function fetchRunStage(env: FactoryEnv, runId: number, fetchImpl: typeof f
   } catch {
     return null;
   }
+}
+
+/**
+ * Short-lived memo of the last derived stage, so a page polling every four
+ * seconds does not turn into two GitHub calls every four seconds from one shared
+ * token. Lives in module scope because the orchestrator is a single Durable
+ * Object; losing it on restart only costs one extra call.
+ */
+const stageCache = new Map<string, { at: number; stage: FactoryBuildState | null }>();
+
+function cachedStage(buildId: string): { at: number; stage: FactoryBuildState | null } | null {
+  const entry = stageCache.get(buildId);
+  if (!entry) return null;
+  if (stageCache.size > 500) stageCache.clear();
+  return entry;
 }
 
 /**
