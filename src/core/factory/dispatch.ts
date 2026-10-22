@@ -26,7 +26,10 @@ import {
   failBuild,
   getBuild,
   isTerminalState,
+  transitionBuild,
+  FACTORY_BUILD_STATES,
   type FactoryBuild,
+  type FactoryBuildState,
 } from "./builds";
 
 export const FACTORY_WORKFLOW_FILE = "factory-build.yml";
@@ -206,8 +209,8 @@ export interface SyncDeps {
 
 export interface SyncResult {
   build: FactoryBuild;
-  /** Where the decision came from â€” useful in logs and tests. */
-  source: "terminal" | "record" | "run_failure" | "timeout" | "pending";
+  /** Where the decision came from - useful in logs and tests. */
+  source: "terminal" | "record" | "run_failure" | "run_progress" | "timeout" | "pending";
 }
 
 /** R2 key of a build's evidence record, written only after the gate passed. */
@@ -263,7 +266,18 @@ export async function syncFactoryBuild(sql: Sql, env: FactoryEnv, buildId: strin
   }
   if (run?.id) attachBuildRun(sql, buildId, String(run.id), run.html_url ?? null);
 
-  // 3. Past the deadline nothing is coming: fail closed.
+  // 3. A run that is still going: report the stage it has actually reached, so
+  //    the customer sees progress instead of one frozen state for fifteen
+  //    minutes. A run that has not been picked up by a runner yet stays QUEUED,
+  //    which is the truth.
+  if (run && !run.conclusion && run.id && (run.status === "in_progress" || run.status === "completed")) {
+    const stage = await fetchRunStage(env, run.id, deps.fetchImpl ?? fetch);
+    const target = stage ?? "ASSEMBLING";
+    const advanced = advanceTo(sql, buildId, target);
+    if (advanced) return { build: advanced, source: "run_progress" };
+  }
+
+  // 4. Past the deadline nothing is coming: fail closed.
   const limit = deps.maxMinutes ?? maxBuildMinutes(env);
   const ageMinutes = (now().getTime() - new Date(build.created_at).getTime()) / 60_000;
   if (ageMinutes > limit) {
@@ -277,6 +291,45 @@ export async function syncFactoryBuild(sql: Sql, env: FactoryEnv, buildId: strin
   return { build: getBuild(sql, buildId) ?? build, source: "pending" };
 }
 
+/** Ask GitHub which steps of a run have been reached. Best effort: null on any failure. */
+async function fetchRunStage(env: FactoryEnv, runId: number, fetchImpl: typeof fetch): Promise<FactoryBuildState | null> {
+  try {
+    const response = await gh(env, `/repos/${factoryRepo(env)}/actions/runs/${runId}/jobs?per_page=20`, {}, fetchImpl);
+    if (!response.ok) return null;
+    const body = (await response.json()) as {
+      jobs?: Array<{ name?: string; status?: string; steps?: Array<{ name?: string; status?: string }> }>;
+    };
+    const jobs = body.jobs ?? [];
+    const steps = jobs.flatMap((job) => job.steps ?? []);
+    return deriveStage(steps, jobs);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Walk a build forward to `target`, one legal step at a time.
+ *
+ * The lifecycle only permits single steps, which is what keeps the event history
+ * honest; a customer watching the page should still see it move
+ * QUEUED -> ASSEMBLING -> BUILDING as the run reports those stages.
+ */
+function advanceTo(sql: Sql, buildId: string, target: FactoryBuildState): FactoryBuild | null {
+  let current = getBuild(sql, buildId);
+  if (!current) return null;
+  const targetIndex = FACTORY_BUILD_STATES.indexOf(target);
+  let guard = FACTORY_BUILD_STATES.length;
+
+  while (!isTerminalState(String(current.status)) && guard-- > 0) {
+    const index = FACTORY_BUILD_STATES.indexOf(current.status as FactoryBuildState);
+    if (index < 0 || index >= targetIndex) return current;
+    const next = FACTORY_BUILD_STATES[index + 1]!;
+    if (isTerminalState(next)) return current;
+    current = transitionBuild(sql, buildId, next, { detail: { source: "workflow_run" } });
+  }
+  return current;
+}
+
 interface RunState {
   id?: number;
   status?: string;
@@ -285,12 +338,66 @@ interface RunState {
 }
 
 /**
- * Best-effort discovery of the run that belongs to this build.
+ * Which lifecycle state a workflow step means.
  *
- * The dispatch API returns no run id, so the run is matched by workflow name and
- * by having been created at (or just after) the build row. This is a STATUS
- * HINT only: it can never make a build READY, and a wrong match can only make a
- * failure visible sooner â€” the evidence record still decides success.
+ * The workflow's own step names are the only honest source of progress: a run
+ * that is `in_progress` says nothing about whether it is compiling or packing.
+ * Matching on names is deliberate and bounded - an unrecognised step keeps the
+ * previous state, so renaming a step degrades the progress display to "less
+ * precise", never to "wrong" or "stuck at the end".
+ */
+const STEP_STAGE: Array<[RegExp, FactoryBuildState]> = [
+  [/validate|freeze|configure|kernel|generate the product/i, "ASSEMBLING"],
+  [/compile/i, "BUILDING"],
+  [/quality gate|generic quality/i, "TESTING"],
+  [/package|integrity|upload .*evidence|download the verified|verify a gate|r2|report completion/i, "PACKAGING"],
+];
+
+/** The highest stage any started step has reached, or null when nothing matched. */
+export function deriveStage(
+  steps: Array<{ name?: string; status?: string }>,
+  jobs: Array<{ name?: string; status?: string }> = [],
+): FactoryBuildState | null {
+  let best: number | null = null;
+
+  const consider = (state: FactoryBuildState) => {
+    const index = FACTORY_BUILD_STATES.indexOf(state);
+    if (index >= 0 && (best === null || index > best)) best = index;
+  };
+
+  for (const step of steps) {
+    // `completed` and `in_progress` both mean "this step has been reached".
+    if (step.status !== "completed" && step.status !== "in_progress") continue;
+    const name = step.name ?? "";
+    for (const [pattern, state] of STEP_STAGE) {
+      if (pattern.test(name)) {
+        consider(state);
+        break;
+      }
+    }
+  }
+
+  // The publish job runs after the gate: upload, evidence, completion report.
+  for (const job of jobs) {
+    if (job.status !== "completed" && job.status !== "in_progress") continue;
+    if (/publish/i.test(job.name ?? "")) consider("PACKAGING");
+  }
+
+  return best === null ? null : FACTORY_BUILD_STATES[best]!;
+}
+
+/**
+ * Find the run that belongs to this build.
+ *
+ * The dispatch API returns no run id, so the run is found by its `run-name`,
+ * which the workflow sets to `factory-build-<build id>` - an exact match, so two
+ * builds dispatched in the same minute can never be confused with each other.
+ * Runs from before that name existed are matched by workflow + creation time as
+ * a fallback.
+ *
+ * This is a STATUS HINT only: it can never make a build READY (the published
+ * evidence record does that), and a wrong match could only make a failure
+ * visible sooner.
  */
 async function findRunState(env: FactoryEnv, build: FactoryBuild, fetchImpl: typeof fetch): Promise<RunState | null> {
   if (!env.GITHUB_TOKEN) return null;
@@ -300,10 +407,27 @@ async function findRunState(env: FactoryEnv, build: FactoryBuild, fetchImpl: typ
   try {
     const response = await gh(env, `/repos/${repo}/actions/runs?event=workflow_dispatch&created=%3E%3D${encodeURIComponent(created)}&per_page=30`, {}, fetchImpl);
     if (!response.ok) return null;
-    const body = (await response.json()) as { workflow_runs?: Array<{ id: number; name?: string; path?: string; status?: string; conclusion?: string | null; html_url?: string; created_at?: string }> };
-    const runs = body.workflow_runs ?? [];
+    const body = (await response.json()) as {
+      workflow_runs?: Array<{ id: number; name?: string; display_title?: string; path?: string; status?: string; conclusion?: string | null; html_url?: string; created_at?: string }>;
+    };
+    const runs = (body.workflow_runs ?? []).filter((run) => (run.path ?? "").endsWith(FACTORY_WORKFLOW_FILE) || (run.name ?? "") === "Factory Product Build");
+
+    const exact = runs.filter((run) => (run.display_title ?? "").trim() === `factory-build-${build.id}`);
+    if (exact.length > 0) {
+      const match = exact.sort((a, b) => (b.created_at ?? "").localeCompare(a.created_at ?? ""))[0]!;
+      return { id: match.id, status: match.status, conclusion: match.conclusion, html_url: match.html_url };
+    }
+
+    // Every run now carries `factory-build-<id>` as its display title. If runs in
+    // this window use that scheme and none names THIS build, then this build has
+    // no run yet - and answering with someone else's run would report their
+    // progress, or their failure, as this customer's.
+    const usesBuildNames = runs.some((run) => (run.display_title ?? "").startsWith("factory-build-"));
+    if (usesBuildNames) return null;
+
+    // Legacy runs (dispatched before the run name existed): fall back to the
+    // oldest matching run in the window.
     const candidates = runs
-      .filter((run) => (run.path ?? "").endsWith(FACTORY_WORKFLOW_FILE) || (run.name ?? "") === "Factory Product Build")
       .filter((run) => (run.created_at ? new Date(run.created_at).getTime() : 0) >= new Date(build.created_at).getTime() - 120_000)
       .sort((a, b) => (a.created_at ?? "").localeCompare(b.created_at ?? ""));
     const match = candidates[0];

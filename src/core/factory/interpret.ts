@@ -128,16 +128,63 @@ HARD RULES
 10. If the request needs a processor that the catalog cannot express (a reverb, a delay, a synth, a pitch shifter, a guitar amp simulator with cabinet impulses, anything requiring a module that is not listed, or anything requiring code), do NOT approximate with an unrelated module. Instead return exactly: {"unsupported": true, "reason": "<one sentence>", "closest": "<one sentence describing the closest thing this catalog CAN build>"}.
 
 FIELD ORDER AND SHAPE
+EVERY value below has a fixed JSON type. A number field must be a JSON number, never a
+string or a word: "curve": 1.0 is valid, "curve": "linear" is a hard failure.
+
 {
-  "factorySchemaVersion": 1,
-  "plugin": {"id","name","vendor","version","effectType","channels"},
-  "graph": {"modules": [{"instanceId","moduleId","moduleVersion","parameters": {<parameterId>: <number>}}]},
-  "parameters": [{"id","name","target","range":{"min","max","default"},"unit","logarithmic","group","exposeToHost"}],
-  "macros": [{"id","name","defaultValue","mappings":[{"parameter","rangeStart","rangeEnd","curve","scale","invert"}]}],
-  "dryWet": {"enabled","defaultMix"},
-  "bypass": {"mode","defaultBypassed"},
-  "ui": {"accentColor","category","shortDescription","tags","layout","parameterOrder"}
+  "factorySchemaVersion": 1,                                  // number, always 1
+  "plugin": {
+    "id": string, "name": string, "vendor": string, "version": string,
+    "effectType": string, "channels": string
+  },
+  "graph": {"modules": [{
+    "instanceId": string,            // unique, letters/digits only, e.g. "comp"
+    "moduleId": string,              // must exist in catalog
+    "moduleVersion": string,         // must equal the catalog version
+    "parameters": {<parameterId>: number}   // every number inside the catalog [min, max]
+  }]},
+  "parameters": [{
+    "id": string,                    // unique control id, letters/digits only
+    "name": string,                  // label shown to the musician
+    "target": string,                // "<instanceId>.<parameterId>" or "$factory.dryWet"
+    "range": {"min": number, "max": number, "default": number},
+    "unit": string,                  // exactly one of "" | "dB" | "Hz" | "ms" | "Q" | "ratio", copied from the catalog parameter
+    "logarithmic": boolean,
+    "group": string,
+    "exposeToHost": boolean          // true for every control
+  }],
+  "macros": [{
+    "id": string, "name": string,
+    "defaultValue": number,          // 0..1
+    "mappings": [{
+      "parameter": string,           // the "id" of a declared control
+      "rangeStart": number,          // 0..1, value of the control at macro 0
+      "rangeEnd": number,            // 0..1, value of the control at macro 1
+      "curve": number,               // 0.05..8 exponent, 1.0 = linear, >1 = more travel late
+      "scale": number,               // 0..4 multiplier, 1.0 = unity
+      "invert": boolean
+    }]
+  }],
+  "dryWet": {"enabled": boolean, "defaultMix": number},        // defaultMix 0..1
+  "bypass": {"mode": "hard", "defaultBypassed": boolean},      // mode is the literal string "hard"
+  "ui": {
+    "accentColor": string,           // "#RRGGBB"
+    "category": string,
+    "shortDescription": string,      // one sentence
+    "tags": string[],                // 0-4 lowercase slugs
+    "layout": "vertical" | "horizontal",
+    "parameterOrder": string[]       // declared control ids, in display order
+  }
 }
+
+WORKED MACRO EXAMPLE (copy this shape exactly, only the values change)
+"macros": [{
+  "id": "warmth", "name": "Warmth", "defaultValue": 0.35,
+  "mappings": [
+    {"parameter": "tilt", "rangeStart": 0.5, "rangeEnd": 0.8, "curve": 1.0, "scale": 1.0, "invert": false},
+    {"parameter": "drive", "rangeStart": 0.0, "rangeEnd": 0.5, "curve": 1.0, "scale": 1.0, "invert": false}
+  ]
+}]
 
 effectType is one of: utility, filter, equalizer, dynamics, saturation, limiter, transient-shaper, stereo-utility, channel-strip, vocal-processor.
 channels is "mono" or "stereo". A stereo-only module (see catalog "channels") means the spec must be "stereo".

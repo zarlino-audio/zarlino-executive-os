@@ -12,6 +12,7 @@ import { createNodeSql } from "../src/db/sql";
 import { ExecutiveStore } from "../src/db/store";
 import { getBuild, getBuildEvents } from "../src/core/factory/builds";
 import { extractJsonObject, validateInterpretRequest, MAX_DESCRIPTION_CHARS } from "../src/core/factory/interpret";
+import { deriveStage } from "../src/core/factory/dispatch";
 import { handleFactoryRoute, type FactoryRouteEnv } from "../src/core/factory/routes";
 
 const GATEWAY = "gateway-secret-of-at-least-16-chars";
@@ -94,8 +95,11 @@ function fakeFetch(responder: (captured: Captured) => Response | Promise<Respons
   return { fetchImpl, calls };
 }
 
-function deepSeekReply(content: unknown, promptTokens = 900, completionTokens = 300): Response {
-  return new Response(
+function json(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+}
+
+function deepSeekReply(content: unknown, promptTokens = 900, completionTokens = 300): Response {  return new Response(
     JSON.stringify({
       choices: [{ message: { content: typeof content === "string" ? content : JSON.stringify(content) } }],
       usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens },
@@ -423,6 +427,151 @@ describe("factory gateway routes", () => {
     const corruptBucket = r2Bucket({ [`factory-builds/${corruptId}/build-record.json`]: "{ not json" });
     const corrupt = await route(get(`/api/factory/builds/${corruptId}`, { "x-factory-gateway": GATEWAY }), baseEnv, { bucket: corruptBucket });
     expect(((await corrupt!.json()) as { build: { status: string; failureState: string } }).build.status).toBe("FAILED");
+  });
+
+  it("reports the stage a running build has actually reached", async () => {
+    // A build used to sit at QUEUED for the whole compile - thirteen minutes of
+    // "queued" for something that was already building. The run's own steps are
+    // the honest source of progress.
+    const buildId = "fb-20261021T000016-ppp555";
+    const steps = [
+      { name: "Set up job", status: "completed" },
+      { name: "Validate build request", status: "completed" },
+      { name: "Freeze and stage the specification", status: "completed" },
+      { name: "Configure", status: "completed" },
+      { name: "Build the factory kernel and the generator", status: "completed" },
+      { name: "Generate the product project", status: "completed" },
+      { name: "Compile the VST3 and the quality gate", status: "in_progress" },
+      { name: "Run the generic quality gate", status: "queued" },
+      { name: "Package the artifact and compute integrity hashes", status: "queued" },
+    ];
+
+    const { fetchImpl } = fakeFetch((captured) => {
+      if (captured.url.includes("/dispatches")) return new Response(null, { status: 204 });
+      if (captured.url.includes("/jobs")) {
+        return json({
+          jobs: [{ name: "Assemble, build and gate", status: "in_progress", steps }],
+        });
+      }
+      return json({
+        workflow_runs: [
+          {
+            id: 9001,
+            name: "Factory Product Build",
+            display_title: `factory-build-${buildId}`,
+            path: ".github/workflows/factory-build.yml",
+            status: "in_progress",
+            conclusion: null,
+            created_at: new Date(Date.now() - 1000).toISOString(),
+          },
+        ],
+      });
+    });
+
+    await route(dispatchRequest(buildId), baseEnv, { fetchImpl });
+    const response = await route(get(`/api/factory/builds/${buildId}`, { "x-factory-gateway": GATEWAY }), baseEnv, {
+      bucket: r2Bucket({}),
+      fetchImpl,
+    });
+    const body = (await response!.json()) as { build: { status: string }; syncSource: string };
+    expect(body.syncSource).toBe("run_progress");
+    // Compiling: it walked QUEUED -> ASSEMBLING -> BUILDING in one poll and
+    // stopped there, because the gate has not started.
+    expect(body.build.status).toBe("BUILDING");
+
+    // The gate step starting moves it to TESTING; the publish job to PACKAGING.
+    steps[7]!.status = "in_progress";
+    const testing = await route(get(`/api/factory/builds/${buildId}`, { "x-factory-gateway": GATEWAY }), baseEnv, {
+      bucket: r2Bucket({}),
+      fetchImpl,
+    });
+    expect(((await testing!.json()) as { build: { status: string } }).build.status).toBe("TESTING");
+
+    steps[7]!.status = "completed";
+    steps[8]!.status = "completed";
+    const publishing = await route(get(`/api/factory/builds/${buildId}`, { "x-factory-gateway": GATEWAY }), baseEnv, {
+      bucket: r2Bucket({}),
+      fetchImpl: fakeFetch((captured) => {
+        if (captured.url.includes("/jobs")) {
+          return json({
+            jobs: [
+              { name: "Assemble, build and gate", status: "completed", steps },
+              { name: "Publish and report", status: "in_progress", steps: [{ name: "Download the verified build", status: "in_progress" }] },
+            ],
+          });
+        }
+        return json({
+          workflow_runs: [
+            {
+              id: 9001,
+              name: "Factory Product Build",
+              display_title: `factory-build-${buildId}`,
+              path: ".github/workflows/factory-build.yml",
+              status: "in_progress",
+              conclusion: null,
+              created_at: new Date(Date.now() - 1000).toISOString(),
+            },
+          ],
+        });
+      }).fetchImpl,
+    });
+    expect(((await publishing!.json()) as { build: { status: string } }).build.status).toBe("PACKAGING");
+
+    // Every step is recorded, so the customer-facing history is auditable.
+    const events = sql.all<{ state: string }>("SELECT state FROM factory_build_events WHERE build_id = ? ORDER BY created_at ASC", buildId);
+    expect(events.map((event) => event.state)).toEqual(["QUEUED", "ASSEMBLING", "BUILDING", "TESTING", "PACKAGING"]);
+  });
+
+  it("matches a run to its build by name, so one build never inherits another's failure", async () => {
+    // Two builds dispatched in the same minute used to be indistinguishable: the
+    // oldest candidate won, so build A could report build B's failure.
+    const mine = "fb-20261021T000017-qqq666";
+    const other = "fb-20261021T000018-rrr777";
+    const dispatchFetch = fakeFetch(() => new Response(null, { status: 204 })).fetchImpl;
+    await route(dispatchRequest(mine), baseEnv, { fetchImpl: dispatchFetch });
+    await route(dispatchRequest(other), baseEnv, { fetchImpl: dispatchFetch });
+
+    const createdAt = new Date(Date.now() - 500).toISOString();
+    const crossTalk = fakeFetch((captured) => {
+      if (captured.url.includes("/jobs")) return json({ jobs: [] });
+      return json({
+        workflow_runs: [
+          {
+            id: 7001,
+            name: "Factory Product Build",
+            display_title: `factory-build-${other}`,
+            path: ".github/workflows/factory-build.yml",
+            status: "completed",
+            conclusion: "failure",
+            created_at: createdAt,
+          },
+        ],
+      });
+    });
+
+    const response = await route(get(`/api/factory/builds/${mine}`, { "x-factory-gateway": GATEWAY }), baseEnv, {
+      bucket: r2Bucket({}),
+      fetchImpl: crossTalk.fetchImpl,
+    });
+    const body = (await response!.json()) as { build: { status: string; failureState: string | null } };
+    expect(body.build.status).not.toBe("FAILED");
+    expect(body.build.failureState).toBeNull();
+  });
+
+  it("derives a stage only from steps that have started", async () => {
+    expect(deriveStage([])).toBeNull();
+    expect(deriveStage([{ name: "Compile the VST3", status: "queued" }])).toBeNull();
+    expect(deriveStage([{ name: "Validate build request", status: "completed" }])).toBe("ASSEMBLING");
+    expect(deriveStage([{ name: "Run the generic quality gate", status: "in_progress" }])).toBe("TESTING");
+    // A renamed step must not crash or lie: unrecognised names carry no stage.
+    expect(deriveStage([{ name: "Something we renamed later", status: "completed" }])).toBeNull();
+    // The highest reached stage wins regardless of array order.
+    expect(
+      deriveStage([
+        { name: "Package the artifact and compute integrity hashes", status: "completed" },
+        { name: "Compile the VST3 and the quality gate", status: "completed" },
+      ]),
+    ).toBe("PACKAGING");
   });
 
   it("fails closed on timeout and stays pending while the build is young", async () => {

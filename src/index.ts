@@ -70,6 +70,8 @@ import { evaluateChecks, planBackupPrune, parseDeepSeekBalance, STATIC_TARGETS, 
 import { isTerminalTaskStatus, GovernanceError } from "./core/tasks/evidence";
 import { dependencyState, releaseCompletedDependencies } from "./core/tasks/dependencies";
 import { handleFactoryRoute } from "./core/factory/routes";
+import { isTerminalState as isTerminalFactoryState, listBuilds as listFactoryBuilds } from "./core/factory/builds";
+import { syncFactoryBuild } from "./core/factory/dispatch";
 import type { AgentRun, DoctorLog, Task } from "./types";
 import type { ModelCallRecord as _M } from "./core/model/types";
 type ModelCall = _M;
@@ -1084,6 +1086,38 @@ export class ExecutiveAgent {
     };
   }
 
+  /**
+   * Bring every non-terminal factory build up to date with backend truth.
+   * Bounded (a build is abandoned by its own deadline) and never throws: one
+   * unreachable build must not stop the sweep.
+   */
+  private async reconcileFactoryBuilds(): Promise<{ checked: number; settled: number }> {
+    let checked = 0;
+    let settled = 0;
+    try {
+      const open = [
+        ...listFactoryBuilds(this.sql, 25, { status: "QUEUED" }),
+        ...listFactoryBuilds(this.sql, 25, { status: "BUILDING" }),
+        ...listFactoryBuilds(this.sql, 25, { status: "TESTING" }),
+        ...listFactoryBuilds(this.sql, 25, { status: "PACKAGING" }),
+      ];
+      for (const build of open) {
+        checked += 1;
+        try {
+          const result = await syncFactoryBuild(this.sql, this.env, build.id, {
+            bucket: this.env.ARTIFACTS ? { get: (key: string) => this.env.ARTIFACTS!.get(key) } : null,
+          });
+          if (isTerminalFactoryState(String(result.build.status))) settled += 1;
+        } catch {
+          /* one build must not stop the sweep */
+        }
+      }
+    } catch {
+      /* reconciliation must never break the cron */
+    }
+    return { checked, settled };
+  }
+
   private async runWakeMaintenance(trigger: string, opts: { runAutoJobs: boolean }): Promise<void> {
     const autoFix = parseBool(this.env.DOCTOR_AUTOFIX, true);
     try {
@@ -1365,6 +1399,13 @@ export class ExecutiveAgent {
     if (internal(request, internalSecret(this.env)) && path === "/api/_scheduled") {
       await this.runWakeMaintenance("cron", { runAutoJobs: true });
       return json({ ok: true, trigger: "cron" });
+    }
+
+    // Factory build reconciliation (internal only). Called by the 15-minute
+    // cron so a build reaches a terminal state even if the customer closed the
+    // tab: without it, status only advanced while someone was polling.
+    if (internal(request, internalSecret(this.env)) && method === "POST" && path === "/api/_factory-reconcile") {
+      return json(await this.reconcileFactoryBuilds());
     }
 
     // Continuity ops (internal only): full database snapshot export for the
@@ -4514,6 +4555,22 @@ export default {
         await runExternalChecks(env, stub);
       } catch {
         /* the monitor must never throw */
+      }
+      // Factory builds are settled by backend truth (the published evidence
+      // record, then the run, then the deadline), so this must happen whether or
+      // not the customer still has the page open.
+      try {
+        const kick = internalSecret(env);
+        if (kick) {
+          await stub.fetch(
+            new Request("https://executive.internal/api/_factory-reconcile", {
+              method: "POST",
+              headers: { [INTERNAL_HEADER]: kick },
+            }),
+          );
+        }
+      } catch {
+        /* reconciliation must never throw */
       }
       controller.noRetry();
       return;
