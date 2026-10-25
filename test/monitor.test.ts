@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildWebsiteTargets,
   evaluateChecks,
+  monitorStateWrites,
   planBackupPrune,
   parseDeepSeekBalance,
   STATIC_TARGETS,
@@ -140,5 +141,50 @@ describe("website contract -> monitor targets (single source of truth)", () => {
     for (const t of WEBSITE_FALLBACK_TARGETS) expect(t.id).toMatch(/^site:/);
     expect(WEBSITE_FALLBACK_TARGETS.some((t) => t.expect === 404)).toBe(true);
     expect(STATIC_TARGETS.some((t) => t.id === "os-api")).toBe(true);
+  });
+});
+
+describe("monitor state writes stay inside the free plan's daily budget", () => {
+  // 20 targets x 96 sweeps a day = 1920 KV writes against a 1000/day allowance.
+  // When this ran on every sweep the account exhausted its KV write budget and
+  // the factory could not publish artifacts at all
+  // (`reached the free usage limit for this operation for today`).
+  const later = "2026-10-02T00:15:00.000Z";
+  const anHourLater = "2026-10-02T01:15:00.000Z";
+
+  const targets = Array.from({ length: 20 }, (_, i) => `site:${i}`);
+
+  it("writes nothing when every target is unchanged", () => {
+    const prev: Record<string, MonitorState | undefined> = {};
+    for (const id of targets) prev[id] = up(id);
+    const next = targets.map((id) => up(id));
+
+    expect(monitorStateWrites(prev, next, later)).toHaveLength(0);
+  });
+
+  it("writes on the first observation and on every state change", () => {
+    const first = monitorStateWrites({}, targets.map((id) => up(id)), now);
+    expect(first).toHaveLength(20);
+
+    const prev: Record<string, MonitorState | undefined> = { a: up("a") };
+    const down: MonitorState[] = [{ id: "a", state: "DOWN", failCount: 2, at: later, lastStatus: 503 }];
+    expect(monitorStateWrites(prev, down, later)).toHaveLength(1);
+  });
+
+  it("still records a failing check before it crosses into DOWN", () => {
+    const prev: Record<string, MonitorState | undefined> = { a: up("a") };
+    const failing: MonitorState[] = [{ id: "a", state: "UP", failCount: 1, at: later, lastStatus: 503 }];
+    expect(monitorStateWrites(prev, failing, later)).toHaveLength(1);
+    // Once recorded, repeating the same observation writes nothing.
+    expect(monitorStateWrites({ a: failing[0]! }, failing, "2026-10-02T00:30:00.000Z")).toHaveLength(0);
+  });
+
+  it("refreshes a still-DOWN target about once an hour, not every sweep", () => {
+    const prev: Record<string, MonitorState | undefined> = {
+      a: { id: "a", state: "DOWN", failCount: 3, at: now, lastStatus: 503 },
+    };
+    const down: MonitorState[] = [{ id: "a", state: "DOWN", failCount: 4, at: later, lastStatus: 503 }];
+    expect(monitorStateWrites(prev, down, "2026-10-02T00:15:00.000Z")).toHaveLength(0);
+    expect(monitorStateWrites(prev, down, anHourLater)).toHaveLength(1);
   });
 });

@@ -167,9 +167,46 @@ export function evaluateChecks(
   return { next, transitions };
 }
 
+/**
+ * Which monitor states are worth writing back to KV.
+ *
+ * The sweep runs every 15 minutes over ~20 targets. Writing every target's state
+ * on every run costs ~1900 KV writes a day against a free plan that allows 1000,
+ * and the write budget is shared with the product - the factory's own artifact
+ * publishing was failing with `your account has reached the free usage limit for
+ * this operation for today` because of it.
+ *
+ * A monitor key only has to change when the *state* changes. A target that stays
+ * UP (or stays DOWN) is already recorded, and its `at` timestamp is not used for
+ * any decision - `failCount` only matters on the way to DOWN, which is a state
+ * change. So: write on transition, write the first observation, and refresh a
+ * still-DOWN target once an hour so a later "still down" reminder has a fresh
+ * basis.
+ */
+export function monitorStateWrites(
+  prev: Record<string, MonitorState | undefined>,
+  next: MonitorState[],
+  now: string,
+  downRefreshMinutes = 60,
+): MonitorState[] {
+  const nowMs = Date.parse(now);
+  return next.filter((state) => {
+    const before = prev[state.id];
+    if (!before) return true;
+    if (before.state !== state.state) return true;
+    // A failing check that has not yet crossed into DOWN still has to be
+    // recorded, or the second failure would never reach the threshold.
+    if (state.state === "UP" && state.failCount > 0 && before.failCount !== state.failCount) return true;
+    if (state.state === "DOWN") {
+      const age = Number.isFinite(nowMs) ? nowMs - Date.parse(before.at) : Infinity;
+      return !(age >= 0 && age < downRefreshMinutes * 60_000);
+    }
+    return false;
+  });
+}
+
 /** Keys that must be deleted so at most `keep` newest remain (lexicographic
- *  order == chronological for the ISO-stamped backup keys we write). */
-export function planBackupPrune(keys: string[], keep = 30): string[] {
+ *  order == chronological for the ISO-stamped backup keys we write). */export function planBackupPrune(keys: string[], keep = 30): string[] {
   const sorted = [...keys].sort();
   return sorted.slice(0, Math.max(0, sorted.length - keep));
 }

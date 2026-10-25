@@ -66,7 +66,7 @@ import {
   scoreProduct,
 } from "./core/perceptual/manager";
 import { newId, nowIso } from "./ids";
-import { evaluateChecks, planBackupPrune, parseDeepSeekBalance, STATIC_TARGETS, WEBSITE_BASE, WEBSITE_FALLBACK_TARGETS, WEBSITE_REPO, buildWebsiteTargets, type CheckResult, type MonitorState, type MonitorTarget, type WebsiteContract } from "./core/monitor";
+import { evaluateChecks, monitorStateWrites, planBackupPrune, parseDeepSeekBalance, STATIC_TARGETS, WEBSITE_BASE, WEBSITE_FALLBACK_TARGETS, WEBSITE_REPO, buildWebsiteTargets, type CheckResult, type MonitorState, type MonitorTarget, type WebsiteContract } from "./core/monitor";
 import { isTerminalTaskStatus, GovernanceError } from "./core/tasks/evidence";
 import { dependencyState, releaseCompletedDependencies } from "./core/tasks/dependencies";
 import { handleFactoryRoute } from "./core/factory/routes";
@@ -4390,7 +4390,13 @@ async function runExternalChecks(
   }
   if (kv && deepseekBalance !== null) {
     const warnAt = Number(env.AI_BALANCE_WARN_USD) > 0 ? Number(env.AI_BALANCE_WARN_USD) : 10;
-    await kv.put("balance:deepseek", JSON.stringify({ at: new Date().toISOString(), usd: deepseekBalance, warnAt }));
+    // Write only when the figure actually moved: KV writes are the scarce
+    // resource on the free plan (1000/day), and re-storing the same balance
+    // every 15 minutes is 96 writes for no information. Reads are plentiful.
+    const stored = safeJson((await kv.get("balance:deepseek")) ?? "null", null) as { usd?: number } | null;
+    if (!stored || Math.abs((stored.usd ?? 0) - deepseekBalance) >= 0.01) {
+      await kv.put("balance:deepseek", JSON.stringify({ at: new Date().toISOString(), usd: deepseekBalance, warnAt }));
+    }
     if (deepseekBalance < warnAt) {
       const last = await kv.get("balance:deepseek:notified");
       const age = last ? Date.now() - Date.parse(last) : Infinity;
@@ -4416,7 +4422,9 @@ async function runExternalChecks(
   }
   const now = new Date().toISOString();
   const { next, transitions } = evaluateChecks(prev, checks, now);
-  if (kv) for (const s of next) await kv.put(`monitor:${s.id}`, JSON.stringify(s));
+  // Only changed states are written: rewriting ~20 keys every 15 minutes spent
+  // the free plan's whole daily KV write budget and starved the product.
+  if (kv) for (const s of monitorStateWrites(prev, next, now)) await kv.put(`monitor:${s.id}`, JSON.stringify(s));
 
   const out: Array<{ id: string; to: string }> = [];
   for (const tr of transitions) {
