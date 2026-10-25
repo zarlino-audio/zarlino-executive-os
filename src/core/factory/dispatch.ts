@@ -50,6 +50,26 @@ export interface ArtifactBucket {
   get(key: string): Promise<{ text(): Promise<string> } | null>;
 }
 
+/**
+ * The factory's evidence store, adapted from Cloudflare KV.
+ *
+ * KV holds the published `build-record.json` (written by the build workflow only
+ * after the quality gate passed) and returns a string rather than an object with
+ * `.text()`. Wrapping it here keeps the READY decision in `syncFactoryBuild`
+ * unchanged, so the trust rule is identical whichever store backs it.
+ */
+export function factoryEvidenceStore(
+  kv: { get(key: string): Promise<string | null> } | null | undefined,
+): ArtifactBucket | null {
+  if (!kv) return null;
+  return {
+    async get(key: string) {
+      const value = await kv.get(key);
+      return value === null || value === undefined ? null : { text: async () => value };
+    },
+  };
+}
+
 export interface DispatchDeps {
   fetchImpl?: typeof fetch;
   now?: () => Date;

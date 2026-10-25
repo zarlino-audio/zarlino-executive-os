@@ -71,7 +71,7 @@ import { isTerminalTaskStatus, GovernanceError } from "./core/tasks/evidence";
 import { dependencyState, releaseCompletedDependencies } from "./core/tasks/dependencies";
 import { handleFactoryRoute } from "./core/factory/routes";
 import { isTerminalState as isTerminalFactoryState, listBuilds as listFactoryBuilds } from "./core/factory/builds";
-import { syncFactoryBuild } from "./core/factory/dispatch";
+import { syncFactoryBuild, factoryEvidenceStore } from "./core/factory/dispatch";
 import type { AgentRun, DoctorLog, Task } from "./types";
 import type { ModelCallRecord as _M } from "./core/model/types";
 type ModelCall = _M;
@@ -83,6 +83,8 @@ type ModelCall = _M;
 export interface Env {
   EXECUTIVE_AGENT: DurableObjectNamespace;
   ZARLINO_KV?: KVNamespace;
+  /** Factory evidence store: `factory-builds/<id>/build-record.json` (KV). */
+  FACTORY_EVIDENCE?: KVNamespace;
   ARTIFACTS?: R2Bucket;
   ASSETS?: Fetcher;
   DEEPSEEK_API_KEY?: string;
@@ -1105,7 +1107,7 @@ export class ExecutiveAgent {
         checked += 1;
         try {
           const result = await syncFactoryBuild(this.sql, this.env, build.id, {
-            bucket: this.env.ARTIFACTS ? { get: (key: string) => this.env.ARTIFACTS!.get(key) } : null,
+            bucket: factoryEvidenceStore(this.env.FACTORY_EVIDENCE),
           });
           if (isTerminalFactoryState(String(result.build.status))) settled += 1;
         } catch {
@@ -1463,7 +1465,7 @@ export class ExecutiveAgent {
         {
           sql: this.sql,
           env: this.env,
-          bucket: this.env.ARTIFACTS ? { get: (key: string) => this.env.ARTIFACTS!.get(key) } : null,
+          bucket: factoryEvidenceStore(this.env.FACTORY_EVIDENCE),
           meter: this.store,
           fetchImpl: undefined,
         },

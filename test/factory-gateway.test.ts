@@ -12,7 +12,7 @@ import { createNodeSql } from "../src/db/sql";
 import { ExecutiveStore } from "../src/db/store";
 import { getBuild, getBuildEvents } from "../src/core/factory/builds";
 import { extractJsonObject, validateInterpretRequest, MAX_DESCRIPTION_CHARS } from "../src/core/factory/interpret";
-import { deriveStage } from "../src/core/factory/dispatch";
+import { deriveStage, factoryEvidenceStore } from "../src/core/factory/dispatch";
 import { handleFactoryRoute, type FactoryRouteEnv } from "../src/core/factory/routes";
 
 const GATEWAY = "gateway-secret-of-at-least-16-chars";
@@ -111,6 +111,13 @@ function deepSeekReply(content: unknown, promptTokens = 900, completionTokens = 
 function r2Bucket(objects: Record<string, string>) {
   return {
     get: async (key: string) => (objects[key] === undefined ? null : { text: async () => objects[key]! }),
+  };
+}
+
+/** A KV namespace holding the same evidence keys (the production store). */
+function kvEvidence(objects: Record<string, string>) {
+  return {
+    get: async (key: string) => (objects[key] === undefined ? null : objects[key]!),
   };
 }
 
@@ -581,6 +588,44 @@ describe("factory gateway routes", () => {
         { name: "Compile the VST3 and the quality gate", status: "completed" },
       ]),
     ).toBe("PACKAGING");
+  });
+
+  it("promotes a build from the evidence record held in KV", async () => {
+    // Production storage moved from R2 to KV when the account's R2 subscription
+    // lapsed. The READY decision must not care which store backs the record, so
+    // this asserts the KV adapter produces exactly the R2 behaviour.
+    const buildId = "fb-20261021T000019-sss888";
+    const record = {
+      buildRecordSchemaVersion: 2,
+      buildId,
+      productName: "Punch",
+      status: "READY",
+      qaPassed: true,
+      qaReport: { passed: true },
+      artifact: { name: "Punch-v1.vst3.zip", zipBytes: 4321, zipSha256: "d".repeat(64) },
+      timings: { compileSeconds: 380, testSeconds: 2 },
+    };
+
+    const store = factoryEvidenceStore(kvEvidence({ [`factory-builds/${buildId}/build-record.json`]: JSON.stringify(record) }));
+    expect(store).not.toBeNull();
+
+    const { fetchImpl } = fakeFetch(() => new Response(null, { status: 204 }));
+    await route(dispatchRequest(buildId), baseEnv, { fetchImpl });
+
+    // Not finished at GitHub, so only the published record can make it READY.
+    const response = await route(get(`/api/factory/builds/${buildId}`, { "x-factory-gateway": GATEWAY }), baseEnv, {
+      bucket: store ?? undefined,
+      fetchImpl,
+    });
+    const body = (await response!.json()) as { build: { status: string; qaPassed: boolean }; syncSource: string };
+    expect(body.syncSource).toBe("record");
+    expect(body.build.status).toBe("READY");
+    expect(body.build.qaPassed).toBe(true);
+
+    // An absent KV key is "no record yet", never a pass.
+    const empty = factoryEvidenceStore(kvEvidence({}));
+    expect(await empty!.get(`factory-builds/${buildId}/build-record.json`)).toBeNull();
+    expect(factoryEvidenceStore(undefined)).toBeNull();
   });
 
   it("fails closed on timeout and stays pending while the build is young", async () => {

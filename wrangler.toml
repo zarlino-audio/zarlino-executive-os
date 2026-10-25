@@ -44,13 +44,33 @@ binding = "ZARLINO_KV"
 id = "66bc47e33fe145f697cf1f80912f269e"
 
 # ---------------------------------------------------------------------------
+# Factory build evidence (KV, namespace "zarlino-factory-artifacts").
+#
+# The build workflow publishes `factory-builds/<buildId>/build-record.json` here
+# only after the quality gate passed on the BUILT bundle, and the orchestrator
+# reads it back as the ground truth for READY. KV rather than R2 because the
+# account's R2 subscription lapsed on 2026-10-25: a worker that binds an R2
+# bucket can no longer be deployed at all (`10136 Please enable R2`), and the
+# factory must stay deployable. Same key layout, same trust rule.
+# ---------------------------------------------------------------------------
+[[kv_namespaces]]
+binding = "FACTORY_EVIDENCE"
+id = "3f463262f7aa4b64a13f4b15c870b83f"
+
+# ---------------------------------------------------------------------------
 # Artifact storage (R2, mandate §25): renders, build packages, reports —
 # large outputs live OUTSIDE the DO's SQLite and are served through
 # /api/artifacts. Created 2026-09-29 (bucket "zarlino-artifacts").
+#
+# DISABLED 2026-10-25 while the account's R2 subscription is lapsed: binding it
+# makes every deploy fail with `10136 Please enable R2`. The /api/artifacts and
+# backup handlers already answer 503 "Artifact storage not configured" when the
+# binding is absent, so the founder console degrades honestly instead of the
+# whole OS becoming undeployable. Restore this block when R2 is re-enabled.
 # ---------------------------------------------------------------------------
-[[r2_buckets]]
-binding = "ARTIFACTS"
-bucket_name = "zarlino-artifacts"
+# [[r2_buckets]]
+# binding = "ARTIFACTS"
+# bucket_name = "zarlino-artifacts"
 
 # ---------------------------------------------------------------------------
 # Static assets: the Founder web console (React+Vite, built to web/dist).
