@@ -125,7 +125,7 @@ HARD RULES
 7. Set plugin.id to "zarlino.customer.<short-slug>" using only letters, digits, dots and dashes; plugin.vendor to "Zarlino Audio"; plugin.version to "1.0.0".
 8. ui.accentColor is "#RRGGBB". ui.category is a short product category. ui.tags are 0-4 lowercase slugs. ui.layout is "vertical" or "horizontal".
 9. bypass.mode must be "hard".
-10. If the request needs a processor that the catalog cannot express (a reverb, a delay, a synth, a pitch shifter, a guitar amp simulator with cabinet impulses, anything requiring a module that is not listed, or anything requiring code), do NOT approximate with an unrelated module. Instead return exactly: {"unsupported": true, "reason": "<one sentence>", "closest": "<one sentence describing the closest thing this catalog CAN build>"}.
+10. If the request needs a processor that the catalog cannot express (convolution with an impulse response, sample playback, a pitch shifter, loudspeaker/cabinet impulses, multiband or sidechain dynamics, linear-phase or spectral processing, anything requiring a module that is not listed, or anything requiring code), do NOT approximate with an unrelated module. Instead return exactly: {"unsupported": true, "reason": "<one sentence>", "closest": "<one sentence describing the closest thing this catalog CAN build>"}.
 
 FIELD ORDER AND SHAPE
 EVERY value below has a fixed JSON type. A number field must be a JSON number, never a
@@ -186,7 +186,22 @@ WORKED MACRO EXAMPLE (copy this shape exactly, only the values change)
   ]
 }]
 
-effectType is one of: utility, filter, equalizer, dynamics, saturation, limiter, transient-shaper, stereo-utility, channel-strip, vocal-processor.
+effectType is one of: utility, filter, equalizer, dynamics, saturation, limiter, transient-shaper, stereo-utility, channel-strip, vocal-processor, instrument.
+
+INSTRUMENTS
+The catalog contains exactly one module that GENERATES sound: zarlino.source.synth, whose
+catalog entry has "isSource": true. A plugin that plays notes (a synth, keys, a pad, a bass
+line, a lead, a pluck, an organ, anything the musician would PLAY rather than send audio
+through) is an instrument:
+- effectType MUST be "instrument",
+- the graph MUST contain zarlino.source.synth exactly once, with any processors after it
+  (filter, chorus, reverb, delay, saturation, limiter...),
+- "dryWet": {"enabled": false, ...} because there is no input signal to mix against,
+- do NOT declare a "$factory.dryWet" parameter,
+- choose envelope and tone values that fit the description (a pad wants a slow attack and a
+  long release; a pluck wants a short attack and a short decay with low sustain).
+A plugin that processes incoming audio must NOT contain the source module, and its effectType
+must be one of the processor types above.
 channels is "mono" or "stereo". A stereo-only module (see catalog "channels") means the spec must be "stereo".
 
 When "mode" is "refine", you are editing "currentSpec": apply ONLY the change the customer asked for and keep every other choice intact. If the request is impossible, return the unsupported object.
